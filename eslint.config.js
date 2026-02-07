@@ -8,7 +8,7 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        projectService: true,
+        project: ['./tsconfig.json', './tsconfig.test.json'],
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -41,7 +41,31 @@ export default tseslint.config(
       'no-debugger': 'error',
     },
   },
+  // Relaxed rules for test files
   {
-    ignores: ['dist/', 'node_modules/', '*.config.*'],
+    files: ['tests/**/*.ts'],
+    rules: {
+      // Tests often need explicit any for mocking
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unsafe-assignment': 'off',
+      '@typescript-eslint/no-unsafe-member-access': 'off',
+      '@typescript-eslint/no-unsafe-call': 'off',
+      '@typescript-eslint/no-unsafe-return': 'off',
+      '@typescript-eslint/no-unsafe-argument': 'off',
+      // Return types less important in tests
+      '@typescript-eslint/explicit-function-return-type': 'off',
+      '@typescript-eslint/explicit-module-boundary-types': 'off',
+      // Tests may have non-null assertions for convenience
+      '@typescript-eslint/no-non-null-assertion': 'off',
+      // Tests may use bracket notation for checking absent properties
+      '@typescript-eslint/dot-notation': 'off',
+      // Type assertion style preference not important in tests
+      '@typescript-eslint/non-nullable-type-assertion-style': 'off',
+      // Allow async without await in mocks
+      '@typescript-eslint/require-await': 'off',
+    },
+  },
+  {
+    ignores: ['dist/', 'node_modules/', '*.config.*', 'tests/integration/generated/'],
   }
 );

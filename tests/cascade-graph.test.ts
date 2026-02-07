@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import type { DMMF } from '@prisma/generator-helper';
 import { parseDMMF } from '../src/dmmf-parser.js';
 import {
   buildCascadeGraph,
@@ -8,59 +7,7 @@ import {
   hasCascadeChildren,
   getSoftDeletableDescendants,
 } from '../src/cascade-graph.js';
-
-function createMockField(
-  overrides: Partial<DMMF.Field> & { name: string; type: string },
-): DMMF.Field {
-  return {
-    name: overrides.name,
-    kind: overrides.kind ?? 'scalar',
-    isList: overrides.isList ?? false,
-    isRequired: overrides.isRequired ?? true,
-    isUnique: overrides.isUnique ?? false,
-    isId: overrides.isId ?? false,
-    isReadOnly: overrides.isReadOnly ?? false,
-    hasDefaultValue: overrides.hasDefaultValue ?? false,
-    type: overrides.type,
-    isGenerated: overrides.isGenerated ?? false,
-    isUpdatedAt: overrides.isUpdatedAt ?? false,
-    ...overrides,
-  };
-}
-
-function createMockModel(
-  overrides: Partial<DMMF.Model> & { name: string; fields: DMMF.Field[] },
-): DMMF.Model {
-  return {
-    name: overrides.name,
-    dbName: overrides.dbName ?? null,
-    fields: overrides.fields,
-    primaryKey: overrides.primaryKey ?? null,
-    uniqueFields: overrides.uniqueFields ?? [],
-    uniqueIndexes: overrides.uniqueIndexes ?? [],
-    isGenerated: overrides.isGenerated ?? false,
-  };
-}
-
-function createMockDMMF(models: DMMF.Model[]): DMMF.Document {
-  return {
-    datamodel: {
-      models,
-      enums: [],
-      types: [],
-    },
-    schema: {
-      inputObjectTypes: { prisma: [] },
-      outputObjectTypes: { prisma: [], model: [] },
-      enumTypes: { prisma: [] },
-      fieldRefTypes: { prisma: [] },
-    },
-    mappings: {
-      modelOperations: [],
-      otherOperations: { read: [], write: [] },
-    },
-  };
-}
+import { createMockField, createMockModel, createMockDMMF } from './helpers/mock-dmmf.js';
 
 describe('buildCascadeGraph', () => {
   it('builds graph for User -> Post cascade relationship', () => {

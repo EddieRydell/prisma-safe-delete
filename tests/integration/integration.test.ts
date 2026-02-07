@@ -31,8 +31,8 @@ describe('Integration: prisma generate', () => {
   });
 
   it('generates valid TypeScript that compiles', () => {
-    // Run tsc on the generated files
-    const result = execSync(
+    // Run tsc on the generated files - throws if compilation fails
+    execSync(
       `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 ${path.join(generatedDir, 'index.ts')}`,
       {
         cwd: integrationDir,
