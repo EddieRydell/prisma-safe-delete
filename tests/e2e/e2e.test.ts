@@ -1580,7 +1580,7 @@ describe('E2E: Real database tests', () => {
       });
 
       // Raw queries bypass the wrapper entirely - this is expected
-      const result = await safePrisma.$queryRaw`SELECT * FROM User`;
+      const result = await safePrisma.$queryRaw`SELECT * FROM "User"`;
 
       expect(result).toHaveLength(2);
     });
