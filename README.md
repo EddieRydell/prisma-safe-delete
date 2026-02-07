@@ -394,6 +394,19 @@ await safePrisma.user.update({
 - Prisma >= 5.0.0
 - TypeScript >= 5.0 (recommended)
 
+## Development
+
+```bash
+# Start Postgres
+docker compose up -d
+
+# Run tests
+pnpm test
+
+# Stop Postgres
+docker compose down
+```
+
 ## License
 
 MIT
