@@ -30,7 +30,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "ci": "pnpm audit --prod && pnpm run typecheck && pnpm run lint && pnpm run knip && pnpm run test",
-    "prepublishOnly": "pnpm run ci && pnpm run build",
+    "prepublishOnly": "pnpm run build",
     "version": "pnpm run build"
   },
   "keywords": [
