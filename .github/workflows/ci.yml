@@ -24,6 +24,14 @@ jobs:
       - name: Audit
         run: pnpm audit
 
+      - name: Build Generator
+        run: pnpm run build
+
+      - name: Generate Test Clients
+        run: |
+          cd tests/e2e && npx prisma generate
+          cd ../integration && npx prisma generate
+
       - name: Type Check
         run: pnpm run typecheck
 

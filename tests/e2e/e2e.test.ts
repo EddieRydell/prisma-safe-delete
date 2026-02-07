@@ -1205,8 +1205,8 @@ describe('E2E: Real database tests', () => {
       });
 
       // Should get D (C is deleted)
-      expect(users.some(u => u.name === 'D')).toBe(true);
-      expect(users.every(u => u.name !== 'C')).toBe(true);
+      expect(users.some((u: any) => u.name === 'D')).toBe(true);
+      expect(users.every((u: any) => u.name !== 'C')).toBe(true);
     });
   });
 
@@ -1243,8 +1243,8 @@ describe('E2E: Real database tests', () => {
         orderBy: { name: 'asc' },
       });
 
-      const teamA = groups.find(g => g.name === 'Team A');
-      const teamB = groups.find(g => g.name === 'Team B');
+      const teamA = groups.find((g: any) => g.name === 'Team A');
+      const teamB = groups.find((g: any) => g.name === 'Team B');
 
       expect(teamA?._count).toBe(2); // Not 3, because one is deleted
       expect(teamB?._count).toBe(1);
