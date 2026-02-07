@@ -1273,26 +1273,30 @@ describe('E2E: Real database tests', () => {
   });
 
   describe('Concurrent operations', () => {
-    it('handles concurrent soft deletes safely', async () => {
-      // Use Article model - no unique string fields means no mangling overhead
-      await prisma.article.createMany({
-        data: Array.from({ length: 10 }, (_, i) => ({
-          id: `article-${String(i)}`,
-          title: `Article ${String(i)}`,
-        })),
-      });
+    // SQLite uses file-level locking, so concurrent transactions serialize with backoff delays
+    it(
+      'handles concurrent soft deletes safely',
+      async () => {
+        await prisma.user.createMany({
+          data: Array.from({ length: 10 }, (_, i) => ({
+            id: `user-${String(i)}`,
+            email: `user${String(i)}@test.com`,
+          })),
+        });
 
-      // Soft delete multiple records concurrently
-      await Promise.all([
-        safePrisma.article.softDelete({ where: { id: 'article-0' } }),
-        safePrisma.article.softDelete({ where: { id: 'article-1' } }),
-        safePrisma.article.softDelete({ where: { id: 'article-2' } }),
-        safePrisma.article.softDelete({ where: { id: 'article-3' } }),
-        safePrisma.article.softDelete({ where: { id: 'article-4' } }),
-      ]);
+        // Soft delete multiple records concurrently
+        await Promise.all([
+          safePrisma.user.softDelete({ where: { id: 'user-0' } }),
+          safePrisma.user.softDelete({ where: { id: 'user-1' } }),
+          safePrisma.user.softDelete({ where: { id: 'user-2' } }),
+          safePrisma.user.softDelete({ where: { id: 'user-3' } }),
+          safePrisma.user.softDelete({ where: { id: 'user-4' } }),
+        ]);
 
-      expect(await safePrisma.article.count()).toBe(5);
-    });
+        expect(await safePrisma.user.count()).toBe(5);
+      },
+      15000,
+    );
   });
 
   describe('Null and edge case handling', () => {
