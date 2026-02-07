@@ -54,7 +54,7 @@ describe('E2E: Real database tests', () => {
     wrapPrismaClient = softCascadeModule.wrapPrismaClient;
 
     // Create pg pool and Prisma adapter (Prisma 7 requirement)
-    const connectionString = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5433/test';
+    const connectionString = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/test';
     pool = new pg.Pool({ connectionString });
     const adapter = new PrismaPg(pool);
 

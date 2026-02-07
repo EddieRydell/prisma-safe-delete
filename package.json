@@ -19,7 +19,7 @@
     "knip": "knip",
     "test": "vitest run",
     "test:watch": "vitest",
-    "ci": "pnpm run typecheck && pnpm run lint && pnpm run knip && pnpm run test",
+    "ci": "pnpm audit --prod && pnpm run typecheck && pnpm run lint && pnpm run knip && pnpm run test",
     "prepublishOnly": "pnpm run ci && pnpm run build"
   },
   "keywords": [
