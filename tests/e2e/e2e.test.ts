@@ -982,8 +982,8 @@ describe('E2E: Real database tests', () => {
     it('handles softDeleteMany with 100+ records', async () => {
       // Create 150 users
       const users = Array.from({ length: 150 }, (_, i) => ({
-        id: `user-${i}`,
-        email: `user${i}@test.com`,
+        id: `user-${String(i)}`,
+        email: `user${String(i)}@test.com`,
         name: i < 100 ? 'BatchDelete' : 'Keep',
       }));
       await prisma.user.createMany({ data: users });
@@ -1004,13 +1004,13 @@ describe('E2E: Real database tests', () => {
           email: 'prolific@test.com',
           posts: {
             create: Array.from({ length: 50 }, (_, i) => ({
-              id: `post-${i}`,
-              title: `Post ${i}`,
+              id: `post-${String(i)}`,
+              title: `Post ${String(i)}`,
               comments: {
                 create: [
-                  { id: `comment-${i}-a`, content: 'Comment A' },
-                  { id: `comment-${i}-b`, content: 'Comment B' },
-                  { id: `comment-${i}-c`, content: 'Comment C' },
+                  { id: `comment-${String(i)}-a`, content: 'Comment A' },
+                  { id: `comment-${String(i)}-b`, content: 'Comment B' },
+                  { id: `comment-${String(i)}-c`, content: 'Comment C' },
                 ],
               },
             })),
@@ -1276,8 +1276,8 @@ describe('E2E: Real database tests', () => {
     it('handles concurrent soft deletes safely', async () => {
       await prisma.user.createMany({
         data: Array.from({ length: 10 }, (_, i) => ({
-          id: `user-${i}`,
-          email: `user${i}@test.com`,
+          id: `user-${String(i)}`,
+          email: `user${String(i)}@test.com`,
         })),
       });
 

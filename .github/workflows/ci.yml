@@ -19,7 +19,7 @@ jobs:
           node-version: '20'
           cache: 'pnpm'
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - name: Audit
         run: pnpm audit

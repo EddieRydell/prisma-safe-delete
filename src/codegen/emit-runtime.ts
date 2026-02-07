@@ -55,7 +55,7 @@ export function emitRuntime(schema: ParsedSchema): string {
   lines.push('const RELATION_IS_LIST: Record<string, boolean> = {');
   for (const model of schema.models) {
     for (const relation of model.relations) {
-      lines.push(`  '${model.name}.${relation.name}': ${relation.isList},`);
+      lines.push(`  '${model.name}.${relation.name}': ${String(relation.isList)},`);
     }
   }
   lines.push('};');
@@ -760,13 +760,6 @@ function create${name}Delegate(prisma: PrismaClient): any {
 function create${name}Delegate(prisma: PrismaClient): any {
   return prisma.${lowerName};
 }`.trim();
-}
-
-function getPrimaryKeySelect(model: ParsedModel): string {
-  if (Array.isArray(model.primaryKey)) {
-    return model.primaryKey.map((k) => `${k}: true`).join(', ');
-  }
-  return `${model.primaryKey}: true`;
 }
 
 function emitIncludingDeletedClient(schema: ParsedSchema): string {

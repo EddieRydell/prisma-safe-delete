@@ -175,7 +175,7 @@ function extractUniqueStringFields(model: DMMFModel): string[] {
   for (const uniqueConstraint of model.uniqueFields) {
     for (const fieldName of uniqueConstraint) {
       const field = model.fields.find((f) => f.name === fieldName);
-      if (field !== undefined && field.type === 'String') {
+      if (field?.type === 'String') {
         uniqueStringFields.add(fieldName);
       }
     }
