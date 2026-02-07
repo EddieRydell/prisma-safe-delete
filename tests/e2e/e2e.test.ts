@@ -2054,8 +2054,7 @@ describe('E2E: Real database tests', () => {
       // Check comments
       const rawComments = await prisma.comment.findMany();
       expect(rawComments).toHaveLength(2);
-      expect(rawComments[0].deleted_by).toBe('admin-456');
-      expect(rawComments[1].deleted_by).toBe('admin-456');
+      expect(rawComments.every((c: any) => c.deleted_by === 'admin-456')).toBe(true);
     });
 
     it('softDeleteMany sets deleted_by on all records', async () => {
