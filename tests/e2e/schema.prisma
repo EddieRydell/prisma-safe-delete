@@ -58,3 +58,142 @@ model AuditLog {
   entityId  String
   createdAt DateTime @default(now())
 }
+
+// Compound key models for testing compound PK/FK support
+model TenantUser {
+  tenantId   String
+  userId     String
+  email      String
+  deleted_at DateTime?
+  documents  TenantDocument[]
+
+  @@id([tenantId, userId])
+}
+
+model TenantDocument {
+  id         String     @id @default(cuid())
+  tenantId   String
+  userId     String
+  title      String
+  deleted_at DateTime?
+  owner      TenantUser @relation(fields: [tenantId, userId], references: [tenantId, userId], onDelete: Cascade)
+}
+
+// camelCase deletedAt models for testing alternative field naming
+model Article {
+  id        String       @id @default(cuid())
+  title     String
+  deletedAt DateTime?
+  tags      ArticleTag[]
+}
+
+model ArticleTag {
+  id        String   @id @default(cuid())
+  name      String
+  articleId String
+  article   Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  deletedAt DateTime?
+}
+
+// Self-referential model for testing recursive structures
+model Category {
+  id         String     @id @default(cuid())
+  name       String
+  parentId   String?
+  parent     Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children   Category[] @relation("CategoryHierarchy")
+  products   Product[]
+  deleted_at DateTime?
+}
+
+// For testing deep cascade (Category -> Product -> ProductVariant -> VariantOption)
+model Product {
+  id         String           @id @default(cuid())
+  name       String
+  categoryId String
+  category   Category         @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  variants   ProductVariant[]
+  deleted_at DateTime?
+}
+
+model ProductVariant {
+  id         String          @id @default(cuid())
+  sku        String
+  productId  String
+  product    Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  options    VariantOption[]
+  deleted_at DateTime?
+}
+
+model VariantOption {
+  id        String         @id @default(cuid())
+  name      String
+  value     String
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+}
+
+// For testing wide cascade (Organization has many different child types)
+model Organization {
+  id         String       @id @default(cuid())
+  name       String
+  teams      Team[]
+  projects   Project[]
+  assets     Asset[]
+  deleted_at DateTime?
+}
+
+model Team {
+  id             String       @id @default(cuid())
+  name           String
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  deleted_at     DateTime?
+}
+
+model Project {
+  id             String       @id @default(cuid())
+  name           String
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  deleted_at     DateTime?
+}
+
+// Non-soft-deletable child in cascade path
+model Asset {
+  id             String       @id @default(cuid())
+  url            String
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  // Note: No deleted_at - this is intentionally not soft-deletable
+}
+
+// Model with unique string constraint for testing mangling
+model Customer {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  username   String    @unique
+  name       String?
+  orders     Order[]
+  deleted_at DateTime?
+}
+
+model Order {
+  id          String    @id @default(cuid())
+  orderNumber String    @unique
+  customerId  String
+  customer    Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  deleted_at  DateTime?
+}
+
+// Model with compound unique constraint
+model Workspace {
+  id         String    @id @default(cuid())
+  orgSlug    String
+  slug       String
+  name       String
+  deleted_at DateTime?
+
+  @@unique([orgSlug, slug])
+}

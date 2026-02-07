@@ -39,6 +39,43 @@ export function emitRuntime(schema: ParsedSchema): string {
   lines.push('};');
   lines.push('');
 
+  // Emit relation models mapping (for proper relation target lookup)
+  lines.push('/** Maps model.field to target model name */');
+  lines.push('const RELATION_MODELS: Record<string, string> = {');
+  for (const model of schema.models) {
+    for (const relation of model.relations) {
+      lines.push(`  '${model.name}.${relation.name}': '${relation.type}',`);
+    }
+  }
+  lines.push('};');
+  lines.push('');
+
+  // Emit relation list metadata (for knowing if a relation supports where clause)
+  lines.push('/** Maps model.field to whether it is a list relation */');
+  lines.push('const RELATION_IS_LIST: Record<string, boolean> = {');
+  for (const model of schema.models) {
+    for (const relation of model.relations) {
+      lines.push(`  '${model.name}.${relation.name}': ${relation.isList},`);
+    }
+  }
+  lines.push('};');
+  lines.push('');
+
+  // Emit unique string fields metadata (for mangling on soft delete)
+  lines.push('/**');
+  lines.push(' * String fields with unique constraints that need mangling on soft delete.');
+  lines.push(' * On soft delete, these fields get "__deleted_{pk}" appended to free up the unique value.');
+  lines.push(' * For compound PKs, the suffix is "__deleted_{pk1}_{pk2}" (fields joined with underscore, sorted alphabetically).');
+  lines.push(' */');
+  lines.push('const UNIQUE_STRING_FIELDS: Record<string, string[]> = {');
+  for (const model of schema.models) {
+    if (model.uniqueStringFields.length > 0) {
+      lines.push(`  ${model.name}: ${JSON.stringify(model.uniqueStringFields)},`);
+    }
+  }
+  lines.push('};');
+  lines.push('');
+
   // Emit helper functions
   lines.push(emitHelperFunctions());
   lines.push('');
@@ -61,6 +98,10 @@ export function emitRuntime(schema: ParsedSchema): string {
   lines.push(emitIncludingDeletedClient(schema));
   lines.push('');
   lines.push(emitOnlyDeletedClient(schema));
+  lines.push('');
+
+  // Emit transaction wrapper
+  lines.push(emitTransactionWrapper(schema));
   lines.push('');
 
   // Emit main wrapper function
@@ -116,6 +157,142 @@ function createPkWhere(modelName: string, pkValues: Record<string, unknown>): Re
   }
 
   return pkValues;
+}
+
+/**
+ * Creates a where clause for updating a record by its primary key values.
+ * For simple PKs: { id: 'value' }
+ * For compound PKs: { pk1_pk2: { pk1: 'v1', pk2: 'v2' } }
+ */
+function createPkWhereFromValues(modelName: string, pkValues: Record<string, unknown>): Record<string, unknown> {
+  const pk = PRIMARY_KEYS[modelName];
+  if (!pk) return pkValues;
+
+  if (Array.isArray(pk)) {
+    // Compound key - Prisma expects { pk1_pk2: { pk1: v1, pk2: v2 } }
+    const compoundName = pk.join('_');
+    return { [compoundName]: pkValues };
+  }
+
+  // Simple key - just return the values as-is
+  return pkValues;
+}
+
+/**
+ * Gets the target model name for a relation field
+ */
+function getRelationModel(parentModel: string, fieldName: string): string | null {
+  return RELATION_MODELS[\`\${parentModel}.\${fieldName}\`] ?? null;
+}
+
+/**
+ * Checks if a relation is a list (to-many) relation
+ */
+function isListRelation(parentModel: string, fieldName: string): boolean {
+  return RELATION_IS_LIST[\`\${parentModel}.\${fieldName}\`] ?? false;
+}
+
+/**
+ * Decomposes a compound key where clause into individual fields.
+ * Converts { tenantId_userId: { tenantId: 'x', userId: 'y' } } into { tenantId: 'x', userId: 'y' }
+ */
+function decomposeCompoundKeyWhere(
+  modelName: string,
+  where: Record<string, unknown>
+): Record<string, unknown> {
+  const pk = PRIMARY_KEYS[modelName];
+  if (!pk || !Array.isArray(pk)) {
+    return where;
+  }
+
+  // Check if where contains the compound key name
+  const compoundKeyName = pk.join('_');
+  const compoundValue = where[compoundKeyName];
+
+  if (compoundValue && typeof compoundValue === 'object') {
+    // Decompose the compound key
+    const { [compoundKeyName]: _removed, ...rest } = where;
+    return {
+      ...rest,
+      ...(compoundValue as Record<string, unknown>),
+    };
+  }
+
+  return where;
+}
+
+/**
+ * Builds a deterministic PK suffix for mangling unique fields.
+ * For simple PKs: "__deleted_{pkValue}"
+ * For compound PKs: "__deleted_{pk1Value}_{pk2Value}" (fields sorted alphabetically)
+ */
+function buildPkSuffix(modelName: string, record: Record<string, unknown>): string {
+  const pk = PRIMARY_KEYS[modelName];
+  if (!pk) return '__deleted_unknown';
+
+  const pkFields = Array.isArray(pk) ? [...pk].sort() : [pk];
+  const pkValues = pkFields.map(field => String(record[field] ?? 'null'));
+  return \`__deleted_\${pkValues.join('_')}\`;
+}
+
+/**
+ * Gets the unique string fields for a model that need mangling on soft delete.
+ */
+function getUniqueStringFields(modelName: string): string[] {
+  return UNIQUE_STRING_FIELDS[modelName] ?? [];
+}
+
+/**
+ * Default max length for string fields (conservative estimate).
+ * Most databases use 255 for varchar without explicit length.
+ */
+const DEFAULT_MAX_STRING_LENGTH = 255;
+
+/**
+ * Mangles unique string fields by appending the PK suffix.
+ * Returns the update data object with mangled values, or throws if mangling would exceed max length.
+ */
+function mangleUniqueFields(
+  modelName: string,
+  record: Record<string, unknown>,
+  maxLength: number = DEFAULT_MAX_STRING_LENGTH
+): Record<string, unknown> {
+  const uniqueFields = getUniqueStringFields(modelName);
+  if (uniqueFields.length === 0) return {};
+
+  const suffix = buildPkSuffix(modelName, record);
+  const updates: Record<string, unknown> = {};
+
+  for (const field of uniqueFields) {
+    const currentValue = record[field];
+
+    // Skip null/undefined values - they don't conflict with unique constraints
+    if (currentValue === null || currentValue === undefined) {
+      continue;
+    }
+
+    const strValue = String(currentValue);
+
+    // Skip if already mangled (idempotent)
+    if (strValue.endsWith(suffix)) {
+      continue;
+    }
+
+    const mangledValue = strValue + suffix;
+
+    // Check max length
+    if (mangledValue.length > maxLength) {
+      throw new Error(
+        \`Cannot soft delete \${modelName}: mangling unique field "\${field}" would exceed max length \` +
+        \`(\${mangledValue.length} > \${maxLength}). Original value: "\${strValue.substring(0, 50)}\${strValue.length > 50 ? '...' : ''}". \` +
+        \`Consider using a partial unique index instead, or hard delete the record.\`
+      );
+    }
+
+    updates[field] = mangledValue;
+  }
+
+  return updates;
 }`.trim();
 }
 
@@ -139,12 +316,20 @@ function injectFilters<T extends Record<string, unknown>>(
   const result = { ...args };
   const deletedAtField = getDeletedAtField(modelName);
 
-  // Inject into top-level where
+  // Inject into top-level where and process relation filters
   if (deletedAtField) {
-    result.where = {
-      ...((result.where as Record<string, unknown>) ?? {}),
-      [deletedAtField]: null,
-    };
+    result.where = injectIntoWhere(
+      {
+        ...((result.where as Record<string, unknown>) ?? {}),
+        [deletedAtField]: null,
+      },
+      modelName
+    );
+  } else if (result.where) {
+    result.where = injectIntoWhere(
+      result.where as Record<string, unknown>,
+      modelName
+    );
   }
 
   // Process include
@@ -167,36 +352,192 @@ function injectFilters<T extends Record<string, unknown>>(
 }
 
 /**
+ * Injects soft delete filters into where clauses, including relation filters
+ */
+function injectIntoWhere(
+  where: Record<string, unknown>,
+  parentModel: string
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(where)) {
+    // Check if this is a relation filter (some, every, none, is, isNot)
+    const relationModel = getRelationModel(parentModel, key);
+
+    if (relationModel && value && typeof value === 'object') {
+      const relationFilter = value as Record<string, unknown>;
+      const deletedAtField = getDeletedAtField(relationModel);
+      const processedFilter: Record<string, unknown> = {};
+
+      for (const [filterKey, filterValue] of Object.entries(relationFilter)) {
+        if (['some', 'every', 'none'].includes(filterKey) && filterValue && typeof filterValue === 'object') {
+          // Inject deleted_at filter into the relation condition
+          const innerWhere = filterValue as Record<string, unknown>;
+          if (deletedAtField) {
+            processedFilter[filterKey] = injectIntoWhere(
+              { ...innerWhere, [deletedAtField]: null },
+              relationModel
+            );
+          } else {
+            processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel);
+          }
+        } else if (['is', 'isNot'].includes(filterKey) && filterValue && typeof filterValue === 'object') {
+          // Handle is/isNot for single relations
+          const innerWhere = filterValue as Record<string, unknown>;
+          if (deletedAtField) {
+            processedFilter[filterKey] = injectIntoWhere(
+              { ...innerWhere, [deletedAtField]: null },
+              relationModel
+            );
+          } else {
+            processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel);
+          }
+        } else {
+          processedFilter[filterKey] = filterValue;
+        }
+      }
+
+      result[key] = processedFilter;
+    } else if (key === 'AND' && Array.isArray(value)) {
+      result[key] = value.map(v =>
+        typeof v === 'object' && v !== null
+          ? injectIntoWhere(v as Record<string, unknown>, parentModel)
+          : v
+      );
+    } else if (key === 'OR' && Array.isArray(value)) {
+      result[key] = value.map(v =>
+        typeof v === 'object' && v !== null
+          ? injectIntoWhere(v as Record<string, unknown>, parentModel)
+          : v
+      );
+    } else if (key === 'NOT' && value && typeof value === 'object') {
+      result[key] = Array.isArray(value)
+        ? value.map(v => typeof v === 'object' && v !== null
+            ? injectIntoWhere(v as Record<string, unknown>, parentModel)
+            : v)
+        : injectIntoWhere(value as Record<string, unknown>, parentModel);
+    } else {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+
+/**
  * Injects filters into relation includes/selects
  */
 function injectIntoRelations(
   relations: Record<string, unknown>,
-  _parentModel: string
+  parentModel: string
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(relations)) {
+    // Handle _count specially
+    if (key === '_count') {
+      if (value === true) {
+        // Simple _count: true - we need to add filters for all countable relations
+        // This is complex because we don't know which relations are being counted
+        // For now, pass through (Prisma will count all)
+        result[key] = value;
+      } else if (value && typeof value === 'object') {
+        const countObj = value as Record<string, unknown>;
+        if (countObj.select && typeof countObj.select === 'object') {
+          // _count: { select: { posts: true, comments: true } }
+          const countSelect = countObj.select as Record<string, unknown>;
+          const filteredCountSelect: Record<string, unknown> = {};
+
+          for (const [relName, relValue] of Object.entries(countSelect)) {
+            const relationModel = getRelationModel(parentModel, relName);
+            if (relationModel) {
+              const deletedAtField = getDeletedAtField(relationModel);
+              if (deletedAtField && relValue === true) {
+                // Add where filter to count only non-deleted
+                filteredCountSelect[relName] = {
+                  where: { [deletedAtField]: null },
+                };
+              } else if (deletedAtField && relValue && typeof relValue === 'object') {
+                // Merge with existing where
+                const existing = relValue as Record<string, unknown>;
+                filteredCountSelect[relName] = {
+                  ...existing,
+                  where: {
+                    ...((existing.where as Record<string, unknown>) ?? {}),
+                    [deletedAtField]: null,
+                  },
+                };
+              } else {
+                filteredCountSelect[relName] = relValue;
+              }
+            } else {
+              filteredCountSelect[relName] = relValue;
+            }
+          }
+
+          result[key] = { ...countObj, select: filteredCountSelect };
+        } else {
+          result[key] = value;
+        }
+      } else {
+        result[key] = value;
+      }
+      continue;
+    }
+
+    // Look up the actual target model for this relation field
+    const relationModel = getRelationModel(parentModel, key);
+    const isList = isListRelation(parentModel, key);
+
     if (value === true) {
-      // Simple include - check if relation target is soft-deletable
-      // For now, we include as-is; full implementation would look up relation target
-      result[key] = value;
+      // Simple include - inject filter if relation target is soft-deletable
+      // Only add where clause for list relations (non-list relations don't support where in include)
+      if (relationModel && isList) {
+        const deletedAtField = getDeletedAtField(relationModel);
+        if (deletedAtField) {
+          result[key] = {
+            where: { [deletedAtField]: null },
+          };
+        } else {
+          result[key] = value;
+        }
+      } else {
+        result[key] = value;
+      }
     } else if (value && typeof value === 'object') {
       // Nested include with options
-      const nested = value as Record<string, unknown>;
-      const relationModel = key.charAt(0).toUpperCase() + key.slice(1);
-      const deletedAtField = getDeletedAtField(relationModel);
+      const nested = { ...(value as Record<string, unknown>) };
 
-      if (deletedAtField) {
-        result[key] = {
-          ...nested,
-          where: {
-            ...((nested.where as Record<string, unknown>) ?? {}),
-            [deletedAtField]: null,
-          },
-        };
-      } else {
-        result[key] = nested;
+      if (relationModel) {
+        // Only add where clause for list relations
+        if (isList) {
+          const deletedAtField = getDeletedAtField(relationModel);
+          if (deletedAtField) {
+            nested.where = {
+              ...((nested.where as Record<string, unknown>) ?? {}),
+              [deletedAtField]: null,
+            };
+          }
+        }
+
+        // Recursively process nested includes
+        if (nested.include && typeof nested.include === 'object') {
+          nested.include = injectIntoRelations(
+            nested.include as Record<string, unknown>,
+            relationModel
+          );
+        }
+
+        // Recursively process nested selects
+        if (nested.select && typeof nested.select === 'object') {
+          nested.select = injectIntoRelations(
+            nested.select as Record<string, unknown>,
+            relationModel
+          );
+        }
       }
+
+      result[key] = nested;
     } else {
       result[key] = value;
     }
@@ -228,9 +569,11 @@ async function softDeleteWithCascade(
   await prisma.$transaction(async (tx) => {
     // Find all records to delete
     const delegate = tx[lowerModelName as keyof typeof tx] as any;
+    // Decompose compound key where clause if needed
+    const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
     const records = await delegate.findMany({
       where: {
-        ...where,
+        ...decomposedWhere,
         [deletedAtField]: null, // Only non-deleted records
       },
     });
@@ -245,23 +588,31 @@ async function softDeleteWithCascade(
     // Cascade to children (depth-first)
     await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
 
-    // Update parent records
+    // Update parent records - mangle unique fields first, then set deleted_at
     const pk = PRIMARY_KEYS[modelName];
     const pkField = Array.isArray(pk) ? pk.join('_') : pk;
 
-    const updateData: Record<string, unknown> = { [deletedAtField]: now };
-    const deletedByField = getDeletedByField(modelName);
-    if (deletedByField && deletedBy) {
-      updateData[deletedByField] = deletedBy;
-    }
+    // For each record, we need to mangle unique fields individually
+    // because each record has its own PK suffix
+    for (const record of records) {
+      const pkVal = extractPrimaryKey(modelName, record);
+      const mangledFields = mangleUniqueFields(modelName, record);
 
-    await delegate.updateMany({
-      where: {
-        OR: pkValues.map((pkVal: Record<string, unknown>) => pkVal),
-        [deletedAtField]: null,
-      },
-      data: updateData,
-    });
+      const updateData: Record<string, unknown> = {
+        ...mangledFields,
+        [deletedAtField]: now,
+      };
+
+      const deletedByField = getDeletedByField(modelName);
+      if (deletedByField && deletedBy) {
+        updateData[deletedByField] = deletedBy;
+      }
+
+      await delegate.update({
+        where: createPkWhereFromValues(modelName, pkVal),
+        data: updateData,
+      });
+    }
   });
 }
 
@@ -289,18 +640,26 @@ async function cascadeToChildren(
     const lowerChildModel = child.model.charAt(0).toLowerCase() + child.model.slice(1);
     const childDelegate = tx[lowerChildModel as keyof typeof tx] as any;
 
-    // Build where clause to find children
-    const fkField = child.foreignKey[0];
-    const pkField = child.parentKey[0];
+    // Build where clause to find children - handle compound keys
+    if (child.foreignKey.length === 0 || child.parentKey.length === 0) continue;
 
-    if (!fkField || !pkField) continue;
-
-    const parentIds = parentPkValues.map((pk) => pk[pkField]);
+    // Build OR conditions for each parent record (supports compound keys)
+    const childWhereConditions = parentPkValues.map((pkVal) => {
+      const condition: Record<string, unknown> = {};
+      for (let i = 0; i < child.foreignKey.length; i++) {
+        const fkField = child.foreignKey[i];
+        const pkField = child.parentKey[i];
+        if (fkField && pkField) {
+          condition[fkField] = pkVal[pkField];
+        }
+      }
+      return condition;
+    });
 
     // Find child records
     const childRecords = await childDelegate.findMany({
       where: {
-        [fkField]: { in: parentIds },
+        OR: childWhereConditions,
         ...(child.deletedAtField ? { [child.deletedAtField]: null } : {}),
       },
     });
@@ -317,15 +676,19 @@ async function cascadeToChildren(
 
     // Soft delete children (if soft-deletable)
     if (child.isSoftDeletable && child.deletedAtField) {
-      await childDelegate.updateMany({
-        where: {
-          [fkField]: { in: parentIds },
-          [child.deletedAtField]: null,
-        },
-        data: {
-          [child.deletedAtField]: deletedAt,
-        },
-      });
+      // Mangle unique fields for each child individually
+      for (const childRecord of childRecords) {
+        const childPkVal = extractPrimaryKey(child.model, childRecord);
+        const mangledFields = mangleUniqueFields(child.model, childRecord);
+
+        await childDelegate.update({
+          where: createPkWhereFromValues(child.model, childPkVal),
+          data: {
+            ...mangledFields,
+            [child.deletedAtField]: deletedAt,
+          },
+        });
+      }
     }
   }
 }`.trim();
@@ -365,12 +728,19 @@ function create${name}Delegate(prisma: PrismaClient): any {
     // Soft delete methods
     softDelete: async (args: any) => {
       await softDeleteWithCascade(prisma, '${name}', args.where);
-      return original.findFirst({ where: args.where });
+      // Decompose compound key for findFirst
+      const decomposedWhere = decomposeCompoundKeyWhere('${name}', args.where);
+      return original.findFirst({ where: decomposedWhere });
     },
     softDeleteMany: async (args: any) => {
+      const deletedAtField = getDeletedAtField('${name}');
+      const pk = PRIMARY_KEYS['${name}'];
+      const pkFields = Array.isArray(pk) ? pk : [pk];
+      const selectClause = Object.fromEntries(pkFields.map(f => [f, true]));
+
       const records = await original.findMany({
-        where: { ...args.where, ${model.deletedAtField ?? 'deleted_at'}: null },
-        select: { ${getPrimaryKeySelect(model)} },
+        where: { ...args.where, ...(deletedAtField ? { [deletedAtField]: null } : {}) },
+        select: selectClause,
       });
       await softDeleteWithCascade(prisma, '${name}', args.where);
       return { count: records.length };
@@ -454,6 +824,44 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
   return lines.join('\n');
 }
 
+function emitTransactionWrapper(schema: ParsedSchema): string {
+  const lines: string[] = [];
+  lines.push('/**');
+  lines.push(' * Wraps a transaction client with soft-delete filtering');
+  lines.push(' */');
+  lines.push('function wrapTransactionClient(tx: any): any {');
+  lines.push('  return {');
+
+  for (const model of schema.models) {
+    const lowerName = toLowerFirst(model.name);
+    if (model.isSoftDeletable) {
+      lines.push(`    ${lowerName}: {`);
+      lines.push(`      findMany: (args?: any) => tx.${lowerName}.findMany(injectFilters(args, '${model.name}')),`);
+      lines.push(`      findFirst: (args?: any) => tx.${lowerName}.findFirst(injectFilters(args, '${model.name}')),`);
+      lines.push(`      findFirstOrThrow: (args?: any) => tx.${lowerName}.findFirstOrThrow(injectFilters(args, '${model.name}')),`);
+      lines.push(`      findUnique: (args?: any) => tx.${lowerName}.findUnique(injectFilters(args, '${model.name}')),`);
+      lines.push(`      findUniqueOrThrow: (args?: any) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args, '${model.name}')),`);
+      lines.push(`      count: (args?: any) => tx.${lowerName}.count(injectFilters(args, '${model.name}')),`);
+      lines.push(`      aggregate: (args?: any) => tx.${lowerName}.aggregate(injectFilters(args, '${model.name}')),`);
+      lines.push(`      groupBy: (args?: any) => tx.${lowerName}.groupBy(injectFilters(args, '${model.name}')),`);
+      lines.push(`      create: (args: any) => tx.${lowerName}.create(args),`);
+      lines.push(`      createMany: (args: any) => tx.${lowerName}.createMany(args),`);
+      lines.push(`      update: (args: any) => tx.${lowerName}.update(args),`);
+      lines.push(`      updateMany: (args: any) => tx.${lowerName}.updateMany(args),`);
+      lines.push(`      upsert: (args: any) => tx.${lowerName}.upsert(args),`);
+      lines.push(`      delete: (args: any) => tx.${lowerName}.delete(args),`);
+      lines.push(`      deleteMany: (args: any) => tx.${lowerName}.deleteMany(args),`);
+      lines.push(`    },`);
+    } else {
+      lines.push(`    ${lowerName}: tx.${lowerName},`);
+    }
+  }
+
+  lines.push('  };');
+  lines.push('}');
+  return lines.join('\n');
+}
+
 function emitWrapperFunction(schema: ParsedSchema): string {
   const lines: string[] = [];
   lines.push('/**');
@@ -471,7 +879,18 @@ function emitWrapperFunction(schema: ParsedSchema): string {
   lines.push('    $connect: () => prisma.$connect(),');
   lines.push('    $disconnect: () => prisma.$disconnect(),');
   lines.push('    $on: (...args: any[]) => (prisma.$on as any)(...args),');
-  lines.push('    $transaction: (...args: any[]) => (prisma.$transaction as any)(...args),');
+  lines.push('    $transaction: (arg: any, options?: any) => {');
+  lines.push('      // Handle both sequential and interactive transactions');
+  lines.push('      if (typeof arg === "function") {');
+  lines.push('        // Interactive transaction - wrap the callback to provide safe delegates');
+  lines.push('        return prisma.$transaction((tx: any) => {');
+  lines.push('          const wrappedTx = wrapTransactionClient(tx);');
+  lines.push('          return arg(wrappedTx);');
+  lines.push('        }, options);');
+  lines.push('      }');
+  lines.push('      // Sequential transaction (array of promises)');
+  lines.push('      return (prisma.$transaction as any)(arg, options);');
+  lines.push('    },');
   lines.push('    $use: (...args: any[]) => (prisma.$use as any)(...args),');
   lines.push('    $extends: (...args: any[]) => (prisma.$extends as any)(...args),');
   lines.push('    $queryRaw: (...args: any[]) => (prisma.$queryRaw as any)(...args),');

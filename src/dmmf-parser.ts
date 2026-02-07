@@ -37,6 +37,8 @@ export interface ParsedModel {
   deletedByField: string | null;
   fields: ParsedField[];
   relations: ParsedRelation[];
+  /** String fields with @unique or part of @@unique that need mangling on soft delete */
+  uniqueStringFields: string[];
 }
 
 /**
@@ -156,6 +158,34 @@ function parseRelation(field: DMMFField): ParsedRelation | null {
 }
 
 /**
+ * Extracts unique string fields from a model.
+ * Includes both @unique fields and string fields from @@unique compound constraints.
+ */
+function extractUniqueStringFields(model: DMMFModel): string[] {
+  const uniqueStringFields = new Set<string>();
+
+  // Find fields with @unique that are strings
+  for (const field of model.fields) {
+    if (field.isUnique && field.type === 'String') {
+      uniqueStringFields.add(field.name);
+    }
+  }
+
+  // Find string fields in @@unique compound constraints
+  for (const uniqueConstraint of model.uniqueFields) {
+    for (const fieldName of uniqueConstraint) {
+      const field = model.fields.find((f) => f.name === fieldName);
+      if (field !== undefined && field.type === 'String') {
+        uniqueStringFields.add(fieldName);
+      }
+    }
+  }
+
+  // Return sorted for deterministic output
+  return [...uniqueStringFields].sort();
+}
+
+/**
  * Parses a single DMMF model into our ParsedModel format
  */
 function parseModel(model: DMMFModel): ParsedModel {
@@ -199,6 +229,7 @@ function parseModel(model: DMMFModel): ParsedModel {
     deletedByField,
     fields,
     relations,
+    uniqueStringFields: extractUniqueStringFields(model),
   };
 }
 
