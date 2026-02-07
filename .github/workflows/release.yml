@@ -22,8 +22,16 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - run: pnpm install --frozen-lockfile
+
+      - name: Build Generator
+        run: pnpm run build
+
+      - name: Generate Test Clients
+        run: |
+          cd tests/e2e && npx prisma generate
+          cd ../integration && npx prisma generate
+
       - run: pnpm run ci
-      - run: pnpm run build
       - run: pnpm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
