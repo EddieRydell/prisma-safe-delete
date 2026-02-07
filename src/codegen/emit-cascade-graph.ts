@@ -18,6 +18,7 @@ export function emitCascadeGraph(graph: CascadeGraph): string {
   lines.push('  parentKey: string[];');
   lines.push('  isSoftDeletable: boolean;');
   lines.push('  deletedAtField: string | null;');
+  lines.push('  deletedByField: string | null;');
   lines.push('}');
   lines.push('');
   lines.push('/** Maps parent model names to their cascade children */');

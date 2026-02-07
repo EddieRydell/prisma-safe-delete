@@ -41,9 +41,9 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  'delete' | 'deleteMany'`);
     lines.push(`> & {`);
     lines.push(`  /** Soft delete a single ${name} record */`);
-    lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}>>;`);
+    lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & { deletedBy?: string }) => Promise<Prisma.${name}GetPayload<{}>>;`);
     lines.push(`  /** Soft delete multiple ${name} records */`);
-    lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & { deletedBy?: string }) => Promise<Prisma.BatchPayload>;`);
     lines.push(`  /** Hard delete a single ${name} record (permanent) */`);
     lines.push(`  hardDelete: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}>>;`);
     lines.push(`  /** Hard delete multiple ${name} records (permanent) */`);

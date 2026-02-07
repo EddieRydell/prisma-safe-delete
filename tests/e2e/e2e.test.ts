@@ -1990,6 +1990,97 @@ describe('E2E: Real database tests', () => {
     });
   });
 
+  describe('deleted_by field support', () => {
+    it('softDelete sets deleted_by when provided', async () => {
+      await prisma.user.create({
+        data: { id: 'user-1', email: 'test@test.com' },
+      });
+
+      await safePrisma.user.softDelete({
+        where: { id: 'user-1' },
+        deletedBy: 'admin-123',
+      });
+
+      const rawUser = await prisma.user.findUnique({ where: { id: 'user-1' } });
+      expect(rawUser.deleted_at).not.toBeNull();
+      expect(rawUser.deleted_by).toBe('admin-123');
+    });
+
+    it('softDelete without deletedBy leaves the field null', async () => {
+      await prisma.user.create({
+        data: { id: 'user-1', email: 'test@test.com' },
+      });
+
+      await safePrisma.user.softDelete({ where: { id: 'user-1' } });
+
+      const rawUser = await prisma.user.findUnique({ where: { id: 'user-1' } });
+      expect(rawUser.deleted_at).not.toBeNull();
+      expect(rawUser.deleted_by).toBeNull();
+    });
+
+    it('softDelete cascade propagates deleted_by to children', async () => {
+      await prisma.user.create({
+        data: {
+          id: 'user-1',
+          email: 'author@test.com',
+          posts: {
+            create: {
+              id: 'post-1',
+              title: 'Post with comments',
+              comments: {
+                create: [
+                  { id: 'comment-1', content: 'Comment 1' },
+                  { id: 'comment-2', content: 'Comment 2' },
+                ],
+              },
+            },
+          },
+        },
+      });
+
+      await safePrisma.user.softDelete({
+        where: { id: 'user-1' },
+        deletedBy: 'admin-456',
+      });
+
+      // Check user
+      const rawUser = await prisma.user.findUnique({ where: { id: 'user-1' } });
+      expect(rawUser.deleted_by).toBe('admin-456');
+
+      // Check post
+      const rawPost = await prisma.post.findUnique({ where: { id: 'post-1' } });
+      expect(rawPost.deleted_by).toBe('admin-456');
+
+      // Check comments
+      const rawComments = await prisma.comment.findMany();
+      expect(rawComments).toHaveLength(2);
+      expect(rawComments.every((c: any) => c.deleted_by === 'admin-456')).toBe(true);
+    });
+
+    it('softDeleteMany sets deleted_by on all records', async () => {
+      await prisma.user.createMany({
+        data: [
+          { id: 'user-1', email: 'user1@test.com', name: 'ToDelete' },
+          { id: 'user-2', email: 'user2@test.com', name: 'ToDelete' },
+          { id: 'user-3', email: 'user3@test.com', name: 'Keep' },
+        ],
+      });
+
+      await safePrisma.user.softDeleteMany({
+        where: { name: 'ToDelete' },
+        deletedBy: 'batch-admin',
+      });
+
+      const user1 = await prisma.user.findUnique({ where: { id: 'user-1' } });
+      const user2 = await prisma.user.findUnique({ where: { id: 'user-2' } });
+      const user3 = await prisma.user.findUnique({ where: { id: 'user-3' } });
+
+      expect(user1.deleted_by).toBe('batch-admin');
+      expect(user2.deleted_by).toBe('batch-admin');
+      expect(user3.deleted_by).toBeNull(); // Not deleted
+    });
+  });
+
   describe('Known limitations (documented behavior)', () => {
     it('KNOWN LIMITATION: Fluent API does not filter (use include instead)', async () => {
       // The fluent API (findUnique().relation()) bypasses our wrapper

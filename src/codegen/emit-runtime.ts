@@ -29,6 +29,17 @@ export function emitRuntime(schema: ParsedSchema, clientImportPath: string): str
   lines.push('};');
   lines.push('');
 
+  // Emit deleted_by metadata
+  lines.push('/** Metadata about models with deleted_by fields */');
+  lines.push('const DELETED_BY_MODELS: Record<string, { deletedByField: string }> = {');
+  for (const model of schema.models) {
+    if (model.deletedByField !== null) {
+      lines.push(`  ${model.name}: { deletedByField: ${JSON.stringify(model.deletedByField)} },`);
+    }
+  }
+  lines.push('};');
+  lines.push('');
+
   // Emit primary key metadata
   lines.push('/** Primary key configuration per model */');
   lines.push('const PRIMARY_KEYS: Record<string, string | string[]> = {');
@@ -622,8 +633,7 @@ async function softDeleteWithCascade(
  * Gets the deleted_by field name for a model
  */
 function getDeletedByField(modelName: string): string | null {
-  // This would be populated from schema metadata in a full implementation
-  return null;
+  return DELETED_BY_MODELS[modelName]?.deletedByField ?? null;
 }
 
 /**
@@ -683,12 +693,19 @@ async function cascadeToChildren(
         const childPkVal = extractPrimaryKey(child.model, childRecord);
         const mangledFields = mangleUniqueFields(child.model, childRecord);
 
+        const updateData: Record<string, unknown> = {
+          ...mangledFields,
+          [child.deletedAtField]: deletedAt,
+        };
+
+        // Set deleted_by if the child model has the field and a value was provided
+        if (child.deletedByField && deletedBy) {
+          updateData[child.deletedByField] = deletedBy;
+        }
+
         await childDelegate.update({
           where: createPkWhereFromValues(child.model, childPkVal),
-          data: {
-            ...mangledFields,
-            [child.deletedAtField]: deletedAt,
-          },
+          data: updateData,
         });
       }
     }
@@ -729,22 +746,24 @@ function create${name}Delegate(prisma: PrismaClient): any {
 
     // Soft delete methods
     softDelete: async (args: any) => {
-      await softDeleteWithCascade(prisma, '${name}', args.where);
+      const { deletedBy, ...rest } = args;
+      await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
       // Decompose compound key for findFirst
-      const decomposedWhere = decomposeCompoundKeyWhere('${name}', args.where);
+      const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
       return original.findFirst({ where: decomposedWhere });
     },
     softDeleteMany: async (args: any) => {
+      const { deletedBy, ...rest } = args;
       const deletedAtField = getDeletedAtField('${name}');
       const pk = PRIMARY_KEYS['${name}'];
       const pkFields = Array.isArray(pk) ? pk : [pk];
       const selectClause = Object.fromEntries(pkFields.map(f => [f, true]));
 
       const records = await original.findMany({
-        where: { ...args.where, ...(deletedAtField ? { [deletedAtField]: null } : {}) },
+        where: { ...rest.where, ...(deletedAtField ? { [deletedAtField]: null } : {}) },
         select: selectClause,
       });
-      await softDeleteWithCascade(prisma, '${name}', args.where);
+      await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
       return { count: records.length };
     },
 
