@@ -3,7 +3,7 @@ import type { ParsedModel, ParsedSchema } from '../dmmf-parser.js';
 /**
  * Generates the runtime wrapper functions
  * @param schema - The parsed Prisma schema
- * @param clientImportPath - The import path for PrismaClient (e.g., '../client' or '@prisma/client')
+ * @param clientImportPath - The relative import path to the generated Prisma client (e.g., '../client')
  */
 export function emitRuntime(schema: ParsedSchema, clientImportPath: string): string {
   const lines: string[] = [];

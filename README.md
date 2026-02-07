@@ -28,7 +28,8 @@ yarn add prisma-safe-delete
 
 ```prisma
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  output   = "./generated/client"
 }
 
 generator softDelete {
@@ -38,7 +39,6 @@ generator softDelete {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 ```
 
@@ -78,10 +78,16 @@ npx prisma generate
 ```
 
 ```typescript
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from './generated/client';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { Pool } from 'pg';
 import { wrapPrismaClient } from './generated/soft-delete';
 
-const prisma = new PrismaClient();
+// Prisma 7 requires an adapter
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+
+const prisma = new PrismaClient({ adapter });
 const safePrisma = wrapPrismaClient(prisma);
 
 // All queries automatically filter out soft-deleted records
@@ -391,7 +397,7 @@ await safePrisma.user.update({
 ## Requirements
 
 - Node.js >= 18
-- Prisma >= 5.0.0
+- Prisma >= 7.0.0
 - TypeScript >= 5.0 (recommended)
 
 ## Development

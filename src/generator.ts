@@ -55,24 +55,26 @@ generatorHandler({
 
     // Find the Prisma client generator to get its output path
     const clientGenerator = options.otherGenerators.find(
-      (g) =>
-        g.provider.value === 'prisma-client-js' ||
-        g.provider.value === 'prisma-client',
+      (g) => g.provider.value === 'prisma-client',
     );
 
-    // Compute client import path
-    let clientImportPath: string;
+    // Compute client import path - Prisma 7 requires explicit output
     const clientOutputPath = clientGenerator?.output?.value;
     if (
-      clientOutputPath !== undefined &&
-      clientOutputPath !== null &&
-      clientOutputPath !== ''
+      clientOutputPath === undefined ||
+      clientOutputPath === null ||
+      clientOutputPath === ''
     ) {
-      clientImportPath = computeClientImportPath(outputDir, clientOutputPath);
-    } else {
-      // Fallback for edge cases - user may need to configure manually
-      clientImportPath = '@prisma/client';
+      throw new Error(
+        'prisma-safe-delete requires the prisma-client generator with an explicit output path. ' +
+          'Please ensure your schema.prisma has:\n\n' +
+          'generator client {\n' +
+          '  provider = "prisma-client"\n' +
+          '  output   = "./generated/client"\n' +
+          '}',
+      );
     }
+    const clientImportPath = computeClientImportPath(outputDir, clientOutputPath);
 
     // Parse the DMMF
     const schema = parseDMMF(options.dmmf);
