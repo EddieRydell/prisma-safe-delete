@@ -11,3 +11,8 @@ CLAUDE.md
 tests/integration/generated/
 tests/integration/*.db
 tests/integration/*.db-journal
+
+# E2E test generated files
+tests/e2e/generated/
+tests/e2e/*.db
+tests/e2e/*.db-journal

@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider = "node ../../dist/bin.js"
+  output   = "./generated/soft-cascade"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./test.db"
+}
+
+model User {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  name       String?
+  deleted_at DateTime?
+  posts      Post[]
+  profile    Profile?
+  createdAt  DateTime  @default(now())
+}
+
+model Profile {
+  id         String    @id @default(cuid())
+  bio        String?
+  userId     String    @unique
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+}
+
+model Post {
+  id         String    @id @default(cuid())
+  title      String
+  content    String?
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments   Comment[]
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+}
+
+model Comment {
+  id         String    @id @default(cuid())
+  content    String
+  postId     String
+  post       Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+}
+
+// Model without soft-delete for testing non-soft-deletable behavior
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String
+  entityId  String
+  createdAt DateTime @default(now())
+}
