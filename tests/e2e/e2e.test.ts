@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { execSync } from 'node:child_process';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PrismaPg } from '@prisma/adapter-pg';
+import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const e2eDir = __dirname;
@@ -11,6 +13,7 @@ let PrismaClient: any;
 let wrapPrismaClient: any;
 let prisma: any;
 let safePrisma: any;
+let pool: pg.Pool | undefined;
 
 describe('E2E: Real database tests', () => {
   beforeAll(async () => {
@@ -24,30 +27,49 @@ describe('E2E: Real database tests', () => {
     execSync('npx prisma generate', {
       cwd: e2eDir,
       stdio: 'pipe',
+      env: {
+        ...process.env,
+        PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION: 'yes',
+      },
     });
 
     // Push schema to create database (resets it)
-    execSync('npx prisma db push --force-reset --skip-generate', {
+    // Note: PRISMA_USER_CONSENT env var is needed for Prisma 7's AI safety check
+    // This is safe because it's a local Docker test database
+    execSync('npx prisma db push --force-reset', {
       cwd: e2eDir,
       stdio: 'pipe',
+      env: {
+        ...process.env,
+        PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION: 'yes',
+      },
     });
 
     // Dynamically import the generated modules
-    const clientModule = await import('./generated/client/index.js');
+    // Note: Prisma 7 generates client.ts, not index.ts
+    const clientModule = await import('./generated/client/client.js');
     PrismaClient = clientModule.PrismaClient;
 
     const softCascadeModule = await import('./generated/soft-cascade/runtime.js');
     wrapPrismaClient = softCascadeModule.wrapPrismaClient;
 
-    // Create the clients
-    prisma = new PrismaClient();
-    safePrisma = wrapPrismaClient(prisma);
+    // Create pg pool and Prisma adapter (Prisma 7 requirement)
+    const connectionString = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5433/test';
+    pool = new pg.Pool({ connectionString });
+    const adapter = new PrismaPg(pool);
 
-    await prisma.$connect();
+    // Create the clients with adapter
+    prisma = new PrismaClient({ adapter });
+    safePrisma = wrapPrismaClient(prisma);
   }, 120000);
 
   afterAll(async () => {
-    await prisma?.$disconnect();
+    if (prisma !== undefined) {
+      await prisma.$disconnect();
+    }
+    if (pool !== undefined) {
+      await pool.end();
+    }
   });
 
   beforeEach(async () => {

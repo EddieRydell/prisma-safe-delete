@@ -11,6 +11,27 @@ import {
   emitIndex,
 } from './codegen/index.js';
 
+/**
+ * Computes the relative import path from our output directory to the Prisma client.
+ */
+function computeClientImportPath(
+  ourOutputDir: string,
+  clientOutputDir: string,
+): string {
+  // Calculate relative path from our output to client output
+  let relativePath = path.relative(ourOutputDir, clientOutputDir);
+
+  // Normalize to forward slashes for imports
+  relativePath = relativePath.split(path.sep).join('/');
+
+  // Ensure it starts with ./ or ../
+  if (!relativePath.startsWith('.')) {
+    relativePath = './' + relativePath;
+  }
+
+  return relativePath;
+}
+
 generatorHandler({
   onManifest(): {
     defaultOutput: string;
@@ -20,7 +41,8 @@ generatorHandler({
     return {
       defaultOutput: './generated/soft-cascade',
       prettyName: 'Prisma Soft Cascade',
-      requiresGenerators: ['prisma-client-js'],
+      // Prisma 7+ uses prisma-client
+      requiresGenerators: ['prisma-client'],
     };
   },
 
@@ -31,6 +53,27 @@ generatorHandler({
       throw new Error('No output directory specified for prisma-safe-delete');
     }
 
+    // Find the Prisma client generator to get its output path
+    const clientGenerator = options.otherGenerators.find(
+      (g) =>
+        g.provider.value === 'prisma-client-js' ||
+        g.provider.value === 'prisma-client',
+    );
+
+    // Compute client import path
+    let clientImportPath: string;
+    const clientOutputPath = clientGenerator?.output?.value;
+    if (
+      clientOutputPath !== undefined &&
+      clientOutputPath !== null &&
+      clientOutputPath !== ''
+    ) {
+      clientImportPath = computeClientImportPath(outputDir, clientOutputPath);
+    } else {
+      // Fallback for edge cases - user may need to configure manually
+      clientImportPath = '@prisma/client';
+    }
+
     // Parse the DMMF
     const schema = parseDMMF(options.dmmf);
 
@@ -38,9 +81,9 @@ generatorHandler({
     const cascadeGraph = buildCascadeGraph(schema);
 
     // Generate all output files
-    const typesContent = emitTypes(schema);
+    const typesContent = emitTypes(schema, clientImportPath);
     const cascadeGraphContent = emitCascadeGraph(cascadeGraph);
-    const runtimeContent = emitRuntime(schema);
+    const runtimeContent = emitRuntime(schema, clientImportPath);
     const indexContent = emitIndex(schema);
 
     // Ensure output directory exists

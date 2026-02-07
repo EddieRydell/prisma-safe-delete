@@ -1,6 +1,10 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "project": ["src/**/*.ts", "tests/**/*.ts"],
-  "ignore": ["tests/integration/generated/**", "tests/e2e/generated/**"],
-  "ignoreDependencies": ["@prisma/client", "prisma"]
+  "ignore": [
+    "tests/integration/generated/**",
+    "tests/e2e/generated/**",
+    "tests/**/prisma.config.ts"
+  ],
+  "ignoreDependencies": ["dotenv", "@prisma/client"]
 }
