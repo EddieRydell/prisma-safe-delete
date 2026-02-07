@@ -1,6 +1,24 @@
 # prisma-safe-delete
 
+[![npm version](https://img.shields.io/npm/v/prisma-safe-delete.svg)](https://www.npmjs.com/package/prisma-safe-delete)
+[![npm downloads](https://img.shields.io/npm/dm/prisma-safe-delete.svg)](https://www.npmjs.com/package/prisma-safe-delete)
+[![CI](https://github.com/EddieRydell/prisma-safe-delete/actions/workflows/ci.yml/badge.svg)](https://github.com/EddieRydell/prisma-safe-delete/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
+
 A Prisma generator that creates a type-safe wrapper for soft deletion with automatic cascade support. Designed to be a drop-in replacement that you configure once and never think about again.
+
+## Why This Library?
+
+Soft deletion is a common pattern where records are marked as deleted (typically with a timestamp) rather than being permanently removed. This preserves data for auditing, recovery, and maintaining referential integrity.
+
+**The problem:** Implementing soft deletion correctly is tedious and error-prone. You need to remember to filter out deleted records in every query, handle cascading deletes manually, and deal with unique constraint conflicts when "deleted" records still occupy unique values.
+
+**prisma-safe-delete solves this by:**
+- Automatically filtering deleted records from all read operations
+- Cascading soft-deletes through your relation tree (following `onDelete: Cascade`)
+- Mangling unique string fields to free them for reuse
+- Providing escape hatches when you need to access deleted data
 
 ## Features
 

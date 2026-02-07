@@ -73,7 +73,7 @@ jobs:
       - name: Build Generator
         run: pnpm run build
 
-      - name: Test
-        run: pnpm test
+      - name: Test with Coverage
+        run: pnpm run test:coverage
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test

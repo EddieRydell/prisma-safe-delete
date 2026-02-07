@@ -5,11 +5,20 @@
   "type": "module",
   "main": "dist/generator.js",
   "types": "dist/generator.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/generator.d.ts",
+      "default": "./dist/generator.js"
+    }
+  },
   "bin": {
     "prisma-safe-delete": "./dist/bin.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",
@@ -19,18 +28,33 @@
     "knip": "knip",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "ci": "pnpm audit --prod && pnpm run typecheck && pnpm run lint && pnpm run knip && pnpm run test",
-    "prepublishOnly": "pnpm run ci && pnpm run build"
+    "prepublishOnly": "pnpm run ci && pnpm run build",
+    "version": "pnpm run build"
   },
   "keywords": [
     "prisma",
     "soft-delete",
+    "soft-deletion",
     "cascade",
     "generator",
-    "typescript"
+    "typescript",
+    "orm",
+    "database",
+    "delete",
+    "restore"
   ],
-  "author": "",
+  "author": "EddieRydell",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EddieRydell/prisma-safe-delete.git"
+  },
+  "homepage": "https://github.com/EddieRydell/prisma-safe-delete#readme",
+  "bugs": {
+    "url": "https://github.com/EddieRydell/prisma-safe-delete/issues"
+  },
   "peerDependencies": {
     "prisma": ">=7.0.0"
   },
@@ -41,6 +65,7 @@
     "@prisma/generator-helper": "^7.0.0",
     "@types/node": "^25.2.1",
     "@types/pg": "^8.16.0",
+    "@vitest/coverage-v8": "^4.0.18",
     "dotenv": "^16.5.0",
     "eslint": "^9.0.0",
     "knip": "^5.0.0",
