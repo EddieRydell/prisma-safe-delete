@@ -31,8 +31,6 @@ jobs:
         run: |
           cd tests/e2e && npx prisma generate
           cd ../integration && npx prisma generate
-        env:
-          DATABASE_URL: postgresql://localhost:5432/dummy
 
       - name: Type Check
         run: pnpm run typecheck
@@ -79,10 +77,6 @@ jobs:
         run: |
           cd tests/e2e && npx prisma generate && npx prisma db push --skip-generate
           cd ../integration && npx prisma generate
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
 
       - name: Test
         run: pnpm test
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
