@@ -14,6 +14,8 @@ export interface CascadeChild {
   isSoftDeletable: boolean;
   /** The name of the deleted_at field if soft-deletable */
   deletedAtField: string | null;
+  /** The name of the deleted_by field if present */
+  deletedByField: string | null;
 }
 
 /**
@@ -84,6 +86,7 @@ export function buildCascadeGraph(schema: ParsedSchema): CascadeGraph {
         parentKey,
         isSoftDeletable: model.isSoftDeletable,
         deletedAtField: model.deletedAtField,
+        deletedByField: model.deletedByField,
       });
     }
   }
