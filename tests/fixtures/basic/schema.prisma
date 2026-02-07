@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+generator softCascade {
+  provider = "prisma-soft-cascade"
+  output   = "./generated/soft-cascade"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  name       String?
+  deleted_at DateTime?
+  deleted_by String?
+  posts      Post[]
+  comments   Comment[]
+  profile    Profile?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model Profile {
+  id         String    @id @default(cuid())
+  bio        String?
+  userId     String    @unique
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model Post {
+  id         String    @id @default(cuid())
+  title      String
+  content    String?
+  published  Boolean   @default(false)
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments   Comment[]
+  tags       Tag[]
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model Comment {
+  id         String    @id @default(cuid())
+  content    String
+  postId     String
+  post       Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model Tag {
+  id    String @id @default(cuid())
+  name  String @unique
+  posts Post[]
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String
+  modelName String
+  recordId  String
+  data      Json?
+  createdAt DateTime @default(now())
+}
+
+model CompoundKeyModel {
+  tenantId   String
+  resourceId String
+  data       String
+  deleted_at DateTime?
+
+  @@id([tenantId, resourceId])
+}

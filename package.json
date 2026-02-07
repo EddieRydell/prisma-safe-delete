@@ -1,0 +1,53 @@
+{
+  "name": "prisma-soft-cascade",
+  "version": "0.1.0",
+  "description": "A Prisma generator that creates a type-safe wrapper for soft deletion with automatic cascade support",
+  "type": "module",
+  "main": "dist/generator.js",
+  "types": "dist/generator.d.ts",
+  "bin": {
+    "prisma-soft-cascade": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix",
+    "knip": "knip",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "ci": "pnpm run typecheck && pnpm run lint && pnpm run knip && pnpm run test",
+    "prepublishOnly": "pnpm run ci && pnpm run build"
+  },
+  "keywords": [
+    "prisma",
+    "soft-delete",
+    "cascade",
+    "generator",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "@prisma/client": ">=5.0.0",
+    "prisma": ">=5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@prisma/client": "^6.0.0",
+    "@prisma/generator-helper": "^6.0.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "knip": "^5.0.0",
+    "prisma": "^6.0.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
