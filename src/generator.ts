@@ -1,4 +1,5 @@
-import { generatorHandler } from '@prisma/generator-helper';
+import generatorHelper from '@prisma/generator-helper';
+const { generatorHandler } = generatorHelper;
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { parseDMMF } from './dmmf-parser.js';
