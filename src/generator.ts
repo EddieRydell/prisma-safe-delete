@@ -28,7 +28,7 @@ generatorHandler({
     const outputDir = options.generator.output?.value;
 
     if (outputDir === undefined || outputDir === null) {
-      throw new Error('No output directory specified for prisma-soft-cascade');
+      throw new Error('No output directory specified for prisma-safe-delete');
     }
 
     // Parse the DMMF

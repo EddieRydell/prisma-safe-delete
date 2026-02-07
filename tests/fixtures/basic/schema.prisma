@@ -3,7 +3,7 @@ generator client {
 }
 
 generator softCascade {
-  provider = "prisma-soft-cascade"
+  provider = "prisma-safe-delete"
   output   = "./generated/soft-cascade"
 }
 

@@ -1,4 +1,4 @@
-# prisma-soft-cascade
+# prisma-safe-delete
 
 A Prisma generator that creates a type-safe wrapper for soft deletion with automatic cascade support.
 
@@ -12,9 +12,9 @@ A Prisma generator that creates a type-safe wrapper for soft deletion with autom
 ## Installation
 
 ```bash
-npm install prisma-soft-cascade
+npm install prisma-safe-delete
 # or
-pnpm add prisma-soft-cascade
+pnpm add prisma-safe-delete
 ```
 
 ## Setup
@@ -27,7 +27,7 @@ generator client {
 }
 
 generator softCascade {
-  provider = "prisma-soft-cascade"
+  provider = "prisma-safe-delete"
   output   = "./generated/soft-cascade"
 }
 
