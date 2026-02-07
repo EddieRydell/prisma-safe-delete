@@ -9,8 +9,8 @@ generator softCascade {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = "file:./test.db"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model User {

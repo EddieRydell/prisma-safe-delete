@@ -1,12 +1,10 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { execSync } from 'node:child_process';
 import * as path from 'node:path';
-import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const e2eDir = __dirname;
-const dbPath = path.join(e2eDir, 'test.db');
 
 // These will be dynamically imported after generation
 let PrismaClient: any;
@@ -16,11 +14,6 @@ let safePrisma: any;
 
 describe('E2E: Real database tests', () => {
   beforeAll(async () => {
-    // Clean up any existing test database
-    if (fs.existsSync(dbPath)) {
-      fs.unlinkSync(dbPath);
-    }
-
     // Build the generator
     execSync('pnpm run build', {
       cwd: path.join(e2eDir, '..', '..'),
@@ -33,8 +26,8 @@ describe('E2E: Real database tests', () => {
       stdio: 'pipe',
     });
 
-    // Push schema to create database
-    execSync('npx prisma db push --skip-generate', {
+    // Push schema to create database (resets it)
+    execSync('npx prisma db push --force-reset --skip-generate', {
       cwd: e2eDir,
       stdio: 'pipe',
     });
@@ -55,11 +48,6 @@ describe('E2E: Real database tests', () => {
 
   afterAll(async () => {
     await prisma?.$disconnect();
-
-    // Clean up test database
-    if (fs.existsSync(dbPath)) {
-      fs.unlinkSync(dbPath);
-    }
   });
 
   beforeEach(async () => {
@@ -1273,30 +1261,25 @@ describe('E2E: Real database tests', () => {
   });
 
   describe('Concurrent operations', () => {
-    // SQLite uses file-level locking, so concurrent transactions serialize with backoff delays
-    it(
-      'handles concurrent soft deletes safely',
-      async () => {
-        await prisma.user.createMany({
-          data: Array.from({ length: 10 }, (_, i) => ({
-            id: `user-${String(i)}`,
-            email: `user${String(i)}@test.com`,
-          })),
-        });
+    it('handles concurrent soft deletes safely', async () => {
+      await prisma.user.createMany({
+        data: Array.from({ length: 10 }, (_, i) => ({
+          id: `user-${String(i)}`,
+          email: `user${String(i)}@test.com`,
+        })),
+      });
 
-        // Soft delete multiple records concurrently
-        await Promise.all([
-          safePrisma.user.softDelete({ where: { id: 'user-0' } }),
-          safePrisma.user.softDelete({ where: { id: 'user-1' } }),
-          safePrisma.user.softDelete({ where: { id: 'user-2' } }),
-          safePrisma.user.softDelete({ where: { id: 'user-3' } }),
-          safePrisma.user.softDelete({ where: { id: 'user-4' } }),
-        ]);
+      // Soft delete multiple records concurrently
+      await Promise.all([
+        safePrisma.user.softDelete({ where: { id: 'user-0' } }),
+        safePrisma.user.softDelete({ where: { id: 'user-1' } }),
+        safePrisma.user.softDelete({ where: { id: 'user-2' } }),
+        safePrisma.user.softDelete({ where: { id: 'user-3' } }),
+        safePrisma.user.softDelete({ where: { id: 'user-4' } }),
+      ]);
 
-        expect(await safePrisma.user.count()).toBe(5);
-      },
-      15000,
-    );
+      expect(await safePrisma.user.count()).toBe(5);
+    });
   });
 
   describe('Null and edge case handling', () => {

@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -31,6 +31,8 @@ jobs:
         run: |
           cd tests/e2e && npx prisma generate
           cd ../integration && npx prisma generate
+        env:
+          DATABASE_URL: postgresql://localhost:5432/dummy
 
       - name: Type Check
         run: pnpm run typecheck
@@ -41,5 +43,46 @@ jobs:
       - name: Dead Code Check
         run: pnpm run knip
 
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build Generator
+        run: pnpm run build
+
+      - name: Generate Test Clients
+        run: |
+          cd tests/e2e && npx prisma generate && npx prisma db push --skip-generate
+          cd ../integration && npx prisma generate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
+
       - name: Test
         run: pnpm test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
