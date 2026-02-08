@@ -155,8 +155,77 @@ export function emitRuntime(
 
   // Emit main wrapper function
   lines.push(emitWrapperFunction(schema));
+  lines.push('');
+
+  // Emit filter helper utilities (exported for user use)
+  lines.push(emitFilterHelpers());
 
   return lines.join('\n');
+}
+
+/**
+ * Emits user-facing helper utilities for manual filtering
+ */
+function emitFilterHelpers(): string {
+  return `
+/**
+ * Helper to filter for only soft-deleted records in where clauses.
+ * Useful for nested relation filters where $onlyDeleted can't be used.
+ *
+ * @example
+ * safePrisma.users.findMany({
+ *   where: {
+ *     memberships: {
+ *       some: onlyDeleted('Membership', { organization_id: orgId })
+ *     }
+ *   }
+ * });
+ */
+export function onlyDeleted<T extends Record<string, unknown>>(
+  modelName: string,
+  where: T = {} as T
+): T & Record<string, unknown> {
+  const deletedAtField = getDeletedAtField(modelName);
+  if (!deletedAtField) return where;
+  return { ...where, [deletedAtField]: { not: null } } as T & Record<string, unknown>;
+}
+
+/**
+ * Helper to filter for only non-deleted (active) records in where clauses.
+ * This is the default behavior, but can be useful for explicit overrides.
+ *
+ * @example
+ * safePrisma.$onlyDeleted.users.findFirst({
+ *   include: {
+ *     posts: {
+ *       where: excludeDeleted('Post', { published: true })
+ *     }
+ *   }
+ * });
+ */
+export function excludeDeleted<T extends Record<string, unknown>>(
+  modelName: string,
+  where: T = {} as T
+): T & Record<string, unknown> {
+  const deletedAtField = getDeletedAtField(modelName);
+  if (!deletedAtField) return where;
+  return { ...where, [deletedAtField]: null } as T & Record<string, unknown>;
+}
+
+/**
+ * Helper to include all records (deleted + active) in where clauses.
+ * This is a no-op function for clarity/documentation purposes.
+ *
+ * @example
+ * safePrisma.users.findMany({
+ *   where: includingDeleted({ status: 'premium' })
+ * });
+ */
+export function includingDeleted<T extends Record<string, unknown>>(
+  where: T = {} as T
+): T {
+  return where;
+}`.trim();
 }
 
 function emitHelperFunctions(): string {
@@ -389,16 +458,40 @@ function unmangleUniqueFields(
 function emitInjectFiltersFunction(): string {
   return `
 /**
- * Recursively injects deleted_at: null filters into query args
+ * Filter mode for soft-delete behavior
+ * - 'exclude-deleted': Only non-deleted records (default)
+ * - 'include-deleted': All records (deleted + active)
+ * - 'only-deleted': Only deleted records
+ */
+type FilterMode = 'exclude-deleted' | 'include-deleted' | 'only-deleted';
+
+/**
+ * Gets the filter value for a given mode and deleted_at field
+ */
+function getModeFilter(mode: FilterMode, deletedAtField: string): Record<string, unknown> | null {
+  switch (mode) {
+    case 'exclude-deleted':
+      return { [deletedAtField]: null };
+    case 'only-deleted':
+      return { [deletedAtField]: { not: null } };
+    case 'include-deleted':
+      return null; // No filter
+  }
+}
+
+/**
+ * Recursively injects soft-delete filters into query args based on mode
  */
 function injectFilters<T extends Record<string, unknown>>(
   args: T | undefined,
-  modelName: string
+  modelName: string,
+  mode: FilterMode = 'exclude-deleted'
 ): T {
   if (!args) {
     const deletedAtField = getDeletedAtField(modelName);
-    if (deletedAtField) {
-      return { where: { [deletedAtField]: null } } as T;
+    if (deletedAtField && mode !== 'include-deleted') {
+      const filter = getModeFilter(mode, deletedAtField);
+      return { where: filter } as T;
     }
     return {} as T;
   }
@@ -407,18 +500,20 @@ function injectFilters<T extends Record<string, unknown>>(
   const deletedAtField = getDeletedAtField(modelName);
 
   // Inject into top-level where and process relation filters
-  if (deletedAtField) {
+  if (deletedAtField && mode !== 'include-deleted') {
+    const existingWhere = (result.where as Record<string, unknown>) ?? {};
+    const modeFilter = getModeFilter(mode, deletedAtField);
+
     result.where = injectIntoWhere(
-      {
-        ...((result.where as Record<string, unknown>) ?? {}),
-        [deletedAtField]: null,
-      },
-      modelName
+      { ...existingWhere, ...modeFilter },
+      modelName,
+      mode
     );
   } else if (result.where) {
     result.where = injectIntoWhere(
       result.where as Record<string, unknown>,
-      modelName
+      modelName,
+      mode
     );
   }
 
@@ -426,7 +521,8 @@ function injectFilters<T extends Record<string, unknown>>(
   if (result.include && typeof result.include === 'object') {
     result.include = injectIntoRelations(
       result.include as Record<string, unknown>,
-      modelName
+      modelName,
+      mode
     );
   }
 
@@ -434,7 +530,8 @@ function injectFilters<T extends Record<string, unknown>>(
   if (result.select && typeof result.select === 'object') {
     result.select = injectIntoRelations(
       result.select as Record<string, unknown>,
-      modelName
+      modelName,
+      mode
     );
   }
 
@@ -446,7 +543,8 @@ function injectFilters<T extends Record<string, unknown>>(
  */
 function injectIntoWhere(
   where: Record<string, unknown>,
-  parentModel: string
+  parentModel: string,
+  mode: FilterMode = 'exclude-deleted'
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
@@ -463,24 +561,40 @@ function injectIntoWhere(
         if (['some', 'every', 'none'].includes(filterKey) && filterValue && typeof filterValue === 'object') {
           // Inject deleted_at filter into the relation condition
           const innerWhere = filterValue as Record<string, unknown>;
-          if (deletedAtField) {
-            processedFilter[filterKey] = injectIntoWhere(
-              { ...innerWhere, [deletedAtField]: null },
-              relationModel
-            );
+          if (deletedAtField && mode !== 'include-deleted') {
+            // Check if user already specified a filter on this field (Phase 4)
+            if (!(deletedAtField in innerWhere)) {
+              const modeFilter = getModeFilter(mode, deletedAtField);
+              processedFilter[filterKey] = injectIntoWhere(
+                { ...innerWhere, ...modeFilter },
+                relationModel,
+                mode
+              );
+            } else {
+              // Respect user's explicit filter
+              processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel, mode);
+            }
           } else {
-            processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel);
+            processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel, mode);
           }
         } else if (['is', 'isNot'].includes(filterKey) && filterValue && typeof filterValue === 'object') {
           // Handle is/isNot for single relations
           const innerWhere = filterValue as Record<string, unknown>;
-          if (deletedAtField) {
-            processedFilter[filterKey] = injectIntoWhere(
-              { ...innerWhere, [deletedAtField]: null },
-              relationModel
-            );
+          if (deletedAtField && mode !== 'include-deleted') {
+            // Check if user already specified a filter on this field (Phase 4)
+            if (!(deletedAtField in innerWhere)) {
+              const modeFilter = getModeFilter(mode, deletedAtField);
+              processedFilter[filterKey] = injectIntoWhere(
+                { ...innerWhere, ...modeFilter },
+                relationModel,
+                mode
+              );
+            } else {
+              // Respect user's explicit filter
+              processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel, mode);
+            }
           } else {
-            processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel);
+            processedFilter[filterKey] = injectIntoWhere(innerWhere, relationModel, mode);
           }
         } else {
           processedFilter[filterKey] = filterValue;
@@ -491,21 +605,21 @@ function injectIntoWhere(
     } else if (key === 'AND' && Array.isArray(value)) {
       result[key] = value.map(v =>
         typeof v === 'object' && v !== null
-          ? injectIntoWhere(v as Record<string, unknown>, parentModel)
+          ? injectIntoWhere(v as Record<string, unknown>, parentModel, mode)
           : v
       );
     } else if (key === 'OR' && Array.isArray(value)) {
       result[key] = value.map(v =>
         typeof v === 'object' && v !== null
-          ? injectIntoWhere(v as Record<string, unknown>, parentModel)
+          ? injectIntoWhere(v as Record<string, unknown>, parentModel, mode)
           : v
       );
     } else if (key === 'NOT' && value && typeof value === 'object') {
       result[key] = Array.isArray(value)
         ? value.map(v => typeof v === 'object' && v !== null
-            ? injectIntoWhere(v as Record<string, unknown>, parentModel)
+            ? injectIntoWhere(v as Record<string, unknown>, parentModel, mode)
             : v)
-        : injectIntoWhere(value as Record<string, unknown>, parentModel);
+        : injectIntoWhere(value as Record<string, unknown>, parentModel, mode);
     } else {
       result[key] = value;
     }
@@ -515,11 +629,12 @@ function injectIntoWhere(
 }
 
 /**
- * Injects filters into relation includes/selects
+ * Injects filters into relation includes/selects with mode propagation
  */
 function injectIntoRelations(
   relations: Record<string, unknown>,
-  parentModel: string
+  parentModel: string,
+  mode: FilterMode = 'exclude-deleted'
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
@@ -527,9 +642,7 @@ function injectIntoRelations(
     // Handle _count specially
     if (key === '_count') {
       if (value === true) {
-        // Simple _count: true - we need to add filters for all countable relations
-        // This is complex because we don't know which relations are being counted
-        // For now, pass through (Prisma will count all)
+        // Simple _count: true - pass through
         result[key] = value;
       } else if (value && typeof value === 'object') {
         const countObj = value as Record<string, unknown>;
@@ -542,21 +655,27 @@ function injectIntoRelations(
             const relationModel = getRelationModel(parentModel, relName);
             if (relationModel) {
               const deletedAtField = getDeletedAtField(relationModel);
-              if (deletedAtField && relValue === true) {
-                // Add where filter to count only non-deleted
+              if (deletedAtField && mode !== 'include-deleted' && relValue === true) {
+                // Add where filter based on mode
+                const modeFilter = getModeFilter(mode, deletedAtField);
                 filteredCountSelect[relName] = {
-                  where: { [deletedAtField]: null },
+                  where: modeFilter,
                 };
-              } else if (deletedAtField && relValue && typeof relValue === 'object') {
-                // Merge with existing where
+              } else if (deletedAtField && mode !== 'include-deleted' && relValue && typeof relValue === 'object') {
+                // Merge with existing where - respect user's explicit filter (Phase 4)
                 const existing = relValue as Record<string, unknown>;
-                filteredCountSelect[relName] = {
-                  ...existing,
-                  where: {
-                    ...((existing.where as Record<string, unknown>) ?? {}),
-                    [deletedAtField]: null,
-                  },
-                };
+                const existingWhere = (existing.where as Record<string, unknown>) ?? {};
+
+                if (!(deletedAtField in existingWhere)) {
+                  const modeFilter = getModeFilter(mode, deletedAtField);
+                  filteredCountSelect[relName] = {
+                    ...existing,
+                    where: { ...existingWhere, ...modeFilter },
+                  };
+                } else {
+                  // User specified explicit filter - respect it
+                  filteredCountSelect[relName] = relValue;
+                }
               } else {
                 filteredCountSelect[relName] = relValue;
               }
@@ -584,9 +703,10 @@ function injectIntoRelations(
       // Only add where clause for list relations (non-list relations don't support where in include)
       if (relationModel && isList) {
         const deletedAtField = getDeletedAtField(relationModel);
-        if (deletedAtField) {
+        if (deletedAtField && mode !== 'include-deleted') {
+          const modeFilter = getModeFilter(mode, deletedAtField);
           result[key] = {
-            where: { [deletedAtField]: null },
+            where: modeFilter,
           };
         } else {
           result[key] = value;
@@ -602,27 +722,33 @@ function injectIntoRelations(
         // Only add where clause for list relations
         if (isList) {
           const deletedAtField = getDeletedAtField(relationModel);
-          if (deletedAtField) {
-            nested.where = {
-              ...((nested.where as Record<string, unknown>) ?? {}),
-              [deletedAtField]: null,
-            };
+          if (deletedAtField && mode !== 'include-deleted') {
+            const existingWhere = (nested.where as Record<string, unknown>) ?? {};
+
+            // Phase 4: Only inject if user hasn't already specified this field
+            if (!(deletedAtField in existingWhere)) {
+              const modeFilter = getModeFilter(mode, deletedAtField);
+              nested.where = { ...existingWhere, ...modeFilter };
+            }
+            // else: User's explicit filter takes precedence
           }
         }
 
-        // Recursively process nested includes
+        // Recursively process nested includes with mode propagation
         if (nested.include && typeof nested.include === 'object') {
           nested.include = injectIntoRelations(
             nested.include as Record<string, unknown>,
-            relationModel
+            relationModel,
+            mode // Propagate mode down
           );
         }
 
-        // Recursively process nested selects
+        // Recursively process nested selects with mode propagation
         if (nested.select && typeof nested.select === 'object') {
           nested.select = injectIntoRelations(
             nested.select as Record<string, unknown>,
-            relationModel
+            relationModel,
+            mode // Propagate mode down
           );
         }
       }
@@ -1200,6 +1326,118 @@ async function restoreCascadeChildren(
   }
 
   return cascaded;
+}
+
+/**
+ * Previews a soft delete with cascade (read-only, no writes)
+ */
+async function previewSoftDelete(
+  prisma: PrismaClient,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<{ wouldDelete: Record<string, number> }> {
+  return prisma.$transaction(async (tx) => {
+    return previewSoftDeleteInTx(tx, modelName, where);
+  });
+}
+
+/**
+ * Previews a soft delete with cascade within an existing transaction (read-only)
+ */
+async function previewSoftDeleteInTx(
+  tx: any,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<{ wouldDelete: Record<string, number> }> {
+  const deletedAtField = getDeletedAtField(modelName);
+  if (!deletedAtField) {
+    throw new Error(\`Model \${modelName} is not soft-deletable\`);
+  }
+
+  const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
+  const delegate = tx[lowerModelName as keyof typeof tx] as any;
+  const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
+
+  // Find all records that would be deleted
+  const records = await delegate.findMany({
+    where: {
+      ...decomposedWhere,
+      [deletedAtField]: null,
+    },
+  });
+
+  if (records.length === 0) return { wouldDelete: {} };
+
+  const pkValues = records.map((r: Record<string, unknown>) =>
+    extractPrimaryKey(modelName, r)
+  );
+
+  // Preview cascade to children (read-only)
+  const cascaded = await previewCascadeChildren(tx, modelName, pkValues);
+
+  const wouldDelete: Record<string, number> = { [modelName]: records.length };
+  for (const [model, count] of Object.entries(cascaded)) {
+    wouldDelete[model] = (wouldDelete[model] ?? 0) + count;
+  }
+  return { wouldDelete };
+}
+
+/**
+ * Recursively previews cascade soft delete to children (read-only, no writes)
+ */
+async function previewCascadeChildren(
+  tx: any,
+  parentModel: string,
+  parentPkValues: Record<string, unknown>[]
+): Promise<Record<string, number>> {
+  const children = CASCADE_GRAPH[parentModel] ?? [];
+  const cascaded: Record<string, number> = {};
+
+  for (const child of children) {
+    const lowerChildModel = child.model.charAt(0).toLowerCase() + child.model.slice(1);
+    const childDelegate = tx[lowerChildModel as keyof typeof tx] as any;
+
+    if (child.foreignKey.length === 0 || child.parentKey.length === 0) continue;
+
+    const childWhereConditions = parentPkValues.map((pkVal) => {
+      const condition: Record<string, unknown> = {};
+      for (let i = 0; i < child.foreignKey.length; i++) {
+        const fkField = child.foreignKey[i];
+        const pkField = child.parentKey[i];
+        if (fkField && pkField) {
+          condition[fkField] = pkVal[pkField];
+        }
+      }
+      return condition;
+    });
+
+    const childRecords = await childDelegate.findMany({
+      where: {
+        OR: childWhereConditions,
+        ...(child.deletedAtField ? { [child.deletedAtField]: null } : {}),
+      },
+    });
+
+    if (childRecords.length === 0) continue;
+
+    const childPkValues = childRecords.map((r: Record<string, unknown>) =>
+      extractPrimaryKey(child.model, r)
+    );
+
+    // Recurse to grandchildren (read-only)
+    const grandchildCascaded = await previewCascadeChildren(tx, child.model, childPkValues);
+
+    for (const [model, count] of Object.entries(grandchildCascaded)) {
+      cascaded[model] = (cascaded[model] ?? 0) + count;
+    }
+
+    // Count soft-deletable children (but don't update them)
+    if (child.isSoftDeletable && child.deletedAtField) {
+      cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
+    }
+  }
+
+  return cascaded;
 }`.trim();
 }
 
@@ -1264,6 +1502,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     },`;
 
     let softDeleteMethods: string;
+    let previewMethod: string;
 
     if (simple) {
       // Fast path: use updateMany directly (no transaction, no per-record updates)
@@ -1294,6 +1533,15 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       });
       return { count: result.count, cascaded: {} };
     },`;
+
+      previewMethod = `
+    // Preview soft delete (read-only)
+    softDeletePreview: async (args: any) => {
+      const count = await original.count({
+        where: { ...args.where, ['${deletedAtField}']: null },
+      });
+      return { wouldDelete: count > 0 ? { ['${name}']: count } : {} };
+    },`;
     } else {
       // Complex path: use softDeleteWithCascade (transaction, per-record updates)
       softDeleteMethods = `
@@ -1314,6 +1562,12 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
       return { count, cascaded };
     },`;
+
+      previewMethod = `
+    // Preview soft delete with cascade (read-only)
+    softDeletePreview: async (args: any) => {
+      return previewSoftDelete(prisma, '${name}', args.where);
+    },`;
     }
 
     return `
@@ -1326,6 +1580,7 @@ function create${name}Delegate(prisma: PrismaClient): any {
   return {${readMethods}
 ${writeMethods}
 ${softDeleteMethods}
+${previewMethod}
 ${restoreMethods}
 ${hardDeleteMethods}
 ${includingDeletedMethods}
@@ -1345,14 +1600,29 @@ function create${name}Delegate(prisma: PrismaClient): any {
 function emitIncludingDeletedClient(schema: ParsedSchema): string {
   const lines: string[] = [];
   lines.push('/**');
-  lines.push(' * Creates a client that includes soft-deleted records');
+  lines.push(' * Creates a client that includes soft-deleted records with filter propagation');
   lines.push(' */');
   lines.push('function createIncludingDeletedClient(prisma: PrismaClient): IncludingDeletedClient {');
   lines.push('  return {');
 
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    lines.push(`    ${lowerName}: prisma.${lowerName},`);
+    if (model.isSoftDeletable && model.deletedAtField !== null) {
+      // Soft-deletable models need wrapped methods to propagate 'include-deleted' mode
+      lines.push(`    ${lowerName}: {`);
+      lines.push(`      findMany: (args?: any) => prisma.${lowerName}.findMany(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      findFirst: (args?: any) => prisma.${lowerName}.findFirst(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      findFirstOrThrow: (args?: any) => prisma.${lowerName}.findFirstOrThrow(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      findUnique: (args?: any) => prisma.${lowerName}.findUnique(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      findUniqueOrThrow: (args?: any) => prisma.${lowerName}.findUniqueOrThrow(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      count: (args?: any) => prisma.${lowerName}.count(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      aggregate: (args?: any) => prisma.${lowerName}.aggregate(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      groupBy: (args?: any) => prisma.${lowerName}.groupBy(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`    },`);
+    } else {
+      // Non-soft-deletable models can use raw delegate
+      lines.push(`    ${lowerName}: prisma.${lowerName},`);
+    }
   }
 
   lines.push('  };');
@@ -1363,7 +1633,7 @@ function emitIncludingDeletedClient(schema: ParsedSchema): string {
 function emitOnlyDeletedClient(schema: ParsedSchema): string {
   const lines: string[] = [];
   lines.push('/**');
-  lines.push(' * Creates a client that queries only soft-deleted records');
+  lines.push(' * Creates a client that queries only soft-deleted records with filter propagation');
   lines.push(' */');
   lines.push('function createOnlyDeletedClient(prisma: PrismaClient): OnlyDeletedClient {');
   lines.push('  return {');
@@ -1372,22 +1642,10 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
     if (model.isSoftDeletable && model.deletedAtField !== null) {
       const lowerName = toLowerFirst(model.name);
       lines.push(`    ${lowerName}: {`);
-      lines.push(`      findMany: (args?: any) => prisma.${lowerName}.findMany({`);
-      lines.push(`        ...args,`);
-      lines.push(`        where: { ...args?.where, ${model.deletedAtField}: { not: null } },`);
-      lines.push(`      }),`);
-      lines.push(`      findFirst: (args?: any) => prisma.${lowerName}.findFirst({`);
-      lines.push(`        ...args,`);
-      lines.push(`        where: { ...args?.where, ${model.deletedAtField}: { not: null } },`);
-      lines.push(`      }),`);
-      lines.push(`      findUnique: (args?: any) => prisma.${lowerName}.findUnique({`);
-      lines.push(`        ...args,`);
-      lines.push(`        where: { ...args?.where, ${model.deletedAtField}: { not: null } },`);
-      lines.push(`      }),`);
-      lines.push(`      count: (args?: any) => prisma.${lowerName}.count({`);
-      lines.push(`        ...args,`);
-      lines.push(`        where: { ...args?.where, ${model.deletedAtField}: { not: null } },`);
-      lines.push(`      }),`);
+      lines.push(`      findMany: (args?: any) => prisma.${lowerName}.findMany(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`      findFirst: (args?: any) => prisma.${lowerName}.findFirst(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`      findUnique: (args?: any) => prisma.${lowerName}.findUnique(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`      count: (args?: any) => prisma.${lowerName}.count(injectFilters(args, '${model.name}', 'only-deleted')),`);
       lines.push(`    },`);
     }
   }
@@ -1463,6 +1721,13 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`        });`);
         lines.push(`        return { count: result.count, cascaded: {} };`);
         lines.push(`      },`);
+        // Preview (fast path - simple count)
+        lines.push(`      softDeletePreview: async (args: any) => {`);
+        lines.push(`        const count = await tx.${lowerName}.count({`);
+        lines.push(`          where: { ...args.where, ['${deletedAtField}']: null },`);
+        lines.push(`        });`);
+        lines.push(`        return { wouldDelete: count > 0 ? { ['${model.name}']: count } : {} };`);
+        lines.push(`      },`);
       } else {
         // Complex path: use softDeleteWithCascadeInTx
         lines.push(`      softDelete: async (args: any) => {`);
@@ -1476,6 +1741,10 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`        const { deletedBy, ...rest } = args;`);
         lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
         lines.push(`        return { count, cascaded };`);
+        lines.push(`      },`);
+        // Preview (complex path - cascade preview)
+        lines.push(`      softDeletePreview: async (args: any) => {`);
+        lines.push(`        return previewSoftDeleteInTx(tx, '${model.name}', args.where);`);
         lines.push(`      },`);
       }
 
@@ -1509,6 +1778,46 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`    ${lowerName}: tx.${lowerName},`);
     }
   }
+
+  // Add $onlyDeleted escape hatch
+  lines.push('');
+  lines.push('    /** Query only soft-deleted records with filter propagation */');
+  lines.push('    $onlyDeleted: {');
+  for (const model of schema.models) {
+    if (model.isSoftDeletable && model.deletedAtField !== null) {
+      const lowerName = toLowerFirst(model.name);
+      lines.push(`      ${lowerName}: {`);
+      lines.push(`        findMany: (args?: any) => tx.${lowerName}.findMany(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`        findFirst: (args?: any) => tx.${lowerName}.findFirst(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`        findUnique: (args?: any) => tx.${lowerName}.findUnique(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`        count: (args?: any) => tx.${lowerName}.count(injectFilters(args, '${model.name}', 'only-deleted')),`);
+      lines.push(`      },`);
+    }
+  }
+  lines.push('    },');
+
+  // Add $includingDeleted escape hatch
+  lines.push('');
+  lines.push('    /** Query including soft-deleted records with filter propagation */');
+  lines.push('    $includingDeleted: {');
+  for (const model of schema.models) {
+    const lowerName = toLowerFirst(model.name);
+    if (model.isSoftDeletable && model.deletedAtField !== null) {
+      lines.push(`      ${lowerName}: {`);
+      lines.push(`        findMany: (args?: any) => tx.${lowerName}.findMany(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        findFirst: (args?: any) => tx.${lowerName}.findFirst(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        findFirstOrThrow: (args?: any) => tx.${lowerName}.findFirstOrThrow(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        findUnique: (args?: any) => tx.${lowerName}.findUnique(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        findUniqueOrThrow: (args?: any) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        count: (args?: any) => tx.${lowerName}.count(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        aggregate: (args?: any) => tx.${lowerName}.aggregate(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`        groupBy: (args?: any) => tx.${lowerName}.groupBy(injectFilters(args, '${model.name}', 'include-deleted')),`);
+      lines.push(`      },`);
+    } else {
+      lines.push(`      ${lowerName}: tx.${lowerName},`);
+    }
+  }
+  lines.push('    },');
 
   lines.push('  };');
   lines.push('}');

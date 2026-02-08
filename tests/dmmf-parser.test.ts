@@ -271,6 +271,152 @@ describe('getHardDeleteOnlyModels', () => {
   });
 });
 
+describe('ParseDMMFOptions - custom field names', () => {
+  it('detects custom deletedAtField when specified', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'title', type: 'String' }),
+        createMockField({
+          name: 'removed_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf, { deletedAtField: 'removed_at' });
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.isSoftDeletable).toBe(true);
+    expect(parsedModel.deletedAtField).toBe('removed_at');
+  });
+
+  it('detects custom deletedByField when specified', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'removed_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+        createMockField({
+          name: 'removed_by',
+          type: 'String',
+          isRequired: false,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf, { deletedAtField: 'removed_at', deletedByField: 'removed_by' });
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.deletedByField).toBe('removed_by');
+  });
+
+  it('still detects default field names when no options are provided', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+        createMockField({
+          name: 'deleted_by',
+          type: 'String',
+          isRequired: false,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.isSoftDeletable).toBe(true);
+    expect(parsedModel.deletedAtField).toBe('deleted_at');
+    expect(parsedModel.deletedByField).toBe('deleted_by');
+  });
+
+  it('default field names still work as fallback when custom names are specified', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    // Custom name doesn't exist, but default 'deleted_at' should still be found
+    const result = parseDMMF(dmmf, { deletedAtField: 'removed_at' });
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.isSoftDeletable).toBe(true);
+    expect(parsedModel.deletedAtField).toBe('deleted_at');
+  });
+
+  it('custom field name takes priority over default when both exist', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'removed_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf, { deletedAtField: 'removed_at' });
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.isSoftDeletable).toBe(true);
+    // Custom name is prepended, so it should be found first
+    expect(parsedModel.deletedAtField).toBe('removed_at');
+  });
+
+  it('does not detect model as soft-deletable when custom field has wrong type', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'removed_at',
+          type: 'String', // Wrong type - should be DateTime
+          isRequired: false,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf, { deletedAtField: 'removed_at' });
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.isSoftDeletable).toBe(false);
+    expect(parsedModel.deletedAtField).toBeNull();
+  });
+});
+
 describe('uniqueStringFields', () => {
   it('includes regular string fields with @unique', () => {
     const model = createMockModel({

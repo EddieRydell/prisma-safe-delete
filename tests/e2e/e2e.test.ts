@@ -3054,4 +3054,921 @@ describe('E2E: Real database tests', () => {
       expect(cascaded.Comment).toBe(2);
     });
   });
+
+  describe('softDeletePreview', () => {
+    describe('Simple model (leaf, no cascade)', () => {
+      it('returns count of records that would be deleted', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'user@test.com' },
+        });
+        await prisma.post.create({
+          data: { id: 'p1', title: 'Post', authorId: 'u1' },
+        });
+        await prisma.comment.createMany({
+          data: [
+            { id: 'c1', content: 'Comment 1', postId: 'p1' },
+            { id: 'c2', content: 'Comment 2', postId: 'p1' },
+          ],
+        });
+
+        const { wouldDelete } = await safePrisma.comment.softDeletePreview({
+          where: { postId: 'p1' },
+        });
+
+        expect(wouldDelete.Comment).toBe(2);
+      });
+
+      it('excludes already-deleted records from count', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'user@test.com' },
+        });
+        await prisma.post.create({
+          data: { id: 'p1', title: 'Post', authorId: 'u1' },
+        });
+        await prisma.comment.createMany({
+          data: [
+            { id: 'c1', content: 'Active', postId: 'p1' },
+            { id: 'c2', content: 'Deleted', postId: 'p1', deleted_at: new Date() },
+          ],
+        });
+
+        const { wouldDelete } = await safePrisma.comment.softDeletePreview({
+          where: { postId: 'p1' },
+        });
+
+        expect(wouldDelete.Comment).toBe(1);
+      });
+
+      it('returns empty wouldDelete when no records match', async () => {
+        const { wouldDelete } = await safePrisma.comment.softDeletePreview({
+          where: { postId: 'nonexistent' },
+        });
+
+        expect(wouldDelete).toEqual({});
+      });
+
+      it('does not modify any data', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'user@test.com' },
+        });
+        await prisma.post.create({
+          data: { id: 'p1', title: 'Post', authorId: 'u1' },
+        });
+        await prisma.comment.create({
+          data: { id: 'c1', content: 'Comment', postId: 'p1' },
+        });
+
+        await safePrisma.comment.softDeletePreview({ where: { id: 'c1' } });
+
+        // Record should still be active
+        const comment = await safePrisma.comment.findUnique({ where: { id: 'c1' } });
+        expect(comment).not.toBeNull();
+        expect(comment.deleted_at).toBeNull();
+      });
+    });
+
+    describe('Complex model (with cascade)', () => {
+      it('includes root model and cascaded children in wouldDelete', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'author@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        const { wouldDelete } = await safePrisma.user.softDeletePreview({
+          where: { id: 'u1' },
+        });
+
+        expect(wouldDelete.User).toBe(1);
+        expect(wouldDelete.Post).toBe(2);
+      });
+
+      it('previews deep cascade (user -> post -> comment)', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'deep@test.com',
+            posts: {
+              create: {
+                id: 'p1',
+                title: 'Post',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'Comment 1' },
+                    { id: 'c2', content: 'Comment 2' },
+                    { id: 'c3', content: 'Comment 3' },
+                  ],
+                },
+              },
+            },
+          },
+        });
+
+        const { wouldDelete } = await safePrisma.user.softDeletePreview({
+          where: { id: 'u1' },
+        });
+
+        expect(wouldDelete.User).toBe(1);
+        expect(wouldDelete.Post).toBe(1);
+        expect(wouldDelete.Comment).toBe(3);
+      });
+
+      it('excludes already-deleted children from preview', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'partial@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Active Post' },
+                { id: 'p2', title: 'Deleted Post', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        const { wouldDelete } = await safePrisma.user.softDeletePreview({
+          where: { id: 'u1' },
+        });
+
+        expect(wouldDelete.User).toBe(1);
+        expect(wouldDelete.Post).toBe(1); // Only the active post
+      });
+
+      it('returns empty wouldDelete when no records match', async () => {
+        const { wouldDelete } = await safePrisma.user.softDeletePreview({
+          where: { id: 'nonexistent' },
+        });
+
+        expect(wouldDelete).toEqual({});
+      });
+
+      it('does not modify any data', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'preview@test.com',
+            posts: {
+              create: { id: 'p1', title: 'Post' },
+            },
+          },
+        });
+
+        await safePrisma.user.softDeletePreview({ where: { id: 'u1' } });
+
+        // Everything should still be active
+        const user = await safePrisma.user.findUnique({ where: { id: 'u1' } });
+        expect(user).not.toBeNull();
+        expect(user.deleted_at).toBeNull();
+
+        const post = await safePrisma.post.findUnique({ where: { id: 'p1' } });
+        expect(post).not.toBeNull();
+        expect(post.deleted_at).toBeNull();
+      });
+
+      it('previews 4-level deep cascade', async () => {
+        await prisma.category.create({
+          data: {
+            id: 'cat-1',
+            name: 'Electronics',
+            products: {
+              create: {
+                id: 'prod-1',
+                name: 'Phone',
+                variants: {
+                  create: {
+                    id: 'var-1',
+                    sku: 'PHN-001',
+                    options: {
+                      create: [
+                        { id: 'opt-1', name: 'Color', value: 'Black' },
+                        { id: 'opt-2', name: 'Storage', value: '128GB' },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        const { wouldDelete } = await safePrisma.category.softDeletePreview({
+          where: { id: 'cat-1' },
+        });
+
+        expect(wouldDelete.Category).toBe(1);
+        expect(wouldDelete.Product).toBe(1);
+        expect(wouldDelete.ProductVariant).toBe(1);
+        expect(wouldDelete.VariantOption).toBe(2);
+      });
+
+      it('previews self-referential cascade', async () => {
+        await prisma.category.create({
+          data: {
+            id: 'root',
+            name: 'Root',
+            children: {
+              create: {
+                id: 'child',
+                name: 'Child',
+                children: {
+                  create: { id: 'grandchild', name: 'Grandchild' },
+                },
+              },
+            },
+          },
+        });
+
+        const { wouldDelete } = await safePrisma.category.softDeletePreview({
+          where: { id: 'root' },
+        });
+
+        expect(wouldDelete.Category).toBe(3); // root + child + grandchild
+      });
+
+      it('preview matches actual softDelete cascade counts', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'match@test.com',
+            posts: {
+              create: {
+                id: 'p1',
+                title: 'Post',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'C1' },
+                    { id: 'c2', content: 'C2' },
+                  ],
+                },
+              },
+            },
+          },
+        });
+
+        // Preview first
+        const { wouldDelete } = await safePrisma.user.softDeletePreview({
+          where: { id: 'u1' },
+        });
+
+        // Then actually delete
+        const { cascaded } = await safePrisma.user.softDelete({
+          where: { id: 'u1' },
+        });
+
+        // Preview root count should match
+        expect(wouldDelete.User).toBe(1);
+        // Preview cascaded counts should match actual cascaded counts
+        expect(wouldDelete.Post).toBe(cascaded.Post);
+        expect(wouldDelete.Comment).toBe(cascaded.Comment);
+      });
+
+      it('wide cascade preview returns counts for multiple child types', async () => {
+        await prisma.organization.create({
+          data: {
+            id: 'org-1',
+            name: 'Acme',
+            teams: {
+              create: [
+                { id: 'team-1', name: 'Engineering' },
+                { id: 'team-2', name: 'Marketing' },
+              ],
+            },
+            projects: {
+              create: [
+                { id: 'proj-1', name: 'Alpha' },
+                { id: 'proj-2', name: 'Beta' },
+              ],
+            },
+          },
+        });
+
+        const { wouldDelete } = await safePrisma.organization.softDeletePreview({
+          where: { id: 'org-1' },
+        });
+
+        expect(wouldDelete.Organization).toBe(1);
+        expect(wouldDelete.Team).toBe(2);
+        expect(wouldDelete.Project).toBe(2);
+      });
+    });
+
+    describe('In transactions', () => {
+      it('simple model preview works in transaction', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'user@test.com' },
+        });
+        await prisma.post.create({
+          data: { id: 'p1', title: 'Post', authorId: 'u1' },
+        });
+        await prisma.comment.createMany({
+          data: [
+            { id: 'c1', content: 'C1', postId: 'p1' },
+            { id: 'c2', content: 'C2', postId: 'p1' },
+          ],
+        });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          return tx.comment.softDeletePreview({ where: { postId: 'p1' } });
+        });
+
+        expect(result.wouldDelete.Comment).toBe(2);
+      });
+
+      it('complex model preview works in transaction', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'tx@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          return tx.user.softDeletePreview({ where: { id: 'u1' } });
+        });
+
+        expect(result.wouldDelete.User).toBe(1);
+        expect(result.wouldDelete.Post).toBe(2);
+      });
+
+      it('preview reflects transaction state', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'txstate@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+                { id: 'p3', title: 'Post 3' },
+              ],
+            },
+          },
+        });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          // Soft delete one post first
+          await tx.post.softDelete({ where: { id: 'p1' } });
+
+          // Now preview should exclude the already-deleted post
+          return tx.user.softDeletePreview({ where: { id: 'u1' } });
+        });
+
+        expect(result.wouldDelete.User).toBe(1);
+        expect(result.wouldDelete.Post).toBe(2); // p2 and p3 only
+      });
+    });
+  });
+
+  describe('Filter Propagation', () => {
+    describe('$onlyDeleted propagation', () => {
+      it('propagates only-deleted filter to first-level relations', async () => {
+        // Create user with posts, then cascade delete
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        // Soft delete the user (cascades to posts)
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        // Query with $onlyDeleted - should get deleted user WITH deleted posts
+        const result = await safePrisma.$onlyDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: { posts: true },
+        });
+
+        expect(result).not.toBeNull();
+        expect(result!.deleted_at).not.toBeNull();
+        expect(result!.posts).toHaveLength(2);
+        expect(result!.posts[0].deleted_at).not.toBeNull();
+        expect(result!.posts[1].deleted_at).not.toBeNull();
+      });
+
+      it('propagates only-deleted filter to deeply nested relations', async () => {
+        // Create user -> post -> comment, all soft-deletable
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: {
+                id: 'p1',
+                title: 'Post',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'Comment 1' },
+                    { id: 'c2', content: 'Comment 2' },
+                  ],
+                },
+              },
+            },
+          },
+        });
+
+        // Soft delete the user (cascades all the way down)
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        // Query with deep nesting
+        const result = await safePrisma.$onlyDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: {
+            posts: {
+              include: {
+                comments: true,
+              },
+            },
+          },
+        });
+
+        expect(result).not.toBeNull();
+        expect(result!.deleted_at).not.toBeNull();
+        expect(result!.posts[0].deleted_at).not.toBeNull();
+        expect(result!.posts[0].comments).toHaveLength(2);
+        expect(result!.posts[0].comments[0].deleted_at).not.toBeNull();
+        expect(result!.posts[0].comments[1].deleted_at).not.toBeNull();
+      });
+
+      it('propagates to _count relations', async () => {
+        // Create user with posts
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        // Soft delete user
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        // Query with _count
+        const result = await safePrisma.$onlyDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: {
+            _count: {
+              select: { posts: true },
+            },
+          },
+        });
+
+        // Should count only deleted posts (both p1 and p2 are now deleted)
+        expect(result!._count.posts).toBe(2);
+      });
+    });
+
+    describe('$includingDeleted propagation', () => {
+      it('propagates include-deleted filter to relations', async () => {
+        // Create user with mix of active and deleted posts
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Active Post' },
+                { id: 'p2', title: 'Deleted Post', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        // Query with $includingDeleted - should get both active and deleted posts
+        const result = await safePrisma.$includingDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: { posts: true },
+        });
+
+        expect(result).not.toBeNull();
+        expect(result!.posts).toHaveLength(2);
+      });
+
+      it('propagates include-deleted to deeply nested relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            deleted_at: new Date(),
+            posts: {
+              create: {
+                id: 'p1',
+                title: 'Post',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'Active Comment' },
+                    { id: 'c2', content: 'Deleted Comment', deleted_at: new Date() },
+                  ],
+                },
+              },
+            },
+          },
+        });
+
+        const result = await safePrisma.$includingDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: {
+            posts: {
+              include: {
+                comments: true,
+              },
+            },
+          },
+        });
+
+        expect(result!.posts[0].comments).toHaveLength(2);
+      });
+    });
+
+    describe('Explicit filter overrides', () => {
+      it('respects user explicit deleted_at filter in relations', async () => {
+        // Create user with posts
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Active Post' },
+                { id: 'p2', title: 'Deleted Post', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        // Manually delete user WITHOUT cascading (using raw prisma)
+        await prisma.user.update({
+          where: { id: 'u1' },
+          data: { deleted_at: new Date() },
+        });
+
+        // Query deleted user but override to get only ACTIVE posts
+        const result = await safePrisma.$onlyDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: {
+            posts: {
+              where: { deleted_at: null }, // Explicit override
+            },
+          },
+        });
+
+        expect(result).not.toBeNull();
+        expect(result!.deleted_at).not.toBeNull(); // User is deleted
+        expect(result!.posts).toHaveLength(1); // Only active post
+        expect(result!.posts[0].id).toBe('p1');
+        expect(result!.posts[0].deleted_at).toBeNull();
+      });
+
+      it('allows mixed filtering in nested relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                {
+                  id: 'p1',
+                  title: 'Post 1',
+                  comments: {
+                    create: [
+                      { id: 'c1', content: 'Comment 1' },
+                      { id: 'c2', content: 'Comment 2', deleted_at: new Date() },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        });
+
+        // Manually delete user and post WITHOUT cascading to comments
+        await prisma.user.update({
+          where: { id: 'u1' },
+          data: { deleted_at: new Date() },
+        });
+        await prisma.post.update({
+          where: { id: 'p1' },
+          data: { deleted_at: new Date() },
+        });
+
+        // Deleted user, with deleted posts, but only active comments
+        const result = await safePrisma.$onlyDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: {
+            posts: {
+              include: {
+                comments: {
+                  where: { deleted_at: null }, // Override: active comments only
+                },
+              },
+            },
+          },
+        });
+
+        expect(result!.posts[0].comments).toHaveLength(1);
+        expect(result!.posts[0].comments[0].id).toBe('c1');
+      });
+    });
+  });
+
+  describe('Transaction Escape Hatches', () => {
+    describe('tx.$onlyDeleted', () => {
+      it('is available in transaction context', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            deleted_at: new Date(),
+          },
+        });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          return tx.$onlyDeleted.user.findFirst({ where: { id: 'u1' } });
+        });
+
+        expect(result).not.toBeNull();
+        expect(result!.deleted_at).not.toBeNull();
+      });
+
+      it('propagates filter mode in transaction', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          return tx.$onlyDeleted.user.findFirst({
+            where: { id: 'u1' },
+            include: { posts: true },
+          });
+        });
+
+        expect(result!.posts).toHaveLength(2);
+        expect(result!.posts[0].deleted_at).not.toBeNull();
+      });
+
+      it('works with atomic audit logging', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+          },
+        });
+
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        // Atomic restore with audit log
+        await safePrisma.$transaction(async (tx: any) => {
+          const user = await tx.$onlyDeleted.user.findFirst({ where: { id: 'u1' } });
+          await tx.user.restore({ where: { id: 'u1' } });
+          await tx.auditLog.create({
+            data: {
+              action: `RESTORE:User:${String(user!.id)}`,
+              entityId: user!.id,
+            },
+          });
+        });
+
+        const restored = await safePrisma.user.findFirst({ where: { id: 'u1' } });
+        const audit = await safePrisma.auditLog.findFirst({
+          where: { action: { startsWith: 'RESTORE:' } }
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored!.deleted_at).toBeNull();
+        expect(audit).not.toBeNull();
+      });
+    });
+
+    describe('tx.$includingDeleted', () => {
+      it('is available in transaction context', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'active@test.com' },
+        });
+        await prisma.user.create({
+          data: { id: 'u2', email: 'deleted@test.com', deleted_at: new Date() },
+        });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          return tx.$includingDeleted.user.findMany();
+        });
+
+        expect(result).toHaveLength(2);
+      });
+
+      it('propagates include-deleted mode in transaction', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Active' },
+                { id: 'p2', title: 'Deleted', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        const result = await safePrisma.$transaction(async (tx: any) => {
+          return tx.$includingDeleted.user.findFirst({
+            where: { id: 'u1' },
+            include: { posts: true },
+          });
+        });
+
+        expect(result!.posts).toHaveLength(2);
+      });
+    });
+
+    describe('tx.model.restoreCascade', () => {
+      it('works in transaction for atomic operations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const { record, cascaded, logId } = await safePrisma.$transaction(async (tx: any) => {
+          const { record, cascaded } = await tx.user.restoreCascade({ where: { id: 'u1' } });
+
+          const log = await tx.auditLog.create({
+            data: {
+              action: `RESTORE_CASCADE:User:${String(record!.id)}:${JSON.stringify(cascaded)}`,
+              entityId: record!.id,
+            },
+          });
+
+          return { record, cascaded, logId: log.id };
+        });
+
+        expect(record).not.toBeNull();
+        expect(cascaded.Post).toBe(2);
+        expect(logId).toBeDefined();
+
+        // Verify all restored
+        const user = await safePrisma.user.findFirst({ where: { id: 'u1' } });
+        const posts = await safePrisma.post.findMany({ where: { authorId: 'u1' } });
+
+        expect(user!.deleted_at).toBeNull();
+        expect(posts).toHaveLength(2);
+      });
+    });
+  });
+
+  describe('Helper Utilities', () => {
+    let onlyDeleted: any;
+    let excludeDeleted: any;
+    let includingDeleted: any;
+
+    beforeAll(async () => {
+      // Import the helpers
+      const helpersModule = await import('./generated/soft-cascade/runtime.js');
+      onlyDeleted = helpersModule.onlyDeleted;
+      excludeDeleted = helpersModule.excludeDeleted;
+      includingDeleted = helpersModule.includingDeleted;
+    });
+
+    describe('onlyDeleted()', () => {
+      it('adds deleted_at filter for soft-deletable models', () => {
+        const where = onlyDeleted('User', { email: 'test@test.com' });
+        expect(where).toEqual({
+          email: 'test@test.com',
+          deleted_at: { not: null },
+        });
+      });
+
+      it('works in nested relation filters', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Active', deleted_at: null },
+                { id: 'p2', title: 'Deleted', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        const result = await safePrisma.user.findFirst({
+          where: {
+            id: 'u1',
+            posts: {
+              some: onlyDeleted('Post', { title: { contains: 'Deleted' } }),
+            },
+          },
+        });
+
+        expect(result).not.toBeNull();
+      });
+
+      it('handles empty where object', () => {
+        const where = onlyDeleted('User');
+        expect(where).toEqual({ deleted_at: { not: null } });
+      });
+    });
+
+    describe('excludeDeleted()', () => {
+      it('adds deleted_at: null filter', () => {
+        const where = excludeDeleted('Post', { published: true });
+        expect(where).toEqual({
+          published: true,
+          deleted_at: null,
+        });
+      });
+
+      it('can override propagation in $onlyDeleted queries', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Active' },
+                { id: 'p2', title: 'Deleted', deleted_at: new Date() },
+              ],
+            },
+          },
+        });
+
+        // Manually delete user WITHOUT cascading
+        await prisma.user.update({
+          where: { id: 'u1' },
+          data: { deleted_at: new Date() },
+        });
+
+        // Alternative syntax for override using helper
+        const result = await safePrisma.$onlyDeleted.user.findFirst({
+          where: { id: 'u1' },
+          include: {
+            posts: {
+              where: excludeDeleted('Post', {}),
+            },
+          },
+        });
+
+        expect(result!.posts).toHaveLength(1);
+        expect(result!.posts[0].id).toBe('p1');
+      });
+    });
+
+    describe('includingDeleted()', () => {
+      it('returns where clause unchanged', () => {
+        const where = { email: 'test@test.com' };
+        const result = includingDeleted(where);
+        expect(result).toBe(where);
+      });
+
+      it('is a no-op for documentation purposes', () => {
+        const result = includingDeleted({});
+        expect(result).toEqual({});
+      });
+    });
+  });
 });

@@ -248,6 +248,9 @@ generatorHandler({
     const uniqueStrategy: UniqueStrategy =
       rawStrategy === 'none' ? 'none' : 'mangle'; // Default to 'mangle'
 
+    const deletedAtFieldName = options.generator.config['deletedAtField'] as string | undefined;
+    const deletedByFieldName = options.generator.config['deletedByField'] as string | undefined;
+
     // Find the Prisma client generator to get its output path
     const clientGenerator = options.otherGenerators.find(
       (g) => g.provider.value === 'prisma-client',
@@ -272,7 +275,10 @@ generatorHandler({
     const clientImportPath = computeClientImportPath(outputDir, clientOutputPath);
 
     // Parse the DMMF
-    const schema = parseDMMF(options.dmmf);
+    const schema = parseDMMF(options.dmmf, {
+      ...(deletedAtFieldName !== undefined ? { deletedAtField: deletedAtFieldName } : {}),
+      ...(deletedByFieldName !== undefined ? { deletedByField: deletedByFieldName } : {}),
+    });
 
     // Emit warning if uniqueStrategy is 'none' and there are unique fields
     if (uniqueStrategy === 'none') {

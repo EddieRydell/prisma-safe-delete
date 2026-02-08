@@ -69,6 +69,8 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & ${deletedByType}) => Promise<{ record: Prisma.${name}GetPayload<{}>; cascaded: CascadeResult }>;`);
     lines.push(`  /** Soft delete multiple ${name} records with cascade */`);
     lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & ${deletedByType}) => Promise<{ count: number; cascaded: CascadeResult }>;`);
+    lines.push(`  /** Preview what would be soft deleted (read-only, no writes) */`);
+    lines.push(`  softDeletePreview: (args: Prisma.${name}DeleteManyArgs) => Promise<{ wouldDelete: CascadeResult }>;`);
     lines.push(`  /** Restore a soft-deleted ${name} record (unmangles unique fields) */`);
     lines.push(`  restore: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}> | null>;`);
     lines.push(`  /** Restore multiple soft-deleted ${name} records */`);
@@ -105,6 +107,12 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
       lines.push(`  ${lowerName}: PrismaClient['${lowerName}'];`);
     }
   }
+  lines.push('');
+  lines.push('  /** Query only soft-deleted records with filter propagation */');
+  lines.push('  $onlyDeleted: OnlyDeletedClient;');
+  lines.push('');
+  lines.push('  /** Query including soft-deleted records with filter propagation */');
+  lines.push('  $includingDeleted: IncludingDeletedClient;');
   lines.push('}');
   lines.push('');
 
@@ -146,12 +154,16 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('}');
   lines.push('');
 
-  // Generate IncludingDeletedClient type (kept for backward compatibility)
-  lines.push('/** @deprecated Use model.includingDeleted instead */');
+  // Generate IncludingDeletedClient type
+  lines.push('/** Client that includes soft-deleted records with filter propagation */');
   lines.push('export interface IncludingDeletedClient {');
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    lines.push(`  ${lowerName}: PrismaClient['${lowerName}'];`);
+    if (model.isSoftDeletable) {
+      lines.push(`  ${lowerName}: Pick<PrismaClient['${lowerName}'], 'findMany' | 'findFirst' | 'findFirstOrThrow' | 'findUnique' | 'findUniqueOrThrow' | 'count' | 'aggregate' | 'groupBy'>;`);
+    } else {
+      lines.push(`  ${lowerName}: PrismaClient['${lowerName}'];`);
+    }
   }
   lines.push('}');
   lines.push('');
@@ -166,6 +178,34 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
     }
   }
   lines.push('}');
+  lines.push('');
+
+  // Export helper function types
+  lines.push('/**');
+  lines.push(' * Helper to filter for only soft-deleted records in where clauses.');
+  lines.push(' * Useful for nested relation filters where $onlyDeleted cannot be used.');
+  lines.push(' */');
+  lines.push('export declare function onlyDeleted<T extends Record<string, unknown>>(');
+  lines.push('  modelName: string,');
+  lines.push('  where?: T');
+  lines.push('): T & Record<string, unknown>;');
+  lines.push('');
+  lines.push('/**');
+  lines.push(' * Helper to filter for only non-deleted (active) records in where clauses.');
+  lines.push(' * This is the default behavior, but useful for explicit overrides.');
+  lines.push(' */');
+  lines.push('export declare function excludeDeleted<T extends Record<string, unknown>>(');
+  lines.push('  modelName: string,');
+  lines.push('  where?: T');
+  lines.push('): T & Record<string, unknown>;');
+  lines.push('');
+  lines.push('/**');
+  lines.push(' * Helper to include all records (deleted + active) in where clauses.');
+  lines.push(' * This is a no-op function for clarity/documentation purposes.');
+  lines.push(' */');
+  lines.push('export declare function includingDeleted<T extends Record<string, unknown>>(');
+  lines.push('  where?: T');
+  lines.push('): T;');
 
   return lines;
 }

@@ -68,6 +68,16 @@ const DELETED_AT_FIELD_NAMES: readonly string[] = ['deleted_at', 'deletedAt'];
 const DELETED_BY_FIELD_NAMES: readonly string[] = ['deleted_by', 'deletedBy'];
 
 /**
+ * Options for customizing DMMF parsing behavior
+ */
+interface ParseDMMFOptions {
+  /** Custom field name for the deleted-at marker (prepended to default candidates) */
+  deletedAtField?: string;
+  /** Custom field name for the deleted-by marker (prepended to default candidates) */
+  deletedByField?: string;
+}
+
+/**
  * Type for DMMF field that may be readonly
  */
 type DMMFField = DMMF.Field | DMMF.Document['datamodel']['models'][number]['fields'][number];
@@ -287,14 +297,23 @@ function extractUniqueConstraints(
 /**
  * Parses a single DMMF model into our ParsedModel format
  */
-function parseModel(model: DMMFModel): ParsedModel {
+function parseModel(model: DMMFModel, options?: ParseDMMFOptions): ParsedModel {
+  const customDeletedAtField = options?.deletedAtField;
+  const deletedAtCandidates = customDeletedAtField !== undefined
+    ? [customDeletedAtField, ...DELETED_AT_FIELD_NAMES]
+    : DELETED_AT_FIELD_NAMES;
+  const customDeletedByField = options?.deletedByField;
+  const deletedByCandidates = customDeletedByField !== undefined
+    ? [customDeletedByField, ...DELETED_BY_FIELD_NAMES]
+    : DELETED_BY_FIELD_NAMES;
+
   const deletedAtCandidate = findFieldByNames(
     model.fields,
-    DELETED_AT_FIELD_NAMES,
+    deletedAtCandidates,
   );
   const deletedByCandidate = findFieldByNames(
     model.fields,
-    DELETED_BY_FIELD_NAMES,
+    deletedByCandidates,
   );
 
   const deletedAtField =
@@ -323,7 +342,7 @@ function parseModel(model: DMMFModel): ParsedModel {
   return {
     name: model.name,
     primaryKey: extractPrimaryKey(model),
-    isSoftDeletable: deletedAtField !== null,
+    isSoftDeletable: Boolean(deletedAtField),
     deletedAtField,
     deletedByField,
     fields,
@@ -338,12 +357,13 @@ function parseModel(model: DMMFModel): ParsedModel {
  * Parses the complete DMMF datamodel into our structured format
  *
  * @param dmmf - The DMMF document from Prisma generator
+ * @param options - Optional configuration for custom field name detection
  * @returns ParsedSchema with models array and lookup map
  */
-export function parseDMMF(dmmf: DMMF.Document): ParsedSchema {
+export function parseDMMF(dmmf: DMMF.Document, options?: ParseDMMFOptions): ParsedSchema {
   const models: ParsedModel[] = [];
   for (const model of dmmf.datamodel.models) {
-    models.push(parseModel(model));
+    models.push(parseModel(model, options));
   }
 
   const modelMap = new Map<string, ParsedModel>();
