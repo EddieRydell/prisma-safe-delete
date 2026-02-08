@@ -188,7 +188,7 @@ function extractUniqueStringFields(model: DMMFModel): string[] {
     }
   }
 
-  // Find mangeable string fields in @@unique compound constraints
+  // Find mangleable string fields in @@unique compound constraints
   for (const uniqueConstraint of model.uniqueFields) {
     for (const fieldName of uniqueConstraint) {
       const field = model.fields.find((f) => f.name === fieldName);
