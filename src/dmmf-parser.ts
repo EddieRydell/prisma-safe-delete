@@ -158,24 +158,41 @@ function parseRelation(field: DMMFField): ParsedRelation | null {
 }
 
 /**
+ * Checks if a field has a UUID native database type (@db.Uuid).
+ * UUID fields should not be mangled since appending text would create invalid UUIDs.
+ */
+function hasUuidNativeType(field: DMMFField): boolean {
+  return field.nativeType?.[0] === 'Uuid';
+}
+
+/**
+ * Checks if a string field is safe to mangle.
+ * Returns true for regular strings, false for UUID native types.
+ */
+function isMangleableStringField(field: DMMFField): boolean {
+  return field.type === 'String' && !hasUuidNativeType(field);
+}
+
+/**
  * Extracts unique string fields from a model.
  * Includes both @unique fields and string fields from @@unique compound constraints.
+ * Excludes UUID native types since mangling would create invalid UUIDs.
  */
 function extractUniqueStringFields(model: DMMFModel): string[] {
   const uniqueStringFields = new Set<string>();
 
-  // Find fields with @unique that are strings
+  // Find fields with @unique that are mangeable strings (excludes @db.Uuid)
   for (const field of model.fields) {
-    if (field.isUnique && field.type === 'String') {
+    if (field.isUnique && isMangleableStringField(field)) {
       uniqueStringFields.add(field.name);
     }
   }
 
-  // Find string fields in @@unique compound constraints
+  // Find mangleable string fields in @@unique compound constraints
   for (const uniqueConstraint of model.uniqueFields) {
     for (const fieldName of uniqueConstraint) {
       const field = model.fields.find((f) => f.name === fieldName);
-      if (field?.type === 'String') {
+      if (field !== undefined && isMangleableStringField(field)) {
         uniqueStringFields.add(fieldName);
       }
     }
