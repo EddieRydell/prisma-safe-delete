@@ -384,12 +384,12 @@ describe('E2E: Real database tests', () => {
       expect(rawUser).not.toBeNull();
     });
 
-    it('hardDelete permanently removes record', async () => {
+    it('__dangerousHardDelete permanently removes record', async () => {
       await prisma.user.create({
         data: { id: 'user-1', email: 'test@test.com' },
       });
 
-      await safePrisma.user.hardDelete({ where: { id: 'user-1' } });
+      await safePrisma.user.__dangerousHardDelete({ where: { id: 'user-1' } });
 
       // Should be gone from both clients
       const safeUser = await safePrisma.user.findUnique({
@@ -2006,36 +2006,10 @@ describe('E2E: Real database tests', () => {
       expect(rawCustomer.deleted_by).toBe('admin-123');
     });
 
-    it('softDelete throws error when model has deleted_by field but deletedBy not provided', async () => {
-      await prisma.customer.create({
-        data: { id: 'cust-1', email: 'test@example.com', username: 'testuser' },
-      });
-
-      await expect(
-        safePrisma.customer.softDelete({ where: { id: 'cust-1' } })
-      ).rejects.toThrow(/deletedBy.*was not provided/);
-
-      // Record should not be deleted
-      const rawCustomer = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
-      expect(rawCustomer.deleted_at).toBeNull();
-    });
-
-    it('softDeleteMany throws error when model has deleted_by field but deletedBy not provided', async () => {
-      await prisma.customer.createMany({
-        data: [
-          { id: 'cust-1', email: 'c1@example.com', username: 'user1' },
-          { id: 'cust-2', email: 'c2@example.com', username: 'user2' },
-        ],
-      });
-
-      await expect(
-        safePrisma.customer.softDeleteMany({ where: { id: { in: ['cust-1', 'cust-2'] } } })
-      ).rejects.toThrow(/deletedBy.*was not provided/);
-
-      // Records should not be deleted
-      const count = await prisma.customer.count({ where: { deleted_at: null } });
-      expect(count).toBe(2);
-    });
+    // Note: deletedBy requirement is enforced at compile-time via TypeScript types.
+    // The following code would not compile:
+    //   safePrisma.customer.softDelete({ where: { id: '1' } })  // Error: missing deletedBy
+    // See integration tests for compile-time verification.
 
     it('softDelete works without deletedBy on models that lack deleted_by field', async () => {
       // User model has deleted_at but no deleted_by field

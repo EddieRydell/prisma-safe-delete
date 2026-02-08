@@ -67,6 +67,43 @@ function createTestSchema() {
 // Default client import path for tests
 const TEST_CLIENT_PATH = '../client';
 
+function createSchemaWithDeletedBy() {
+  const models = [
+    createMockModel({
+      name: 'Customer',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String', isUnique: true }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+        createMockField({
+          name: 'deleted_by',
+          type: 'String',
+          isRequired: false,
+        }),
+      ],
+    }),
+    createMockModel({
+      name: 'User',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String', isUnique: true }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: false,
+        }),
+        // No deleted_by field
+      ],
+    }),
+  ];
+
+  return parseDMMF(createMockDMMF(models));
+}
+
 describe('emitTypes', () => {
   it('generates type definitions with correct header', () => {
     const schema = createTestSchema();
@@ -84,8 +121,27 @@ describe('emitTypes', () => {
     expect(output).toContain("'delete' | 'deleteMany'");
     expect(output).toContain('softDelete:');
     expect(output).toContain('softDeleteMany:');
-    expect(output).toContain('hardDelete:');
-    expect(output).toContain('hardDeleteMany:');
+    expect(output).toContain('__dangerousHardDelete:');
+    expect(output).toContain('__dangerousHardDeleteMany:');
+    expect(output).toContain('includingDeleted:');
+  });
+
+  it('generates required deletedBy for models with deleted_by field', () => {
+    const schema = createSchemaWithDeletedBy();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // Customer has deleted_by field - deletedBy should be required (no ?)
+    expect(output).toMatch(/SafeCustomerDelegate[\s\S]*softDelete:[\s\S]*\{ deletedBy: string \}/);
+    expect(output).toMatch(/SafeCustomerDelegate[\s\S]*softDeleteMany:[\s\S]*\{ deletedBy: string \}/);
+  });
+
+  it('generates optional deletedBy for models without deleted_by field', () => {
+    const schema = createSchemaWithDeletedBy();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // User has no deleted_by field - deletedBy should be optional (?)
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*softDelete:[\s\S]*\{ deletedBy\?: string \}/);
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*softDeleteMany:[\s\S]*\{ deletedBy\?: string \}/);
   });
 
   it('generates standard delegate for non-soft-deletable models', () => {

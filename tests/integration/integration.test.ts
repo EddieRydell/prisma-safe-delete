@@ -44,6 +44,215 @@ describe('Integration: prisma generate', () => {
     expect(true).toBe(true);
   });
 
+  it('TypeScript errors when deletedBy is missing for models with deleted_by field', () => {
+    // Write a test file that only checks types (no instantiation needed)
+    const testFile = path.join(integrationDir, 'generated', 'compile-fail-test.ts');
+    fs.writeFileSync(
+      testFile,
+      `
+import type { SafePrismaClient } from './soft-cascade/types.js';
+
+// Use declare to avoid needing actual implementation
+declare const safePrisma: SafePrismaClient;
+
+// This should fail to compile - Customer has deleted_by, so deletedBy is required
+safePrisma.customer.softDelete({ where: { id: '1' } });
+`
+    );
+
+    try {
+      // Run tsc on the test file - should FAIL
+      const result = execSync(
+        `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 ${testFile}`,
+        {
+          cwd: integrationDir,
+          stdio: 'pipe',
+          encoding: 'utf-8',
+        }
+      );
+      // If we get here, tsc didn't fail - that's wrong!
+      throw new Error(`Expected TypeScript compilation to fail, but it succeeded with output: ${result}`);
+    } catch (error: unknown) {
+      // tsc should fail with an error about missing deletedBy
+      const execError = error as { status?: number; stdout?: string; stderr?: string; message?: string };
+      // Check it's not our own thrown error
+      if (execError.message?.includes('Expected TypeScript compilation to fail') === true) {
+        throw error;
+      }
+      expect(execError.status).not.toBe(0);
+      // tsc outputs errors to stdout, not stderr
+      const output = (execError.stdout ?? '') + (execError.stderr ?? '');
+      expect(output).toMatch(/deletedBy|Property.*missing/i);
+    } finally {
+      // Clean up
+      if (fs.existsSync(testFile)) {
+        fs.unlinkSync(testFile);
+      }
+    }
+  });
+
+  it('TypeScript compiles when deletedBy is provided for models with deleted_by field', () => {
+    // Write a test file that only checks types (no instantiation needed)
+    const testFile = path.join(integrationDir, 'generated', 'compile-pass-test.ts');
+    fs.writeFileSync(
+      testFile,
+      `
+import type { SafePrismaClient } from './soft-cascade/types.js';
+
+// Use declare to avoid needing actual implementation
+declare const safePrisma: SafePrismaClient;
+
+// This should compile - deletedBy is provided
+safePrisma.customer.softDelete({ where: { id: '1' }, deletedBy: 'admin' });
+
+// User doesn't have deleted_by field, so deletedBy is optional - this should also compile
+safePrisma.user.softDelete({ where: { id: '1' } });
+`
+    );
+
+    try {
+      // Run tsc - should succeed
+      execSync(
+        `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 ${testFile}`,
+        {
+          cwd: integrationDir,
+          stdio: 'pipe',
+          encoding: 'utf-8',
+        }
+      );
+      // If we get here, it compiled successfully
+      expect(true).toBe(true);
+    } catch (error: unknown) {
+      const execError = error as { stdout?: string; stderr?: string };
+      const output = (execError.stdout ?? '') + (execError.stderr ?? '');
+      throw new Error(`Expected TypeScript compilation to succeed, but it failed:\n${output}`);
+    } finally {
+      // Clean up
+      if (fs.existsSync(testFile)) {
+        fs.unlinkSync(testFile);
+      }
+    }
+  });
+
+  // Helper to run tsc and expect it to fail
+  function expectTypeError(code: string, expectedPattern: RegExp): void {
+    const testFile = path.join(integrationDir, 'generated', `type-test-${String(Date.now())}.ts`);
+    fs.writeFileSync(testFile, code);
+    try {
+      execSync(
+        `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --strict ${testFile}`,
+        { cwd: integrationDir, stdio: 'pipe', encoding: 'utf-8' }
+      );
+      throw new Error('Expected TypeScript compilation to fail, but it succeeded');
+    } catch (error: unknown) {
+      const execError = error as { status?: number; stdout?: string; stderr?: string; message?: string };
+      if (execError.message?.includes('Expected TypeScript compilation to fail') === true) {
+        throw error;
+      }
+      expect(execError.status).not.toBe(0);
+      const output = (execError.stdout ?? '') + (execError.stderr ?? '');
+      expect(output).toMatch(expectedPattern);
+    } finally {
+      if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+    }
+  }
+
+  // Helper to run tsc and expect it to pass
+  function expectNoTypeError(code: string): void {
+    const testFile = path.join(integrationDir, 'generated', `type-test-${String(Date.now())}.ts`);
+    fs.writeFileSync(testFile, code);
+    try {
+      execSync(
+        `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --strict ${testFile}`,
+        { cwd: integrationDir, stdio: 'pipe', encoding: 'utf-8' }
+      );
+    } catch (error: unknown) {
+      const execError = error as { stdout?: string; stderr?: string };
+      const output = (execError.stdout ?? '') + (execError.stderr ?? '');
+      throw new Error(`Expected TypeScript compilation to succeed, but it failed:\n${output}`);
+    } finally {
+      if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+    }
+  }
+
+  it('TypeScript errors when calling delete on soft-deletable model', () => {
+    expectTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.user.delete({ where: { id: '1' } });
+`, /Property 'delete' does not exist/);
+  });
+
+  it('TypeScript errors when calling deleteMany on soft-deletable model', () => {
+    expectTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.user.deleteMany({ where: {} });
+`, /Property 'deleteMany' does not exist/);
+  });
+
+  it('TypeScript allows delete on non-soft-deletable model (AuditLog)', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.auditLog.delete({ where: { id: '1' } });
+`);
+  });
+
+  it('Transaction callback has typed softDelete method', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.$transaction(async (tx) => {
+  // tx should have softDelete on user
+  await tx.user.softDelete({ where: { id: '1' } });
+  // tx should have includingDeleted
+  await tx.user.includingDeleted.findMany();
+  // tx should require deletedBy for Customer
+  await tx.customer.softDelete({ where: { id: '1' }, deletedBy: 'admin' });
+});
+`);
+  });
+
+  it('Transaction callback errors when missing deletedBy for Customer', () => {
+    expectTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.$transaction(async (tx) => {
+  await tx.customer.softDelete({ where: { id: '1' } });
+});
+`, /deletedBy|Property.*missing/i);
+  });
+
+  it('includingDeleted has read methods but not write methods', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+// These should all work
+safePrisma.user.includingDeleted.findMany();
+safePrisma.user.includingDeleted.findFirst({ where: { id: '1' } });
+safePrisma.user.includingDeleted.findUnique({ where: { id: '1' } });
+safePrisma.user.includingDeleted.count();
+`);
+  });
+
+  it('includingDeleted does not have create/update/delete methods', () => {
+    expectTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.user.includingDeleted.create({ data: { email: 'test@test.com' } });
+`, /Property 'create' does not exist/);
+  });
+
+  it('__dangerousHardDelete exists and is typed correctly', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.user.__dangerousHardDelete({ where: { id: '1' } });
+safePrisma.user.__dangerousHardDeleteMany({ where: {} });
+`);
+  });
+
   it('generates correct cascade graph for User -> Post -> Comment chain', async () => {
     const cascadeGraphPath = path.join(generatedDir, 'cascade-graph.ts');
     const content = fs.readFileSync(cascadeGraphPath, 'utf-8');
@@ -75,8 +284,8 @@ describe('Integration: prisma generate', () => {
     // Should have softDelete methods
     expect(content).toContain('softDelete:');
     expect(content).toContain('softDeleteMany:');
-    expect(content).toContain('hardDelete:');
-    expect(content).toContain('hardDeleteMany:');
+    expect(content).toContain('__dangerousHardDelete:');
+    expect(content).toContain('__dangerousHardDeleteMany:');
 
     // AuditLog (not soft-deletable) should NOT have Omit
     expect(content).toContain("SafeAuditLogDelegate = PrismaClient['auditLog']");
@@ -255,8 +464,8 @@ describe('Integration: Runtime behavior', () => {
     // Verify soft-deletable model has softDelete method
     expect(typeof safePrisma.user.softDelete).toBe('function');
     expect(typeof safePrisma.user.softDeleteMany).toBe('function');
-    expect(typeof safePrisma.user.hardDelete).toBe('function');
-    expect(typeof safePrisma.user.hardDeleteMany).toBe('function');
+    expect(typeof safePrisma.user.__dangerousHardDelete).toBe('function');
+    expect(typeof safePrisma.user.__dangerousHardDeleteMany).toBe('function');
 
     // Verify delete methods are NOT exposed (they're replaced)
     expect((safePrisma.user as Record<string, unknown>)['delete']).toBeUndefined();
