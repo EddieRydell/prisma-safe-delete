@@ -113,6 +113,13 @@ describe('emitTypes', () => {
     expect(output).toContain(`import type { PrismaClient, Prisma } from '${TEST_CLIENT_PATH}'`);
   });
 
+  it('generates CascadeResult type', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('export type CascadeResult = Record<string, number>;');
+  });
+
   it('generates SafeUserDelegate with soft-delete methods', () => {
     const schema = createTestSchema();
     const output = emitTypes(schema, TEST_CLIENT_PATH);
@@ -127,6 +134,18 @@ describe('emitTypes', () => {
     expect(output).toContain('__dangerousHardDelete:');
     expect(output).toContain('__dangerousHardDeleteMany:');
     expect(output).toContain('includingDeleted:');
+  });
+
+  it('generates softDelete with cascaded return type', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('softDelete: (args: Prisma.UserDeleteArgs');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}>; cascaded: CascadeResult }>');
+    expect(output).toContain('softDeleteMany: (args: Prisma.UserDeleteManyArgs');
+    expect(output).toContain('Promise<{ count: number; cascaded: CascadeResult }>');
+    expect(output).toContain('restoreCascade: (args: Prisma.UserDeleteArgs)');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}> | null; cascaded: CascadeResult }>');
   });
 
   it('generates required deletedBy for models with deleted_by field', () => {
@@ -233,7 +252,8 @@ describe('emitRuntime', () => {
 
   it('respects uniqueStrategy: none option', () => {
     const schema = createTestSchema();
-    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none' });
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
 
     expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'none'");
     // mangleUniqueFields should still exist but will return {} at runtime
@@ -242,7 +262,8 @@ describe('emitRuntime', () => {
 
   it('respects uniqueStrategy: mangle option', () => {
     const schema = createTestSchema();
-    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle' });
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
     expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'mangle'");
   });
@@ -316,6 +337,181 @@ describe('emitRuntime', () => {
 
     expect(output).toContain('export function wrapPrismaClient');
   });
+
+  it('simple model (leaf, no unique strings) emits updateMany-based softDeleteMany', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Post is a leaf model with no unique string fields - should use fast path
+    // Look for updateMany in the Post delegate's softDeleteMany
+    expect(output).toMatch(/createPostDelegate[\s\S]*?original\.updateMany\(/);
+    // Post delegate should NOT call softDeleteWithCascade
+    const postDelegateMatch = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegateMatch).not.toBeNull();
+    expect(postDelegateMatch![0]).not.toContain('softDeleteWithCascade');
+  });
+
+  it('complex model (has cascade children) emits softDeleteWithCascade', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // User has cascade child Post - should use complex path
+    const userDelegateMatch = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegateMatch).not.toBeNull();
+    expect(userDelegateMatch![0]).toContain('softDeleteWithCascade');
+  });
+
+  it('applies injectFilters to update and updateMany', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Both User and Post delegates should inject filters on update/updateMany
+    expect(output).toContain("update: (args: any) => original.update(injectFilters(args, 'User'))");
+    expect(output).toContain("updateMany: (args: any) => original.updateMany(injectFilters(args, 'User'))");
+  });
+
+  it('model with unique string fields but no children uses complex path with mangle strategy', () => {
+    // Create a leaf model that has unique string fields
+    const models = [
+      createMockModel({
+        name: 'Customer',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+    const cascadeGraph = buildCascadeGraph(schema); // Customer has no children
+
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Should use complex path because it has unique string fields that need mangling
+    const customerDelegate = /function createCustomerDelegate[\s\S]*?^}/m.exec(output);
+    expect(customerDelegate).not.toBeNull();
+    expect(customerDelegate![0]).toContain('softDeleteWithCascade');
+    expect(customerDelegate![0]).not.toContain('fast path');
+  });
+
+  it('model with unique string fields but no children uses fast path with none strategy', () => {
+    // Same leaf model with unique string fields, but uniqueStrategy is 'none'
+    const models = [
+      createMockModel({
+        name: 'Customer',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+    const cascadeGraph = buildCascadeGraph(schema);
+
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
+
+    // Should use fast path because uniqueStrategy='none' means no mangling regardless
+    const customerDelegate = /function createCustomerDelegate[\s\S]*?^}/m.exec(output);
+    expect(customerDelegate).not.toBeNull();
+    expect(customerDelegate![0]).not.toContain('softDeleteWithCascade');
+    expect(customerDelegate![0]).toContain('original.updateMany');
+  });
+
+  it('model with children always uses complex path regardless of uniqueStrategy', () => {
+    const schema = createTestSchema(); // User has Post children
+    const cascadeGraph = buildCascadeGraph(schema);
+
+    // Even with uniqueStrategy='none', User should use complex path because it has children
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
+
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('softDeleteWithCascade');
+  });
+
+  it('fast-path softDelete returns { record, cascaded: {} }', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Post is a fast-path model. Check its softDelete returns { record, cascaded: {} }
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    expect(postDelegate![0]).toContain('return { record, cascaded: {} }');
+  });
+
+  it('fast-path softDeleteMany returns { count: result.count, cascaded: {} }', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    expect(postDelegate![0]).toContain('return { count: result.count, cascaded: {} }');
+  });
+
+  it('complex-path softDelete returns { record, cascaded }', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // User is a complex-path model
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('return { record, cascaded }');
+  });
+
+  it('complex-path softDeleteMany returns { count, cascaded }', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('return { count, cascaded }');
+  });
+
+  it('transaction wrapper uses fast path for simple models', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Find the wrapTransactionClient function
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // Post (simple) should use tx.post.updateMany in softDelete, not softDeleteWithCascadeInTx
+    const postSection = /post: \{[\s\S]*?\},\n\s{4}\w/.exec(txContent);
+    expect(postSection).not.toBeNull();
+    expect(postSection![0]).toContain('tx.post.updateMany');
+    expect(postSection![0]).not.toContain('softDeleteWithCascadeInTx');
+
+    // User (complex) should use softDeleteWithCascadeInTx in transaction
+    const userSection = /user: \{[\s\S]*?\},\n\s{4}\w/.exec(txContent);
+    expect(userSection).not.toBeNull();
+    expect(userSection![0]).toContain('softDeleteWithCascadeInTx');
+  });
+
+  it('fast-path includes deleted_by support when model has deleted_by field', () => {
+    const schema = createSchemaWithDeletedBy();
+    // Customer has deleted_by but no children → if unique fields exist it depends on strategy
+    // User has no deleted_by and no children
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
+
+    // Customer has unique string fields but uniqueStrategy='none' → fast path
+    const customerDelegate = /function createCustomerDelegate[\s\S]*?^}/m.exec(output);
+    expect(customerDelegate).not.toBeNull();
+    const customerCode = customerDelegate![0];
+    // Should reference deleted_by field in fast path
+    expect(customerCode).toContain('deletedByField');
+    expect(customerCode).toContain('deleted_by');
+  });
 });
 
 describe('emitIndex', () => {
@@ -324,6 +520,7 @@ describe('emitIndex', () => {
     const output = emitIndex(schema);
 
     expect(output).toContain("export type { SafePrismaClient");
+    expect(output).toContain("CascadeResult");
     expect(output).toContain("export type { SafeUserDelegate }");
     expect(output).toContain("export type { SafePostDelegate }");
     expect(output).toContain("export { CASCADE_GRAPH, MODEL_NAMES }");

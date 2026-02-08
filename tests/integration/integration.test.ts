@@ -253,6 +253,103 @@ safePrisma.user.__dangerousHardDeleteMany({ where: {} });
 `);
   });
 
+  it('softDelete return type has record and cascaded fields', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient, CascadeResult } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+async function test() {
+  const result = await safePrisma.user.softDelete({ where: { id: '1' } });
+  // Must be able to access .record and .cascaded
+  const record = result.record;
+  const cascaded: CascadeResult = result.cascaded;
+  const email: string = record.email;
+  const count: number = cascaded['Post'] ?? 0;
+}
+`);
+  });
+
+  it('softDelete return type is not assignable to raw record', () => {
+    expectTypeError(`
+import type { SafePrismaClient, SafeUserDelegate } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+async function test() {
+  // Return type is { record, cascaded }, NOT just the record
+  const result = await safePrisma.user.softDelete({ where: { id: '1' } });
+  // Accessing .email directly on result should fail (it's on .record)
+  const email: string = result.email;
+}
+`, /Property 'email' does not exist/);
+  });
+
+  it('softDeleteMany return type has count and cascaded fields', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient, CascadeResult } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+async function test() {
+  const result = await safePrisma.user.softDeleteMany({ where: {} });
+  const count: number = result.count;
+  const cascaded: CascadeResult = result.cascaded;
+}
+`);
+  });
+
+  it('softDeleteMany return type is not BatchPayload', () => {
+    expectTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+async function test() {
+  const result = await safePrisma.user.softDeleteMany({ where: {} });
+  // BatchPayload would have .count as bigint, ours is number
+  const n: bigint = result.count;
+}
+`, /Type 'number' is not assignable to type 'bigint'/);
+  });
+
+  it('restoreCascade return type has record and cascaded fields', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient, CascadeResult } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+async function test() {
+  const result = await safePrisma.user.restoreCascade({ where: { id: '1' } });
+  const record = result.record;  // can be null
+  const cascaded: CascadeResult = result.cascaded;
+  if (record !== null) {
+    const email: string = record.email;
+  }
+}
+`);
+  });
+
+  it('CascadeResult type is importable from index', () => {
+    expectNoTypeError(`
+import type { CascadeResult } from './soft-cascade/index.js';
+const result: CascadeResult = { Post: 3, Comment: 5 };
+const count: number = result['Post']!;
+`);
+  });
+
+  it('softDelete cascaded return type works in transaction', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient, CascadeResult } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+async function test() {
+  await safePrisma.$transaction(async (tx) => {
+    const result = await tx.user.softDelete({ where: { id: '1' } });
+    const record = result.record;
+    const cascaded: CascadeResult = result.cascaded;
+
+    const result2 = await tx.user.softDeleteMany({ where: {} });
+    const count: number = result2.count;
+    const cascaded2: CascadeResult = result2.cascaded;
+
+    const result3 = await tx.user.restoreCascade({ where: { id: '1' } });
+    const record3 = result3.record;
+    const cascaded3: CascadeResult = result3.cascaded;
+  });
+}
+`);
+  });
+
   it('generates correct cascade graph for User -> Post -> Comment chain', async () => {
     const cascadeGraphPath = path.join(generatedDir, 'cascade-graph.ts');
     const content = fs.readFileSync(cascadeGraphPath, 'utf-8');
@@ -277,13 +374,17 @@ safePrisma.user.__dangerousHardDeleteMany({ where: {} });
     const typesPath = path.join(generatedDir, 'types.ts');
     const content = fs.readFileSync(typesPath, 'utf-8');
 
+    // Should have CascadeResult type
+    expect(content).toContain('export type CascadeResult = Record<string, number>;');
+
     // Should have Omit removing delete methods for soft-deletable models
     expect(content).toContain("Omit<");
     expect(content).toContain("'delete' | 'deleteMany'");
 
-    // Should have softDelete methods
+    // Should have softDelete methods with cascaded return types
     expect(content).toContain('softDelete:');
     expect(content).toContain('softDeleteMany:');
+    expect(content).toContain('cascaded: CascadeResult');
     expect(content).toContain('__dangerousHardDelete:');
     expect(content).toContain('__dangerousHardDeleteMany:');
 

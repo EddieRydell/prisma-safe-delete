@@ -2,7 +2,11 @@ import generatorHelper from '@prisma/generator-helper';
 const { generatorHandler } = generatorHelper;
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { parseDMMF, type ParsedSchema } from './dmmf-parser.js';
+import {
+  parseDMMF,
+  type ParsedSchema,
+  type UniqueConstraintInfo,
+} from './dmmf-parser.js';
 import { buildCascadeGraph } from './cascade-graph.js';
 import {
   emitTypes,
@@ -31,25 +35,44 @@ const BOLD = '\x1b[1m';
  */
 export interface UniqueFieldInfo {
   model: string;
-  fields: string[];
   deletedAtField: string;
+  /** Standalone @unique fields and compound @@unique NOT including deleted_at */
+  constraintsNeedingIndexes: UniqueConstraintInfo[];
+  /** Compound @@unique constraints that include deleted_at (broken pattern) */
+  compoundWithDeletedAt: UniqueConstraintInfo[];
 }
 
 /**
- * Collects models that have unique string fields requiring partial indexes.
+ * Collects models that have unique constraints requiring attention.
+ * Categorizes constraints into those needing partial indexes and those
+ * with the broken @@unique([..., deleted_at]) pattern.
  * Exported for testing.
  */
 export function collectModelsWithUniqueFields(schema: ParsedSchema): UniqueFieldInfo[] {
   const result: UniqueFieldInfo[] = [];
 
   for (const model of schema.models) {
-    // Use allUniqueFields (not just uniqueStringFields) because when uniqueStrategy='none',
-    // ALL unique fields need partial indexes, not just the string ones that would be mangled
-    if (model.isSoftDeletable && model.allUniqueFields.length > 0 && model.deletedAtField !== null) {
+    if (!model.isSoftDeletable || model.deletedAtField === null) {
+      continue;
+    }
+
+    const constraintsNeedingIndexes: UniqueConstraintInfo[] = [];
+    const compoundWithDeletedAt: UniqueConstraintInfo[] = [];
+
+    for (const constraint of model.uniqueConstraints) {
+      if (constraint.includesDeletedAt) {
+        compoundWithDeletedAt.push(constraint);
+      } else {
+        constraintsNeedingIndexes.push(constraint);
+      }
+    }
+
+    if (constraintsNeedingIndexes.length > 0 || compoundWithDeletedAt.length > 0) {
       result.push({
         model: model.name,
-        fields: model.allUniqueFields,
         deletedAtField: model.deletedAtField,
+        constraintsNeedingIndexes,
+        compoundWithDeletedAt,
       });
     }
   }
@@ -70,7 +93,7 @@ export function buildUniqueStrategyWarningLines(
   }
 
   const y = useColors ? YELLOW : '';
-  const c = useColors ? CYAN : '';
+  const cn = useColors ? CYAN : '';
   const r = useColors ? RESET : '';
   const b = useColors ? BOLD : '';
 
@@ -78,26 +101,84 @@ export function buildUniqueStrategyWarningLines(
     '',
     `${y}${b}⚠️  prisma-safe-delete: uniqueStrategy is 'none'${r}`,
     `${y}   You must create partial unique indexes manually to prevent conflicts.${r}`,
-    '',
-    `${c}   Models requiring partial unique indexes:${r}`,
   ];
 
-  for (const { model, fields } of modelsWithUniqueFields) {
-    lines.push(`     - ${model}: ${fields.join(', ')}`);
+  // Section 1: Compound @@unique constraints that include deleted_at
+  const allCompoundWithDeletedAt = modelsWithUniqueFields.flatMap((info) =>
+    info.compoundWithDeletedAt.map((constraint) => ({
+      model: info.model,
+      deletedAtField: info.deletedAtField,
+      constraint,
+    })),
+  );
+
+  if (allCompoundWithDeletedAt.length > 0) {
+    lines.push('');
+    lines.push(
+      `${y}${b}   ⚠️  Compound @@unique constraints including deleted_at detected:${r}`,
+    );
+    lines.push(
+      `${y}   These do NOT enforce uniqueness on active records because NULL != NULL in SQL.${r}`,
+    );
+    lines.push(
+      `${y}   Multiple active records (where deleted_at IS NULL) can have the same values.${r}`,
+    );
+    lines.push('');
+    lines.push(`${cn}   Replace with partial unique indexes:${r}`);
+
+    for (const { model, deletedAtField, constraint } of allCompoundWithDeletedAt) {
+      const fieldList = constraint.fields.join(', ');
+      const indexName = `${model.toLowerCase()}_${constraint.fields.join('_')}_active`;
+      lines.push(
+        `     CREATE UNIQUE INDEX ${indexName} ON "${model}"(${fieldList}) WHERE ${deletedAtField} IS NULL;`,
+      );
+    }
+
+    lines.push('');
+    lines.push(
+      `${cn}   Alternative: Use NULLS NOT DISTINCT (PostgreSQL 15+) on the existing constraint.${r}`,
+    );
   }
 
-  lines.push('');
-  lines.push(`${c}   Example SQL (PostgreSQL):${r}`);
+  // Section 2: Constraints needing partial indexes (standalone @unique and compound @@unique without deleted_at)
+  const allConstraintsNeedingIndexes = modelsWithUniqueFields.flatMap((info) =>
+    info.constraintsNeedingIndexes.map((constraint) => ({
+      model: info.model,
+      deletedAtField: info.deletedAtField,
+      constraint,
+    })),
+  );
 
-  for (const { model, fields, deletedAtField } of modelsWithUniqueFields) {
-    for (const field of fields) {
-      const indexName = `${model.toLowerCase()}_${field}_active`;
-      lines.push(`     CREATE UNIQUE INDEX ${indexName} ON "${model}"(${field}) WHERE ${deletedAtField} IS NULL;`);
+  if (allConstraintsNeedingIndexes.length > 0) {
+    lines.push('');
+    lines.push(`${cn}   Models requiring partial unique indexes:${r}`);
+
+    for (const info of modelsWithUniqueFields) {
+      if (info.constraintsNeedingIndexes.length === 0) continue;
+      const fieldDescriptions = info.constraintsNeedingIndexes.map((constraint) =>
+        constraint.fields.length > 1
+          ? `(${constraint.fields.join(', ')})`
+          : constraint.fields[0],
+      );
+      lines.push(`     - ${info.model}: ${fieldDescriptions.join(', ')}`);
+    }
+
+    lines.push('');
+    lines.push(`${cn}   Example SQL (PostgreSQL):${r}`);
+
+    for (const { model, deletedAtField, constraint } of allConstraintsNeedingIndexes) {
+      const fieldList = constraint.fields.join(', ');
+      const indexName = `${model.toLowerCase()}_${constraint.fields.join('_')}_active`;
+      lines.push(
+        `     CREATE UNIQUE INDEX ${indexName} ON "${model}"(${fieldList}) WHERE ${deletedAtField} IS NULL;`,
+      );
     }
   }
 
   lines.push('');
-  lines.push(`${y}   Without these indexes, soft-deleted records will block new records with the same unique values.${r}`);
+  lines.push(
+    `${y}   Without these indexes, soft-deleted records will block new records with the same unique values.${r}`,
+  );
   lines.push('');
 
   return lines;
@@ -204,7 +285,7 @@ generatorHandler({
     // Generate all output files
     const typesContent = emitTypes(schema, clientImportPath);
     const cascadeGraphContent = emitCascadeGraph(cascadeGraph);
-    const runtimeContent = emitRuntime(schema, clientImportPath, { uniqueStrategy });
+    const runtimeContent = emitRuntime(schema, clientImportPath, { uniqueStrategy, cascadeGraph });
     const indexContent = emitIndex(schema);
 
     // Ensure output directory exists
