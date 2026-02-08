@@ -112,8 +112,9 @@ const safePrisma = wrapPrismaClient(prisma);
 const users = await safePrisma.user.findMany();
 
 // Soft delete with automatic cascade
-await safePrisma.user.softDelete({ where: { id: 'user-1' } });
-// ^ This soft-deletes the user AND all their posts AND all comments on those posts
+const { record, cascaded } = await safePrisma.user.softDelete({ where: { id: 'user-1' } });
+// ^ Soft-deletes the user AND all their posts AND all comments on those posts
+console.log(cascaded); // { Post: 3, Comment: 7 }
 ```
 
 ## API Reference
@@ -196,11 +197,16 @@ const users = await safePrisma.user.findMany({
 ### Write Operations
 
 ```typescript
-// Standard write operations pass through unchanged
+// Create operations pass through unchanged
 await safePrisma.user.create({ data: { email: 'new@example.com' } });
 await safePrisma.user.createMany({ data: [...] });
+
+// update and updateMany filter out soft-deleted records
+// (you cannot accidentally modify a deleted record)
 await safePrisma.user.update({ where: { id: 'user-1' }, data: { name: 'Jane' } });
 await safePrisma.user.updateMany({ where: { ... }, data: { ... } });
+
+// upsert passes through unchanged (can find soft-deleted records)
 await safePrisma.user.upsert({ where: { ... }, create: { ... }, update: { ... } });
 ```
 
@@ -208,12 +214,17 @@ await safePrisma.user.upsert({ where: { ... }, create: { ... }, update: { ... } 
 
 ```typescript
 // Soft delete a single record (with cascade)
-await safePrisma.user.softDelete({ where: { id: 'user-1' } });
+const { record, cascaded } = await safePrisma.user.softDelete({ where: { id: 'user-1' } });
+console.log(record);    // The deleted user record (or null if not found)
+console.log(cascaded);  // { Post: 3, Comment: 7 } — cascade-deleted counts by model
 
 // Soft delete multiple records (with cascade)
-const result = await safePrisma.user.softDeleteMany({ where: { name: 'Test' } });
-console.log(result.count); // Number of records soft-deleted
+const { count, cascaded } = await safePrisma.user.softDeleteMany({ where: { name: 'Test' } });
+console.log(count);     // Number of matched records soft-deleted
+console.log(cascaded);  // Aggregated cascade counts across all matched records
 ```
+
+The `cascaded` field is a `Record<string, number>` mapping model names to the number of records that were cascade-deleted. It's empty (`{}`) when there are no cascade children.
 
 ### Restore
 
@@ -228,8 +239,9 @@ const result = await safePrisma.user.restoreMany({ where: { name: 'Test' } });
 console.log(result.count); // Number of records restored
 
 // Restore with cascade - restores parent AND all cascade-deleted children
-const user = await safePrisma.user.restoreCascade({ where: { id: 'user-1' } });
+const { record, cascaded } = await safePrisma.user.restoreCascade({ where: { id: 'user-1' } });
 // ^ Restores the user AND all their posts AND comments that were cascade-deleted
+console.log(cascaded); // { Post: 2, Comment: 5 } — restored counts by model
 ```
 
 **How cascade restore works:**
@@ -249,9 +261,9 @@ await safePrisma.user.restore({ where: { id: 'deleted-user-id' } });
 ### Hard Delete (Escape Hatch)
 
 ```typescript
-// Permanently delete when needed
-await safePrisma.user.hardDelete({ where: { id: 'user-1' } });
-await safePrisma.user.hardDeleteMany({ where: { createdAt: { lt: oldDate } } });
+// Permanently delete when needed (intentionally ugly name to discourage use)
+await safePrisma.user.__dangerousHardDelete({ where: { id: 'user-1' } });
+await safePrisma.user.__dangerousHardDeleteMany({ where: { createdAt: { lt: oldDate } } });
 ```
 
 ### Escape Hatches
@@ -309,12 +321,14 @@ model Comment {
 ```
 
 ```typescript
-await safePrisma.user.softDelete({ where: { id: 'user-1' } });
+const { record, cascaded } = await safePrisma.user.softDelete({ where: { id: 'user-1' } });
 // Soft-deletes:
 // 1. The user
 // 2. All their posts
 // 3. All comments on those posts
 // All with the same timestamp (transactional)
+
+console.log(cascaded); // { Post: 2, Comment: 5 }
 ```
 
 ### Cascade Rules
@@ -365,7 +379,7 @@ generator softDelete {
 - `"mangle"` (default): Append `__deleted_{pk}` suffix to unique string fields
 - `"none"`: Skip mangling entirely; you handle uniqueness via partial indexes
 
-When using `uniqueStrategy = "none"`, a warning is displayed during `prisma generate` listing all fields that need partial indexes:
+When using `uniqueStrategy = "none"`, a warning is displayed during `prisma generate` listing all constraints that need attention:
 
 ```
 ⚠️  prisma-safe-delete: uniqueStrategy is 'none'
@@ -379,6 +393,8 @@ When using `uniqueStrategy = "none"`, a warning is displayed during `prisma gene
      CREATE UNIQUE INDEX user_email_active ON "User"(email) WHERE deleted_at IS NULL;
      CREATE UNIQUE INDEX customer_email_active ON "Customer"(email) WHERE deleted_at IS NULL;
 ```
+
+If you have compound `@@unique` constraints that include `deleted_at` (e.g., `@@unique([org_id, name, deleted_at])`), the generator will warn you that these don't enforce uniqueness on active records because `NULL != NULL` in SQL, and suggest replacing them with partial indexes.
 
 ### Partial Unique Indexes
 
@@ -465,15 +481,16 @@ Raw queries bypass the wrapper entirely (by design):
 const users = await safePrisma.$queryRaw`SELECT * FROM User`;
 ```
 
-### Update/Upsert on Soft-Deleted Records
+### Upsert on Soft-Deleted Records
 
-`update` and `upsert` can still modify soft-deleted records. This is intentional to allow restoration workflows:
+`upsert` can still find soft-deleted records (it passes through to Prisma unchanged). This means a soft-deleted record may be found by its unique constraint and updated rather than creating a new one:
 
 ```typescript
-// This works even if the user is soft-deleted
-await safePrisma.user.update({
-  where: { id: 'deleted-user' },
-  data: { deleted_at: null }  // Restore the user
+// If 'john@example.com' exists but is soft-deleted, this updates it
+await safePrisma.user.upsert({
+  where: { email: 'john@example.com' },
+  create: { email: 'john@example.com', name: 'John' },
+  update: { name: 'John Updated' },
 });
 ```
 
@@ -488,14 +505,21 @@ This library has comprehensive test coverage across unit, integration, and end-t
 | Relation filters (`some`/`every`/`none`) with deleted children | ✅ |
 | `_count` correctness | ✅ |
 | `groupBy`/`aggregate` exclude deleted | ✅ |
+| `update`/`updateMany` filter out soft-deleted records | ✅ |
 | Cascade with mixed children (some soft-deletable, some not) | ✅ |
 | Self-referential relations (cycles) handled safely | ✅ |
+| Deep cascade chains (4+ levels) | ✅ |
+| Wide cascade (multiple child types simultaneously) | ✅ |
+| Cascade result counts accurate (including partial cascades) | ✅ |
 | Compound primary key mangling stable | ✅ |
 | Idempotent `softDelete` (re-deleting is safe) | ✅ |
 | `restore` unmangles unique fields | ✅ |
-| `restoreCascade` restores parent + children | ✅ |
+| `restoreCascade` restores parent + children with counts | ✅ |
 | Restore conflict detection | ✅ |
 | Interactive transactions receive wrapped clients | ✅ |
+| Cascade results correct in transaction context | ✅ |
+| Compile-time enforcement of return types | ✅ |
+| Fast-path optimization for leaf models | ✅ |
 | Fluent API bypass confirmed (documented limitation) | ✅ |
 
 Run the full test suite:

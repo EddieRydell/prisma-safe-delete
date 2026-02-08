@@ -1,4 +1,5 @@
 import type { ParsedModel, ParsedSchema } from '../dmmf-parser.js';
+import type { CascadeGraph } from '../cascade-graph.js';
 
 /**
  * Strategy for handling unique constraints on soft delete.
@@ -7,6 +8,18 @@ type UniqueStrategy = 'mangle' | 'none';
 
 interface EmitRuntimeOptions {
   uniqueStrategy: UniqueStrategy;
+  cascadeGraph: CascadeGraph;
+}
+
+/**
+ * Determines if a model can use the fast path (single updateMany) for soft deletes.
+ * Qualifying criteria: no cascade children AND (uniqueStrategy='none' OR no unique string fields).
+ */
+function isSimpleModel(model: ParsedModel, options: EmitRuntimeOptions): boolean {
+  const children = options.cascadeGraph[model.name] ?? [];
+  if (children.length > 0) return false;
+  if (options.uniqueStrategy === 'none') return true;
+  return model.uniqueStringFields.length === 0;
 }
 
 /**
@@ -18,7 +31,7 @@ interface EmitRuntimeOptions {
 export function emitRuntime(
   schema: ParsedSchema,
   clientImportPath: string,
-  options: EmitRuntimeOptions = { uniqueStrategy: 'mangle' },
+  options: EmitRuntimeOptions = { uniqueStrategy: 'mangle', cascadeGraph: {} },
 ): string {
   const lines: string[] = [];
 
@@ -126,7 +139,7 @@ export function emitRuntime(
 
   // Emit model delegate wrappers
   for (const model of schema.models) {
-    lines.push(emitModelDelegate(model));
+    lines.push(emitModelDelegate(model, options));
     lines.push('');
   }
 
@@ -137,7 +150,7 @@ export function emitRuntime(
   lines.push('');
 
   // Emit transaction wrapper
-  lines.push(emitTransactionWrapper(schema));
+  lines.push(emitTransactionWrapper(schema, options));
   lines.push('');
 
   // Emit main wrapper function
@@ -634,9 +647,9 @@ async function softDeleteWithCascade(
   modelName: string,
   where: Record<string, unknown>,
   deletedBy?: string
-): Promise<void> {
-  await prisma.$transaction(async (tx) => {
-    await softDeleteWithCascadeInTx(tx, modelName, where, deletedBy);
+): Promise<{ count: number; cascaded: Record<string, number> }> {
+  return prisma.$transaction(async (tx) => {
+    return softDeleteWithCascadeInTx(tx, modelName, where, deletedBy);
   });
 }
 
@@ -648,7 +661,7 @@ async function softDeleteWithCascadeInTx(
   modelName: string,
   where: Record<string, unknown>,
   deletedBy?: string
-): Promise<void> {
+): Promise<{ count: number; cascaded: Record<string, number> }> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) {
     throw new Error(\`Model \${modelName} is not soft-deletable\`);
@@ -668,7 +681,7 @@ async function softDeleteWithCascadeInTx(
     },
   });
 
-  if (records.length === 0) return;
+  if (records.length === 0) return { count: 0, cascaded: {} };
 
   // Get primary keys of records to delete
   const pkValues = records.map((r: Record<string, unknown>) =>
@@ -676,7 +689,7 @@ async function softDeleteWithCascadeInTx(
   );
 
   // Cascade to children (depth-first)
-  await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
+  const cascaded = await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
 
   // Update parent records - mangle unique fields first, then set deleted_at
   const pk = PRIMARY_KEYS[modelName];
@@ -703,6 +716,8 @@ async function softDeleteWithCascadeInTx(
       data: updateData,
     });
   }
+
+  return { count: records.length, cascaded };
 }
 
 /**
@@ -721,8 +736,9 @@ async function cascadeToChildren(
   parentPkValues: Record<string, unknown>[],
   deletedAt: Date,
   deletedBy?: string
-): Promise<void> {
+): Promise<Record<string, number>> {
   const children = CASCADE_GRAPH[parentModel] ?? [];
+  const cascaded: Record<string, number> = {};
 
   for (const child of children) {
     const lowerChildModel = child.model.charAt(0).toLowerCase() + child.model.slice(1);
@@ -760,7 +776,12 @@ async function cascadeToChildren(
     );
 
     // Recurse to grandchildren first (depth-first)
-    await cascadeToChildren(tx, child.model, childPkValues, deletedAt, deletedBy);
+    const grandchildCascaded = await cascadeToChildren(tx, child.model, childPkValues, deletedAt, deletedBy);
+
+    // Merge grandchild results
+    for (const [model, count] of Object.entries(grandchildCascaded)) {
+      cascaded[model] = (cascaded[model] ?? 0) + count;
+    }
 
     // Soft delete children (if soft-deletable)
     if (child.isSoftDeletable && child.deletedAtField) {
@@ -784,8 +805,13 @@ async function cascadeToChildren(
           data: updateData,
         });
       }
+
+      // Track the count for this child model
+      cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
     }
   }
+
+  return cascaded;
 }
 
 /**
@@ -992,7 +1018,7 @@ async function restoreWithCascade(
   prisma: PrismaClient,
   modelName: string,
   where: Record<string, unknown>
-): Promise<Record<string, unknown> | null> {
+): Promise<{ record: Record<string, unknown> | null; cascaded: Record<string, number> }> {
   return prisma.$transaction(async (tx) => {
     return restoreWithCascadeInTx(tx, modelName, where);
   });
@@ -1005,7 +1031,7 @@ async function restoreWithCascadeInTx(
   tx: any,
   modelName: string,
   where: Record<string, unknown>
-): Promise<Record<string, unknown> | null> {
+): Promise<{ record: Record<string, unknown> | null; cascaded: Record<string, number> }> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) {
     throw new Error(\`Model \${modelName} is not soft-deletable\`);
@@ -1025,13 +1051,13 @@ async function restoreWithCascadeInTx(
     },
   });
 
-  if (!record) return null;
+  if (!record) return { record: null, cascaded: {} };
 
   const deletedAt = record[deletedAtField];
 
   // Restore children first (depth-first, reverse of cascade delete)
   const pkVal = extractPrimaryKey(modelName, record);
-  await restoreCascadeChildren(tx, modelName, [pkVal], deletedAt);
+  const cascaded = await restoreCascadeChildren(tx, modelName, [pkVal], deletedAt);
 
   // Now restore the parent record
   const unmangledFields = unmangleUniqueFields(modelName, record);
@@ -1065,10 +1091,12 @@ async function restoreWithCascadeInTx(
     updateData[deletedByField] = null;
   }
 
-  return delegate.update({
+  const restoredRecord = await delegate.update({
     where: createPkWhereFromValues(modelName, pkVal),
     data: updateData,
   });
+
+  return { record: restoredRecord, cascaded };
 }
 
 /**
@@ -1080,8 +1108,9 @@ async function restoreCascadeChildren(
   parentModel: string,
   parentPkValues: Record<string, unknown>[],
   deletedAt: Date
-): Promise<void> {
+): Promise<Record<string, number>> {
   const children = CASCADE_GRAPH[parentModel] ?? [];
+  const cascaded: Record<string, number> = {};
 
   for (const child of children) {
     if (!child.isSoftDeletable || !child.deletedAtField) continue;
@@ -1120,7 +1149,12 @@ async function restoreCascadeChildren(
     );
 
     // Recurse to grandchildren first
-    await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt);
+    const grandchildCascaded = await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt);
+
+    // Merge grandchild results
+    for (const [model, count] of Object.entries(grandchildCascaded)) {
+      cascaded[model] = (cascaded[model] ?? 0) + count;
+    }
 
     // Now restore the children
     for (const childRecord of childRecords) {
@@ -1160,23 +1194,25 @@ async function restoreCascadeChildren(
         data: updateData,
       });
     }
+
+    // Track the count for this child model
+    cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
   }
+
+  return cascaded;
 }`.trim();
 }
 
-function emitModelDelegate(model: ParsedModel): string {
+function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): string {
   const name = model.name;
   const lowerName = toLowerFirst(name);
 
-  if (model.isSoftDeletable) {
-    return `
-/**
- * Creates a safe delegate for ${name} with soft-delete support
- */
-function create${name}Delegate(prisma: PrismaClient): any {
-  const original = prisma.${lowerName};
+  if (model.isSoftDeletable && model.deletedAtField !== null) {
+    const deletedAtField = model.deletedAtField;
+    const simple = isSimpleModel(model, options);
 
-  return {
+    // Common parts shared between simple and complex delegates
+    const readMethods = `
     // Wrapped methods with filter injection
     findMany: (args?: any) => original.findMany(injectFilters(args, '${name}')),
     findFirst: (args?: any) => original.findFirst(injectFilters(args, '${name}')),
@@ -1185,42 +1221,18 @@ function create${name}Delegate(prisma: PrismaClient): any {
     findUniqueOrThrow: (args?: any) => original.findUniqueOrThrow(injectFilters(args, '${name}')),
     count: (args?: any) => original.count(injectFilters(args, '${name}')),
     aggregate: (args?: any) => original.aggregate(injectFilters(args, '${name}')),
-    groupBy: (args?: any) => original.groupBy(injectFilters(args, '${name}')),
+    groupBy: (args?: any) => original.groupBy(injectFilters(args, '${name}')),`;
 
+    const writeMethods = `
     // Pass-through methods (no filter needed for writes)
     create: (args: any) => original.create(args),
     createMany: (args: any) => original.createMany(args),
     createManyAndReturn: (args: any) => original.createManyAndReturn(args),
-    update: (args: any) => original.update(args),
-    updateMany: (args: any) => original.updateMany(args),
-    upsert: (args: any) => original.upsert(args),
+    update: (args: any) => original.update(injectFilters(args, '${name}')),
+    updateMany: (args: any) => original.updateMany(injectFilters(args, '${name}')),
+    upsert: (args: any) => original.upsert(args),`;
 
-    // Soft delete methods
-    // NOTE: deletedBy requirement is enforced at COMPILE-TIME only via TypeScript types.
-    // There is no runtime validation - callers bypassing TypeScript (e.g., plain JS) must
-    // ensure they pass deletedBy for models with deleted_by fields.
-    softDelete: async (args: any) => {
-      const { deletedBy, ...rest } = args;
-      await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
-      // Decompose compound key for findFirst
-      const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
-      return original.findFirst({ where: decomposedWhere });
-    },
-    softDeleteMany: async (args: any) => {
-      const { deletedBy, ...rest } = args;
-      const deletedAtField = getDeletedAtField('${name}');
-      const pk = PRIMARY_KEYS['${name}'];
-      const pkFields = Array.isArray(pk) ? pk : [pk];
-      const selectClause = Object.fromEntries(pkFields.map(f => [f, true]));
-
-      const records = await original.findMany({
-        where: { ...rest.where, ...(deletedAtField ? { [deletedAtField]: null } : {}) },
-        select: selectClause,
-      });
-      await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
-      return { count: records.length };
-    },
-
+    const restoreMethods = `
     // Restore methods
     restore: async (args: any) => {
       return restoreRecord(prisma, '${name}', args.where);
@@ -1229,13 +1241,16 @@ function create${name}Delegate(prisma: PrismaClient): any {
       return restoreManyRecords(prisma, '${name}', args.where);
     },
     restoreCascade: async (args: any) => {
-      return restoreWithCascade(prisma, '${name}', args.where);
-    },
+      const { record, cascaded } = await restoreWithCascade(prisma, '${name}', args.where);
+      return { record, cascaded };
+    },`;
 
+    const hardDeleteMethods = `
     // Hard delete (intentionally ugly name to discourage use)
     __dangerousHardDelete: (args: any) => original.delete(args),
-    __dangerousHardDeleteMany: (args: any) => original.deleteMany(args),
+    __dangerousHardDeleteMany: (args: any) => original.deleteMany(args),`;
 
+    const includingDeletedMethods = `
     // Access raw delegate without soft-delete filtering
     includingDeleted: {
       findMany: (args?: any) => original.findMany(args),
@@ -1246,7 +1261,74 @@ function create${name}Delegate(prisma: PrismaClient): any {
       count: (args?: any) => original.count(args),
       aggregate: (args?: any) => original.aggregate(args),
       groupBy: (args?: any) => original.groupBy(args),
+    },`;
+
+    let softDeleteMethods: string;
+
+    if (simple) {
+      // Fast path: use updateMany directly (no transaction, no per-record updates)
+      const deletedByUpdate = model.deletedByField !== null
+        ? `\n      const deletedByField = ${JSON.stringify(model.deletedByField)};\n      if (deletedByField && deletedBy) {\n        updateData[deletedByField] = deletedBy;\n      }`
+        : '';
+
+      softDeleteMethods = `
+    // Soft delete methods (fast path - no cascade children, no unique mangling)
+    softDelete: async (args: any) => {
+      const { deletedBy, ...rest } = args;
+      const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
+      const now = new Date();
+      const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };${deletedByUpdate}
+      await original.updateMany({
+        where: { ...decomposedWhere, ['${deletedAtField}']: null },
+        data: updateData,
+      });
+      const record = await original.findFirst({ where: decomposedWhere });
+      return { record, cascaded: {} };
     },
+    softDeleteMany: async (args: any) => {
+      const { deletedBy, ...rest } = args;
+      const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdate}
+      const result = await original.updateMany({
+        where: { ...rest.where, ['${deletedAtField}']: null },
+        data: updateData,
+      });
+      return { count: result.count, cascaded: {} };
+    },`;
+    } else {
+      // Complex path: use softDeleteWithCascade (transaction, per-record updates)
+      softDeleteMethods = `
+    // Soft delete methods (with cascade support)
+    // NOTE: deletedBy requirement is enforced at COMPILE-TIME only via TypeScript types.
+    // There is no runtime validation - callers bypassing TypeScript (e.g., plain JS) must
+    // ensure they pass deletedBy for models with deleted_by fields.
+    softDelete: async (args: any) => {
+      const { deletedBy, ...rest } = args;
+      const { cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
+      // Decompose compound key for findFirst
+      const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
+      const record = await original.findFirst({ where: decomposedWhere });
+      return { record, cascaded };
+    },
+    softDeleteMany: async (args: any) => {
+      const { deletedBy, ...rest } = args;
+      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
+      return { count, cascaded };
+    },`;
+    }
+
+    return `
+/**
+ * Creates a safe delegate for ${name} with soft-delete support
+ */
+function create${name}Delegate(prisma: PrismaClient): any {
+  const original = prisma.${lowerName};
+
+  return {${readMethods}
+${writeMethods}
+${softDeleteMethods}
+${restoreMethods}
+${hardDeleteMethods}
+${includingDeletedMethods}
   };
 }`.trim();
   }
@@ -1315,7 +1397,7 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
   return lines.join('\n');
 }
 
-function emitTransactionWrapper(schema: ParsedSchema): string {
+function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOptions): string {
   const lines: string[] = [];
   lines.push('/**');
   lines.push(' * Wraps a transaction client with soft-delete filtering and full API');
@@ -1325,7 +1407,10 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
 
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    if (model.isSoftDeletable) {
+    if (model.isSoftDeletable && model.deletedAtField !== null) {
+      const simple = isSimpleModel(model, options);
+      const deletedAtField = model.deletedAtField;
+
       lines.push(`    ${lowerName}: {`);
       // Read operations with filter injection
       lines.push(`      findMany: (args?: any) => tx.${lowerName}.findMany(injectFilters(args, '${model.name}')),`);
@@ -1336,32 +1421,64 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
       lines.push(`      count: (args?: any) => tx.${lowerName}.count(injectFilters(args, '${model.name}')),`);
       lines.push(`      aggregate: (args?: any) => tx.${lowerName}.aggregate(injectFilters(args, '${model.name}')),`);
       lines.push(`      groupBy: (args?: any) => tx.${lowerName}.groupBy(injectFilters(args, '${model.name}')),`);
-      // Write operations (pass-through)
+      // Write operations
       lines.push(`      create: (args: any) => tx.${lowerName}.create(args),`);
       lines.push(`      createMany: (args: any) => tx.${lowerName}.createMany(args),`);
-      lines.push(`      update: (args: any) => tx.${lowerName}.update(args),`);
-      lines.push(`      updateMany: (args: any) => tx.${lowerName}.updateMany(args),`);
+      lines.push(`      update: (args: any) => tx.${lowerName}.update(injectFilters(args, '${model.name}')),`);
+      lines.push(`      updateMany: (args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}')),`);
       lines.push(`      upsert: (args: any) => tx.${lowerName}.upsert(args),`);
-      // Soft delete methods (compile-time only validation - no runtime checks for deletedBy)
-      lines.push(`      softDelete: async (args: any) => {`);
-      lines.push(`        const { deletedBy, ...rest } = args;`);
-      lines.push(`        await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
-      lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
-      lines.push(`        return tx.${lowerName}.findFirst({ where: decomposedWhere });`);
-      lines.push(`      },`);
-      lines.push(`      softDeleteMany: async (args: any) => {`);
-      lines.push(`        const { deletedBy, ...rest } = args;`);
-      lines.push(`        const deletedAtField = getDeletedAtField('${model.name}');`);
-      lines.push(`        const pk = PRIMARY_KEYS['${model.name}'];`);
-      lines.push(`        const pkFields = Array.isArray(pk) ? pk : [pk];`);
-      lines.push(`        const selectClause = Object.fromEntries(pkFields.map(f => [f, true]));`);
-      lines.push(`        const records = await tx.${lowerName}.findMany({`);
-      lines.push(`          where: { ...rest.where, ...(deletedAtField ? { [deletedAtField]: null } : {}) },`);
-      lines.push(`          select: selectClause,`);
-      lines.push(`        });`);
-      lines.push(`        await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
-      lines.push(`        return { count: records.length };`);
-      lines.push(`      },`);
+
+      if (simple) {
+        // Fast path: use updateMany directly
+        lines.push(`      softDelete: async (args: any) => {`);
+        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
+        lines.push(`        const now = new Date();`);
+        lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };`);
+        if (model.deletedByField !== null) {
+          lines.push(`        const deletedByField = ${JSON.stringify(model.deletedByField)};`);
+          lines.push(`        if (deletedByField && deletedBy) {`);
+          lines.push(`          updateData[deletedByField] = deletedBy;`);
+          lines.push(`        }`);
+        }
+        lines.push(`        await tx.${lowerName}.updateMany({`);
+        lines.push(`          where: { ...decomposedWhere, ['${deletedAtField}']: null },`);
+        lines.push(`          data: updateData,`);
+        lines.push(`        });`);
+        lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere });`);
+        lines.push(`        return { record, cascaded: {} };`);
+        lines.push(`      },`);
+        lines.push(`      softDeleteMany: async (args: any) => {`);
+        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };`);
+        if (model.deletedByField !== null) {
+          lines.push(`        const deletedByField = ${JSON.stringify(model.deletedByField)};`);
+          lines.push(`        if (deletedByField && deletedBy) {`);
+          lines.push(`          updateData[deletedByField] = deletedBy;`);
+          lines.push(`        }`);
+        }
+        lines.push(`        const result = await tx.${lowerName}.updateMany({`);
+        lines.push(`          where: { ...rest.where, ['${deletedAtField}']: null },`);
+        lines.push(`          data: updateData,`);
+        lines.push(`        });`);
+        lines.push(`        return { count: result.count, cascaded: {} };`);
+        lines.push(`      },`);
+      } else {
+        // Complex path: use softDeleteWithCascadeInTx
+        lines.push(`      softDelete: async (args: any) => {`);
+        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const { cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
+        lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
+        lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere });`);
+        lines.push(`        return { record, cascaded };`);
+        lines.push(`      },`);
+        lines.push(`      softDeleteMany: async (args: any) => {`);
+        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
+        lines.push(`        return { count, cascaded };`);
+        lines.push(`      },`);
+      }
+
       // Restore methods
       lines.push(`      restore: async (args: any) => {`);
       lines.push(`        return restoreRecordInTx(tx, '${model.name}', args.where);`);
@@ -1370,7 +1487,8 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
       lines.push(`        return restoreManyInTx(tx, '${model.name}', args.where);`);
       lines.push(`      },`);
       lines.push(`      restoreCascade: async (args: any) => {`);
-      lines.push(`        return restoreWithCascadeInTx(tx, '${model.name}', args.where);`);
+      lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', args.where);`);
+      lines.push(`        return { record, cascaded };`);
       lines.push(`      },`);
       // Hard delete methods (intentionally scary names)
       lines.push(`      __dangerousHardDelete: (args: any) => tx.${lowerName}.delete(args),`);

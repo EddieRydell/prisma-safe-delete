@@ -44,7 +44,7 @@ describe('collectModelsWithUniqueFields', () => {
     expect(result).toEqual([]);
   });
 
-  it('collects models with unique string fields', () => {
+  it('collects standalone @unique fields into constraintsNeedingIndexes', () => {
     const models = [
       createMockModel({
         name: 'User',
@@ -62,12 +62,13 @@ describe('collectModelsWithUniqueFields', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toEqual({
       model: 'User',
-      fields: ['email'],
       deletedAtField: 'deleted_at',
+      constraintsNeedingIndexes: [{ fields: ['email'], includesDeletedAt: false }],
+      compoundWithDeletedAt: [],
     });
   });
 
-  it('collects multiple unique fields from same model', () => {
+  it('collects multiple standalone @unique fields', () => {
     const models = [
       createMockModel({
         name: 'Customer',
@@ -84,8 +85,11 @@ describe('collectModelsWithUniqueFields', () => {
     const result = collectModelsWithUniqueFields(schema);
 
     expect(result).toHaveLength(1);
-    expect(result[0]!.fields).toContain('email');
-    expect(result[0]!.fields).toContain('username');
+    expect(result[0]!.constraintsNeedingIndexes).toEqual([
+      { fields: ['email'], includesDeletedAt: false },
+      { fields: ['username'], includesDeletedAt: false },
+    ]);
+    expect(result[0]!.compoundWithDeletedAt).toEqual([]);
   });
 
   it('collects from multiple models', () => {
@@ -153,10 +157,183 @@ describe('collectModelsWithUniqueFields', () => {
     const result = collectModelsWithUniqueFields(schema);
 
     expect(result).toHaveLength(1);
-    // allUniqueFields should include ALL unique fields, not just strings
-    expect(result[0]!.fields).toContain('email');
-    expect(result[0]!.fields).toContain('employeeNumber'); // Int field
-    expect(result[0]!.fields).toContain('externalId'); // UUID field
+    const fields = result[0]!.constraintsNeedingIndexes.flatMap((c) => c.fields);
+    expect(fields).toContain('email');
+    expect(fields).toContain('employeeNumber');
+    expect(fields).toContain('externalId');
+  });
+
+  it('detects @@unique([org_id, name, deleted_at]) in compoundWithDeletedAt', () => {
+    const models = [
+      createMockModel({
+        name: 'Tenant',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'org_id', type: 'String' }),
+          createMockField({ name: 'name', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+        uniqueFields: [['org_id', 'name', 'deleted_at']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.compoundWithDeletedAt).toEqual([
+      { fields: ['org_id', 'name'], includesDeletedAt: true },
+    ]);
+    expect(result[0]!.constraintsNeedingIndexes).toEqual([]);
+  });
+
+  it('detects @@unique([org_id, name]) without deleted_at in constraintsNeedingIndexes', () => {
+    const models = [
+      createMockModel({
+        name: 'Tenant',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'org_id', type: 'String' }),
+          createMockField({ name: 'name', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+        uniqueFields: [['org_id', 'name']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.constraintsNeedingIndexes).toEqual([
+      { fields: ['org_id', 'name'], includesDeletedAt: false },
+    ]);
+    expect(result[0]!.compoundWithDeletedAt).toEqual([]);
+  });
+
+  it('correctly separates both patterns on the same model', () => {
+    const models = [
+      createMockModel({
+        name: 'Resource',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'slug', type: 'String', isUnique: true }),
+          createMockField({ name: 'org_id', type: 'String' }),
+          createMockField({ name: 'name', type: 'String' }),
+          createMockField({ name: 'tenant_id', type: 'String' }),
+          createMockField({ name: 'code', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+        uniqueFields: [
+          ['org_id', 'name', 'deleted_at'], // compound with deleted_at
+          ['tenant_id', 'code'],             // compound without deleted_at
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.constraintsNeedingIndexes).toEqual([
+      { fields: ['slug'], includesDeletedAt: false },
+      { fields: ['tenant_id', 'code'], includesDeletedAt: false },
+    ]);
+    expect(result[0]!.compoundWithDeletedAt).toEqual([
+      { fields: ['org_id', 'name'], includesDeletedAt: true },
+    ]);
+  });
+
+  it('handles camelCase deletedAt in compound @@unique', () => {
+    const models = [
+      createMockModel({
+        name: 'Article',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'orgId', type: 'String' }),
+          createMockField({ name: 'slug', type: 'String' }),
+          createMockField({ name: 'deletedAt', type: 'DateTime', isRequired: false }),
+        ],
+        uniqueFields: [['orgId', 'slug', 'deletedAt']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.compoundWithDeletedAt).toEqual([
+      { fields: ['orgId', 'slug'], includesDeletedAt: true },
+    ]);
+  });
+
+  it('@@unique with only deleted_at produces no constraint (empty fields)', () => {
+    // Degenerate case: @@unique([deleted_at]) — after stripping deleted_at, fields is empty
+    const models = [
+      createMockModel({
+        name: 'Weird',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+        uniqueFields: [['deleted_at']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    // Empty fields means no useful constraint → should not appear at all
+    expect(result).toEqual([]);
+  });
+
+  it('standalone @unique on deleted_at field itself is skipped', () => {
+    // deleted_at having @unique on it is meaningless for warnings
+    const models = [
+      createMockModel({
+        name: 'Unusual',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false, isUnique: true }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    // deleted_at itself having @unique should not trigger warnings
+    expect(result).toEqual([]);
+  });
+
+  it('relation fields with @unique are excluded from constraints', () => {
+    // Fields with relationName are relation markers, not real unique fields
+    const models = [
+      createMockModel({
+        name: 'Profile',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({
+            name: 'user',
+            type: 'User',
+            kind: 'object',
+            isUnique: true,
+            relationName: 'ProfileUser',
+          }),
+          createMockField({ name: 'userId', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    expect(result).toHaveLength(1);
+    // Only userId should appear, not the relation field 'user'
+    const fields = result[0]!.constraintsNeedingIndexes.flatMap((c) => c.fields);
+    expect(fields).toContain('userId');
+    expect(fields).not.toContain('user');
   });
 });
 
@@ -168,7 +345,12 @@ describe('buildUniqueStrategyWarningLines', () => {
 
   it('includes warning header', () => {
     const models: UniqueFieldInfo[] = [
-      { model: 'User', fields: ['email'], deletedAtField: 'deleted_at' },
+      {
+        model: 'User',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [{ fields: ['email'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [],
+      },
     ];
 
     const result = buildUniqueStrategyWarningLines(models, false);
@@ -177,10 +359,23 @@ describe('buildUniqueStrategyWarningLines', () => {
     expect(result.some((line) => line.includes('partial unique indexes'))).toBe(true);
   });
 
-  it('lists all models and fields', () => {
+  it('lists models and fields for constraintsNeedingIndexes', () => {
     const models: UniqueFieldInfo[] = [
-      { model: 'User', fields: ['email'], deletedAtField: 'deleted_at' },
-      { model: 'Customer', fields: ['email', 'username'], deletedAtField: 'deleted_at' },
+      {
+        model: 'User',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [{ fields: ['email'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [],
+      },
+      {
+        model: 'Customer',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [
+          { fields: ['email'], includesDeletedAt: false },
+          { fields: ['username'], includesDeletedAt: false },
+        ],
+        compoundWithDeletedAt: [],
+      },
     ];
 
     const result = buildUniqueStrategyWarningLines(models, false);
@@ -189,9 +384,14 @@ describe('buildUniqueStrategyWarningLines', () => {
     expect(result.some((line) => line.includes('Customer: email, username'))).toBe(true);
   });
 
-  it('generates correct SQL examples', () => {
+  it('generates correct SQL for standalone @unique fields', () => {
     const models: UniqueFieldInfo[] = [
-      { model: 'User', fields: ['email'], deletedAtField: 'deleted_at' },
+      {
+        model: 'User',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [{ fields: ['email'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [],
+      },
     ];
 
     const result = buildUniqueStrategyWarningLines(models, false);
@@ -203,9 +403,54 @@ describe('buildUniqueStrategyWarningLines', () => {
     ).toBe(true);
   });
 
-  it('generates SQL for multiple fields', () => {
+  it('generates compound SQL for compound @@unique constraints without deleted_at', () => {
     const models: UniqueFieldInfo[] = [
-      { model: 'Customer', fields: ['email', 'username'], deletedAtField: 'deleted_at' },
+      {
+        model: 'Tenant',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [{ fields: ['org_id', 'name'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [],
+      },
+    ];
+
+    const result = buildUniqueStrategyWarningLines(models, false);
+
+    expect(
+      result.some((line) =>
+        line.includes('CREATE UNIQUE INDEX tenant_org_id_name_active ON "Tenant"(org_id, name) WHERE deleted_at IS NULL')
+      )
+    ).toBe(true);
+  });
+
+  it('shows compound constraints with parens in model listing', () => {
+    const models: UniqueFieldInfo[] = [
+      {
+        model: 'Tenant',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [
+          { fields: ['slug'], includesDeletedAt: false },
+          { fields: ['org_id', 'name'], includesDeletedAt: false },
+        ],
+        compoundWithDeletedAt: [],
+      },
+    ];
+
+    const result = buildUniqueStrategyWarningLines(models, false);
+
+    expect(result.some((line) => line.includes('Tenant: slug, (org_id, name)'))).toBe(true);
+  });
+
+  it('generates SQL for multiple standalone fields', () => {
+    const models: UniqueFieldInfo[] = [
+      {
+        model: 'Customer',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [
+          { fields: ['email'], includesDeletedAt: false },
+          { fields: ['username'], includesDeletedAt: false },
+        ],
+        compoundWithDeletedAt: [],
+      },
     ];
 
     const result = buildUniqueStrategyWarningLines(models, false);
@@ -220,7 +465,12 @@ describe('buildUniqueStrategyWarningLines', () => {
 
   it('uses correct deletedAt field name in SQL', () => {
     const models: UniqueFieldInfo[] = [
-      { model: 'Article', fields: ['slug'], deletedAtField: 'deletedAt' },
+      {
+        model: 'Article',
+        deletedAtField: 'deletedAt',
+        constraintsNeedingIndexes: [{ fields: ['slug'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [],
+      },
     ];
 
     const result = buildUniqueStrategyWarningLines(models, false);
@@ -232,13 +482,107 @@ describe('buildUniqueStrategyWarningLines', () => {
 
   it('includes footer warning about consequences', () => {
     const models: UniqueFieldInfo[] = [
-      { model: 'User', fields: ['email'], deletedAtField: 'deleted_at' },
+      {
+        model: 'User',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [{ fields: ['email'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [],
+      },
     ];
 
     const result = buildUniqueStrategyWarningLines(models, false);
 
     expect(
       result.some((line) => line.includes('soft-deleted records will block new records'))
+    ).toBe(true);
+  });
+
+  it('produces loud NULL warning for compoundWithDeletedAt', () => {
+    const models: UniqueFieldInfo[] = [
+      {
+        model: 'Tenant',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [],
+        compoundWithDeletedAt: [{ fields: ['org_id', 'name'], includesDeletedAt: true }],
+      },
+    ];
+
+    const result = buildUniqueStrategyWarningLines(models, false);
+
+    expect(result.some((line) => line.includes('NULL != NULL'))).toBe(true);
+    expect(
+      result.some((line) => line.includes('do NOT enforce uniqueness on active records'))
+    ).toBe(true);
+  });
+
+  it('mentions NULLS NOT DISTINCT for compoundWithDeletedAt', () => {
+    const models: UniqueFieldInfo[] = [
+      {
+        model: 'Tenant',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [],
+        compoundWithDeletedAt: [{ fields: ['org_id', 'name'], includesDeletedAt: true }],
+      },
+    ];
+
+    const result = buildUniqueStrategyWarningLines(models, false);
+
+    expect(result.some((line) => line.includes('NULLS NOT DISTINCT'))).toBe(true);
+    expect(result.some((line) => line.includes('PostgreSQL 15+'))).toBe(true);
+  });
+
+  it('generates correct SQL for compoundWithDeletedAt (deleted_at excluded from columns)', () => {
+    const models: UniqueFieldInfo[] = [
+      {
+        model: 'Tenant',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [],
+        compoundWithDeletedAt: [{ fields: ['org_id', 'name'], includesDeletedAt: true }],
+      },
+    ];
+
+    const result = buildUniqueStrategyWarningLines(models, false);
+
+    expect(
+      result.some((line) =>
+        line.includes('CREATE UNIQUE INDEX tenant_org_id_name_active ON "Tenant"(org_id, name) WHERE deleted_at IS NULL')
+      )
+    ).toBe(true);
+    // deleted_at should NOT appear in the index columns
+    expect(
+      result.some((line) =>
+        line.includes('ON "Tenant"(org_id, name, deleted_at)')
+      )
+    ).toBe(false);
+  });
+
+  it('shows both sections when model has both patterns', () => {
+    const models: UniqueFieldInfo[] = [
+      {
+        model: 'Resource',
+        deletedAtField: 'deleted_at',
+        constraintsNeedingIndexes: [{ fields: ['slug'], includesDeletedAt: false }],
+        compoundWithDeletedAt: [{ fields: ['org_id', 'name'], includesDeletedAt: true }],
+      },
+    ];
+
+    const result = buildUniqueStrategyWarningLines(models, false);
+
+    // Section 1: NULL warning
+    expect(result.some((line) => line.includes('NULL != NULL'))).toBe(true);
+    // Section 1: SQL for compound with deleted_at
+    expect(
+      result.some((line) =>
+        line.includes('resource_org_id_name_active ON "Resource"(org_id, name)')
+      )
+    ).toBe(true);
+    // Section 2: Model listing
+    expect(result.some((line) => line.includes('Resource: slug'))).toBe(true);
+    // Section 2: SQL for standalone
+    expect(
+      result.some((line) =>
+        line.includes('resource_slug_active ON "Resource"(slug)')
+      )
     ).toBe(true);
   });
 });

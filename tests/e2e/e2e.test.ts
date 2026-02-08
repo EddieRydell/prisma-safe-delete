@@ -1535,19 +1535,68 @@ describe('E2E: Real database tests', () => {
   });
 
   describe('Update/upsert on soft-deleted records', () => {
-    it('update on soft-deleted record still works (documented behavior)', async () => {
+    it('update on soft-deleted record throws P2025 (not found)', async () => {
       await prisma.user.create({
         data: { id: 'u1', email: 'deleted@test.com', deleted_at: new Date() },
       });
 
-      // Note: update on soft-deleted records is allowed - this is by design
-      // Users who need to restore or modify deleted records can do so
+      // update now filters out soft-deleted records, so targeting a deleted record throws
+      await expect(
+        safePrisma.user.update({
+          where: { id: 'u1' },
+          data: { name: 'Updated Name' },
+        }),
+      ).rejects.toThrow();
+    });
+
+    it('update on active record still works', async () => {
+      await prisma.user.create({
+        data: { id: 'u1', email: 'active@test.com' },
+      });
+
       const updated = await safePrisma.user.update({
         where: { id: 'u1' },
         data: { name: 'Updated Name' },
       });
 
       expect(updated.name).toBe('Updated Name');
+    });
+
+    it('updateMany skips soft-deleted records', async () => {
+      await prisma.user.createMany({
+        data: [
+          { id: 'u1', email: 'a@test.com', name: 'Active' },
+          { id: 'u2', email: 'b@test.com', name: 'Active', deleted_at: new Date() },
+          { id: 'u3', email: 'c@test.com', name: 'Active' },
+        ],
+      });
+
+      const result = await safePrisma.user.updateMany({
+        where: { name: 'Active' },
+        data: { name: 'Updated' },
+      });
+
+      // Only 2 active records should be updated, not the soft-deleted one
+      expect(result.count).toBe(2);
+
+      // Verify the deleted record was not modified
+      const deletedUser = await prisma.user.findUnique({ where: { id: 'u2' } });
+      expect(deletedUser.name).toBe('Active');
+    });
+
+    it('transaction update also filters soft-deleted records', async () => {
+      await prisma.user.create({
+        data: { id: 'u1', email: 'deleted@test.com', deleted_at: new Date() },
+      });
+
+      await expect(
+        safePrisma.$transaction(async (tx: any) => {
+          return tx.user.update({
+            where: { id: 'u1' },
+            data: { name: 'Updated' },
+          });
+        }),
+      ).rejects.toThrow();
     });
 
     it('upsert creates new when existing record is soft-deleted', async () => {
@@ -2340,9 +2389,13 @@ describe('E2E: Real database tests', () => {
         expect(deletedComment.deleted_at?.getTime()).toBe(deletedUser.deleted_at?.getTime());
 
         // Restore with cascade
-        const restored = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+        const { record: restored, cascaded } = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
         expect(restored).not.toBeNull();
         expect(restored.deleted_at).toBeNull();
+
+        // Verify cascade info
+        expect(cascaded.Post).toBe(2);
+        expect(cascaded.Comment).toBe(2);
 
         // Verify all children are restored
         const posts = await safePrisma.post.findMany({ where: { authorId: 'u1' } });
@@ -2395,8 +2448,9 @@ describe('E2E: Real database tests', () => {
           data: { id: 'u1', email: 'active@test.com' },
         });
 
-        const result = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
-        expect(result).toBeNull();
+        const { record, cascaded } = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+        expect(record).toBeNull();
+        expect(cascaded).toEqual({});
       });
     });
 
@@ -2562,6 +2616,133 @@ describe('E2E: Real database tests', () => {
       });
     });
 
+    describe('Cascade info in return values', () => {
+      it('softDelete returns cascade info for simple cascade', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'cascade@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+                { id: 'p3', title: 'Post 3' },
+              ],
+            },
+          },
+        });
+
+        const { record, cascaded } = await safePrisma.user.softDelete({ where: { id: 'u1' } });
+        expect(record).not.toBeNull();
+        expect(record.id).toBe('u1');
+        expect(cascaded.Post).toBe(3);
+      });
+
+      it('softDelete returns cascade info for deep cascade', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'deep@test.com',
+            posts: {
+              create: {
+                id: 'p1',
+                title: 'Post',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'Comment 1' },
+                    { id: 'c2', content: 'Comment 2' },
+                  ],
+                },
+              },
+            },
+          },
+        });
+
+        const { cascaded } = await safePrisma.user.softDelete({ where: { id: 'u1' } });
+        expect(cascaded.Post).toBe(1);
+        expect(cascaded.Comment).toBe(2);
+      });
+
+      it('softDelete returns empty cascade for leaf model', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'leaf@test.com',
+            posts: {
+              create: {
+                id: 'p1',
+                title: 'Post',
+              },
+            },
+          },
+        });
+
+        // Post has Comment children but this post has none
+        const { cascaded } = await safePrisma.post.softDelete({ where: { id: 'p1' } });
+        expect(cascaded).toEqual({});
+      });
+
+      it('softDeleteMany returns aggregated cascade info', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'user1@test.com',
+            name: 'ToDelete',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+        await prisma.user.create({
+          data: {
+            id: 'u2',
+            email: 'user2@test.com',
+            name: 'ToDelete',
+            posts: {
+              create: { id: 'p3', title: 'Post 3' },
+            },
+          },
+        });
+
+        const { count, cascaded } = await safePrisma.user.softDeleteMany({
+          where: { name: 'ToDelete' },
+        });
+        expect(count).toBe(2);
+        expect(cascaded.Post).toBe(3);
+      });
+
+      it('restoreCascade returns cascade info', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'restore@test.com',
+            posts: {
+              create: [
+                {
+                  id: 'p1',
+                  title: 'Post 1',
+                  comments: {
+                    create: { id: 'c1', content: 'Comment 1' },
+                  },
+                },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const { record, cascaded } = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+        expect(record).not.toBeNull();
+        expect(cascaded.Post).toBe(2);
+        expect(cascaded.Comment).toBe(1);
+      });
+    });
+
     describe('Cascade restore in transaction', () => {
       it('restoreCascade works in transaction context', async () => {
         await prisma.user.create({
@@ -2577,7 +2758,7 @@ describe('E2E: Real database tests', () => {
         await safePrisma.user.softDelete({ where: { id: 'u1' } });
 
         await safePrisma.$transaction(async (tx: any) => {
-          const restored = await tx.user.restoreCascade({ where: { id: 'u1' } });
+          const { record: restored } = await tx.user.restoreCascade({ where: { id: 'u1' } });
           expect(restored.deleted_at).toBeNull();
         });
 
@@ -2587,6 +2768,290 @@ describe('E2E: Real database tests', () => {
         expect(user).not.toBeNull();
         expect(post).not.toBeNull();
       });
+    });
+  });
+
+  describe('Simple model fast path (leaf models without unique mangling)', () => {
+    it('softDeleteMany on Comment returns correct count and empty cascaded', async () => {
+      // Comment is a leaf model (no cascade children, no unique string fields)
+      // so it uses the fast updateMany path
+      await prisma.user.create({
+        data: { id: 'u1', email: 'user@test.com' },
+      });
+      await prisma.post.create({
+        data: { id: 'p1', title: 'Post', authorId: 'u1' },
+      });
+      await prisma.comment.createMany({
+        data: [
+          { id: 'c1', content: 'Comment 1', postId: 'p1' },
+          { id: 'c2', content: 'Comment 2', postId: 'p1' },
+          { id: 'c3', content: 'Comment 3', postId: 'p1', deleted_at: new Date() },
+        ],
+      });
+
+      const { count, cascaded } = await safePrisma.comment.softDeleteMany({
+        where: { postId: 'p1' },
+      });
+
+      // Only 2 active comments should be deleted (c3 already deleted)
+      expect(count).toBe(2);
+      expect(cascaded).toEqual({});
+
+      // Verify all 3 are now deleted
+      const remaining = await safePrisma.comment.findMany({ where: { postId: 'p1' } });
+      expect(remaining).toHaveLength(0);
+    });
+
+    it('softDelete on Comment returns record and empty cascaded', async () => {
+      await prisma.user.create({
+        data: { id: 'u1', email: 'user@test.com' },
+      });
+      await prisma.post.create({
+        data: { id: 'p1', title: 'Post', authorId: 'u1' },
+      });
+      await prisma.comment.create({
+        data: { id: 'c1', content: 'A comment', postId: 'p1' },
+      });
+
+      const { record, cascaded } = await safePrisma.comment.softDelete({
+        where: { id: 'c1' },
+      });
+
+      expect(record).not.toBeNull();
+      expect(record.id).toBe('c1');
+      expect(record.deleted_at).not.toBeNull();
+      expect(cascaded).toEqual({});
+    });
+
+    it('fast-path softDelete on non-existent record returns null-ish record and empty cascaded', async () => {
+      // Comment is a fast-path model (no children, no unique strings)
+      const { record, cascaded } = await safePrisma.comment.softDelete({
+        where: { id: 'nonexistent' },
+      });
+
+      // Fast path does updateMany then findFirst — findFirst returns null for nonexistent
+      expect(record).toBeNull();
+      expect(cascaded).toEqual({});
+    });
+
+    it('fast-path softDeleteMany with no matches returns zero count and empty cascaded', async () => {
+      const { count, cascaded } = await safePrisma.comment.softDeleteMany({
+        where: { postId: 'nonexistent' },
+      });
+
+      expect(count).toBe(0);
+      expect(cascaded).toEqual({});
+    });
+  });
+
+  describe('Cascade result edge cases', () => {
+    it('softDelete with partial cascade (some children already deleted)', async () => {
+      await prisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'partial@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Active Post' },
+              { id: 'p2', title: 'Already Deleted', deleted_at: new Date() },
+            ],
+          },
+        },
+      });
+
+      const { cascaded } = await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+      // Only the active post (p1) should be counted in cascaded
+      // p2 was already deleted so the cascade skips it
+      expect(cascaded.Post).toBe(1);
+    });
+
+    it('wide cascade returns counts for multiple child types', async () => {
+      await prisma.organization.create({
+        data: {
+          id: 'org-1',
+          name: 'Acme',
+          teams: {
+            create: [
+              { id: 'team-1', name: 'Engineering' },
+              { id: 'team-2', name: 'Marketing' },
+            ],
+          },
+          projects: {
+            create: [
+              { id: 'proj-1', name: 'Alpha' },
+              { id: 'proj-2', name: 'Beta' },
+              { id: 'proj-3', name: 'Gamma' },
+            ],
+          },
+        },
+      });
+
+      const { cascaded } = await safePrisma.organization.softDelete({
+        where: { id: 'org-1' },
+      });
+
+      expect(cascaded.Team).toBe(2);
+      expect(cascaded.Project).toBe(3);
+      // Asset is non-soft-deletable, should not appear
+      expect(cascaded.Asset).toBeUndefined();
+    });
+
+    it('softDelete cascade result in transaction context', async () => {
+      await prisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'txcascade@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Post 1' },
+              { id: 'p2', title: 'Post 2' },
+            ],
+          },
+        },
+      });
+
+      const result = await safePrisma.$transaction(async (tx: any) => {
+        return tx.user.softDelete({ where: { id: 'u1' } });
+      });
+
+      expect(result.record).not.toBeNull();
+      expect(result.cascaded.Post).toBe(2);
+    });
+
+    it('softDeleteMany cascade result in transaction context', async () => {
+      await prisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'txmany1@test.com',
+          name: 'Batch',
+          posts: { create: { id: 'p1', title: 'Post 1' } },
+        },
+      });
+      await prisma.user.create({
+        data: {
+          id: 'u2',
+          email: 'txmany2@test.com',
+          name: 'Batch',
+          posts: { create: { id: 'p2', title: 'Post 2' } },
+        },
+      });
+
+      const result = await safePrisma.$transaction(async (tx: any) => {
+        return tx.user.softDeleteMany({ where: { name: 'Batch' } });
+      });
+
+      expect(result.count).toBe(2);
+      expect(result.cascaded.Post).toBe(2);
+    });
+
+    it('deep cascade (4 levels) returns correct model counts', async () => {
+      await prisma.category.create({
+        data: {
+          id: 'cat-1',
+          name: 'Electronics',
+          products: {
+            create: {
+              id: 'prod-1',
+              name: 'Phone',
+              variants: {
+                create: {
+                  id: 'var-1',
+                  sku: 'PHN-001',
+                  options: {
+                    create: [
+                      { id: 'opt-1', name: 'Color', value: 'Black' },
+                      { id: 'opt-2', name: 'Storage', value: '128GB' },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const { cascaded } = await safePrisma.category.softDelete({ where: { id: 'cat-1' } });
+
+      expect(cascaded.Product).toBe(1);
+      expect(cascaded.ProductVariant).toBe(1);
+      expect(cascaded.VariantOption).toBe(2);
+    });
+
+    it('self-referential cascade returns correct counts', async () => {
+      await prisma.category.create({
+        data: {
+          id: 'root',
+          name: 'Root',
+          children: {
+            create: {
+              id: 'child',
+              name: 'Child',
+              children: {
+                create: { id: 'grandchild', name: 'Grandchild' },
+              },
+            },
+          },
+        },
+      });
+
+      const { cascaded } = await safePrisma.category.softDelete({ where: { id: 'root' } });
+
+      // Self-referential: Category children
+      expect(cascaded.Category).toBe(2); // child + grandchild
+    });
+
+    it('updateMany in transaction filters soft-deleted records', async () => {
+      await prisma.user.createMany({
+        data: [
+          { id: 'u1', email: 'a@test.com', name: 'Active' },
+          { id: 'u2', email: 'b@test.com', name: 'Active', deleted_at: new Date() },
+          { id: 'u3', email: 'c@test.com', name: 'Active' },
+        ],
+      });
+
+      const result = await safePrisma.$transaction(async (tx: any) => {
+        return tx.user.updateMany({
+          where: { name: 'Active' },
+          data: { name: 'Updated' },
+        });
+      });
+
+      // Only 2 active records should be updated, not the soft-deleted one
+      expect(result.count).toBe(2);
+
+      // Verify the deleted record was not modified
+      const deletedUser = await prisma.user.findUnique({ where: { id: 'u2' } });
+      expect(deletedUser.name).toBe('Active');
+    });
+
+    it('cascade count excludes already-deleted children at all levels', async () => {
+      // User -> Post -> Comment where some comments are already deleted
+      await prisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'mixed@test.com',
+          posts: {
+            create: {
+              id: 'p1',
+              title: 'Post',
+              comments: {
+                create: [
+                  { id: 'c1', content: 'Active' },
+                  { id: 'c2', content: 'Already Deleted', deleted_at: new Date() },
+                  { id: 'c3', content: 'Active Too' },
+                ],
+              },
+            },
+          },
+        },
+      });
+
+      const { cascaded } = await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+      expect(cascaded.Post).toBe(1);
+      // Only active comments (c1, c3) should be counted
+      expect(cascaded.Comment).toBe(2);
     });
   });
 });

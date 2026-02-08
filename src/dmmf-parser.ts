@@ -27,6 +27,17 @@ export interface ParsedRelation {
 }
 
 /**
+ * Represents a unique constraint from the Prisma schema.
+ * Can be either a standalone @unique field or a compound @@unique.
+ */
+export interface UniqueConstraintInfo {
+  /** The fields in the constraint (excluding deleted_at) */
+  fields: string[];
+  /** Whether deleted_at/deletedAt was part of a compound @@unique */
+  includesDeletedAt: boolean;
+}
+
+/**
  * Represents a fully parsed Prisma model
  */
 export interface ParsedModel {
@@ -41,6 +52,8 @@ export interface ParsedModel {
   uniqueStringFields: string[];
   /** All fields with @unique or part of @@unique (for partial index warnings) */
   allUniqueFields: string[];
+  /** Structured unique constraint info for accurate warning generation */
+  uniqueConstraints: UniqueConstraintInfo[];
 }
 
 /**
@@ -230,6 +243,48 @@ function extractAllUniqueFields(model: DMMFModel): string[] {
 }
 
 /**
+ * Extracts structured unique constraint info from a model.
+ * For standalone @unique fields: creates a single-field constraint (skips deleted_at).
+ * For compound @@unique: strips deleted_at from fields and flags includesDeletedAt.
+ */
+function extractUniqueConstraints(
+  model: DMMFModel,
+  deletedAtFieldName: string | null,
+): UniqueConstraintInfo[] {
+  const constraints: UniqueConstraintInfo[] = [];
+
+  // Standalone @unique fields
+  for (const field of model.fields) {
+    if (field.isUnique && field.relationName === undefined) {
+      // Skip the deleted_at field itself — it's never meaningful as a unique constraint target
+      if (deletedAtFieldName !== null && field.name === deletedAtFieldName) {
+        continue;
+      }
+      constraints.push({ fields: [field.name], includesDeletedAt: false });
+    }
+  }
+
+  // Compound @@unique constraints
+  for (const uniqueConstraint of model.uniqueFields) {
+    const hasDeletedAt =
+      deletedAtFieldName !== null &&
+      uniqueConstraint.includes(deletedAtFieldName);
+    const fieldsWithoutDeletedAt = hasDeletedAt
+      ? uniqueConstraint.filter((f) => f !== deletedAtFieldName)
+      : [...uniqueConstraint];
+
+    if (fieldsWithoutDeletedAt.length > 0) {
+      constraints.push({
+        fields: fieldsWithoutDeletedAt,
+        includesDeletedAt: hasDeletedAt,
+      });
+    }
+  }
+
+  return constraints;
+}
+
+/**
  * Parses a single DMMF model into our ParsedModel format
  */
 function parseModel(model: DMMFModel): ParsedModel {
@@ -275,6 +330,7 @@ function parseModel(model: DMMFModel): ParsedModel {
     relations,
     uniqueStringFields: extractUniqueStringFields(model),
     allUniqueFields: extractAllUniqueFields(model),
+    uniqueConstraints: extractUniqueConstraints(model, deletedAtField),
   };
 }
 
