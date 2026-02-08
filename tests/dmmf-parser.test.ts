@@ -270,3 +270,91 @@ describe('getHardDeleteOnlyModels', () => {
     expect(hardDeleteOnly[0]?.name).toBe('AuditLog');
   });
 });
+
+describe('uniqueStringFields', () => {
+  it('includes regular string fields with @unique', () => {
+    const model = createMockModel({
+      name: 'User',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String', isUnique: true }),
+        createMockField({ name: 'name', type: 'String' }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.uniqueStringFields).toEqual(['email']);
+  });
+
+  it('excludes UUID native type fields from mangling', () => {
+    const model = createMockModel({
+      name: 'Membership',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'organization_id',
+          type: 'String',
+          isUnique: true,
+          nativeType: ['Uuid', []],
+        }),
+        createMockField({ name: 'email', type: 'String', isUnique: true }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    // organization_id should be excluded because it has @db.Uuid
+    // email should be included because it's a regular string
+    expect(parsedModel.uniqueStringFields).toEqual(['email']);
+  });
+
+  it('excludes UUID fields from @@unique compound constraints', () => {
+    const model = createMockModel({
+      name: 'TenantResource',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'tenant_id',
+          type: 'String',
+          nativeType: ['Uuid', []],
+        }),
+        createMockField({ name: 'resource_name', type: 'String' }),
+      ],
+      uniqueFields: [['tenant_id', 'resource_name']],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    // tenant_id should be excluded (UUID), resource_name should be included
+    expect(parsedModel.uniqueStringFields).toEqual(['resource_name']);
+  });
+
+  it('handles model with only UUID unique fields', () => {
+    const model = createMockModel({
+      name: 'Reference',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'external_id',
+          type: 'String',
+          isUnique: true,
+          nativeType: ['Uuid', []],
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    // No fields should be mangled since the only unique string is a UUID
+    expect(parsedModel.uniqueStringFields).toEqual([]);
+  });
+});
