@@ -166,6 +166,14 @@ describe('emitTypes', () => {
     expect(output).toMatch(/SafeUserDelegate[\s\S]*softDeleteMany:[\s\S]*\{ deletedBy\?: string \}/);
   });
 
+  it('generates softDeletePreview type for soft-deletable models', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('softDeletePreview: (args: Prisma.UserDeleteManyArgs) => Promise<{ wouldDelete: CascadeResult }>');
+    expect(output).toContain('softDeletePreview: (args: Prisma.PostDeleteManyArgs) => Promise<{ wouldDelete: CascadeResult }>');
+  });
+
   it('generates standard delegate for non-soft-deletable models', () => {
     const schema = createTestSchema();
     const output = emitTypes(schema, TEST_CLIENT_PATH);
@@ -511,6 +519,72 @@ describe('emitRuntime', () => {
     // Should reference deleted_by field in fast path
     expect(customerCode).toContain('deletedByField');
     expect(customerCode).toContain('deleted_by');
+  });
+
+  it('generates previewSoftDelete and previewCascadeChildren functions', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('async function previewSoftDelete');
+    expect(output).toContain('async function previewSoftDeleteInTx');
+    expect(output).toContain('async function previewCascadeChildren');
+  });
+
+  it('simple model delegate emits softDeletePreview with count', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Post is a simple model (leaf, no unique strings)
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    expect(postDelegate![0]).toContain('softDeletePreview');
+    expect(postDelegate![0]).toContain('original.count');
+    expect(postDelegate![0]).toContain('wouldDelete');
+  });
+
+  it('complex model delegate emits softDeletePreview with cascade preview', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // User is a complex model (has cascade children)
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('softDeletePreview');
+    expect(userDelegate![0]).toContain('previewSoftDelete');
+  });
+
+  it('transaction wrapper includes softDeletePreview for simple models', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // Post (simple) should have softDeletePreview with tx.post.count
+    const postSection = /post: \{[\s\S]*?\},\n\s{4}\w/.exec(txContent);
+    expect(postSection).not.toBeNull();
+    expect(postSection![0]).toContain('softDeletePreview');
+    expect(postSection![0]).toContain('tx.post.count');
+  });
+
+  it('transaction wrapper includes softDeletePreview for complex models', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // User (complex) should have softDeletePreview with previewSoftDeleteInTx
+    const userSection = /user: \{[\s\S]*?\},\n\s{4}\w/.exec(txContent);
+    expect(userSection).not.toBeNull();
+    expect(userSection![0]).toContain('softDeletePreview');
+    expect(userSection![0]).toContain('previewSoftDeleteInTx');
   });
 });
 

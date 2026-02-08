@@ -24,11 +24,16 @@ Soft deletion is a common pattern where records are marked as deleted (typically
 
 - **Automatic filter injection**: All read operations automatically exclude soft-deleted records
 - **Deep relation filtering**: Filters applied to `include`, `select`, `_count`, and relation filters (`some`/`every`/`none`)
+- **Filter propagation**: Escape hatch modes (`$onlyDeleted`, `$includingDeleted`) propagate through nested relations
+- **Explicit filter overrides**: User-specified `deleted_at` filters override automatic propagation
 - **Cascade soft-delete**: Automatically cascades based on `onDelete: Cascade` relations
+- **Detailed cascade info**: Returns counts of cascaded deletions by model type
 - **Unique constraint handling**: Automatically mangles unique string fields to free up values for reuse
-- **Transaction support**: Interactive transactions receive wrapped clients with filtering
+- **Transaction support**: Full soft-delete API including escape hatches available in transactions
+- **Atomic operations**: Combine `restoreCascade` with audit logging in transactions
+- **Helper utilities**: Functions for manual filtering in complex nested queries
 - **Compound key support**: Full support for compound primary keys and foreign keys
-- **Escape hatches**: Access raw client, query deleted records, or hard delete when needed
+- **Escape hatches**: Multiple ways to access deleted records or bypass filtering
 
 ## Installation
 
@@ -268,29 +273,178 @@ await safePrisma.user.__dangerousHardDeleteMany({ where: { createdAt: { lt: oldD
 
 ### Escape Hatches
 
+When you need to query deleted records or bypass filtering:
+
 ```typescript
-// Access the raw Prisma client (no filtering)
+// Access the raw Prisma client (no filtering at all)
 const allUsers = await safePrisma.$prisma.user.findMany();
 
-// Query including soft-deleted records
-const allUsers = await safePrisma.$includingDeleted.user.findMany();
+// Query including soft-deleted records (with filter propagation)
+const allUsers = await safePrisma.$includingDeleted.user.findMany({
+  include: { posts: true }  // Includes both deleted and active posts
+});
 
-// Query only soft-deleted records
-const deletedUsers = await safePrisma.$onlyDeleted.user.findMany();
+// Query only soft-deleted records (with filter propagation)
+const deletedUsers = await safePrisma.$onlyDeleted.user.findMany({
+  include: { posts: true }  // Includes only deleted posts
+});
+
+// Per-model escape hatch
+const allUserPosts = await safePrisma.user.includingDeleted.findMany();
 ```
 
 ### Transactions
 
-Interactive transactions receive wrapped clients with filtering:
+Interactive transactions have full soft-delete support including escape hatches:
 
 ```typescript
-const result = await safePrisma.$transaction(async (tx) => {
-  // tx has the same filtering as safePrisma
-  const users = await tx.user.findMany();  // Excludes deleted
-  const posts = await tx.post.findMany();  // Excludes deleted
-  return { users, posts };
+await safePrisma.$transaction(async (tx) => {
+  // Standard filtering (excludes deleted)
+  const users = await tx.user.findMany();
+  const posts = await tx.post.findMany();
+
+  // Use escape hatches in transactions
+  const deletedUsers = await tx.$onlyDeleted.user.findMany();
+  const allPosts = await tx.$includingDeleted.post.findMany();
+
+  // Restore with atomic audit logging
+  const { record, cascaded } = await tx.user.restoreCascade({
+    where: { id: 'user-123' }
+  });
+
+  await tx.auditLog.create({
+    data: {
+      action: `RESTORE:User:${record!.id}`,
+      entityId: record!.id,
+    },
+  });
 });
 ```
+
+## Advanced Filtering
+
+### Filter Propagation
+
+Filter modes automatically propagate through relation includes for consistent behavior:
+
+```typescript
+// $onlyDeleted propagates to all relations
+const user = await safePrisma.$onlyDeleted.user.findFirst({
+  where: { id: 'user-123' },
+  include: {
+    posts: true,          // Only deleted posts
+    comments: {
+      include: {
+        replies: true     // Only deleted replies (nested propagation)
+      }
+    }
+  }
+});
+
+// $includingDeleted propagates too
+const user = await safePrisma.$includingDeleted.user.findFirst({
+  where: { id: 'user-123' },
+  include: {
+    posts: true  // All posts (deleted + active)
+  }
+});
+```
+
+### Explicit Filter Overrides
+
+You can override automatic propagation with explicit `where` clauses:
+
+```typescript
+// Query deleted users with their ACTIVE posts
+const user = await safePrisma.$onlyDeleted.user.findFirst({
+  where: { id: 'user-123' },
+  include: {
+    posts: {
+      where: { deleted_at: null }  // Override: only active posts
+    }
+  }
+});
+
+// Mixed filtering at different levels
+const user = await safePrisma.$onlyDeleted.user.findFirst({
+  include: {
+    posts: true,                    // Deleted posts (auto-propagated)
+    comments: {
+      where: { deleted_at: null },  // But active comments (override)
+      include: {
+        replies: true               // Deleted replies (resumes propagation)
+      }
+    }
+  }
+});
+```
+
+### Helper Utilities for Nested Filtering
+
+For complex where clauses where escape hatches don't work:
+
+```typescript
+import { onlyDeleted, excludeDeleted, includingDeleted } from './generated/soft-delete';
+
+// Find users who have deleted memberships
+const users = await safePrisma.user.findMany({
+  where: {
+    memberships: {
+      some: onlyDeleted('Membership', {
+        organizationId: 'org-123'
+      })
+    }
+  }
+});
+
+// Find active posts with deleted comments
+const posts = await safePrisma.post.findMany({
+  where: {
+    comments: {
+      some: onlyDeleted('Comment', {
+        content: { contains: 'spam' }
+      })
+    }
+  }
+});
+
+// Explicit active filter (overrides propagation)
+const user = await safePrisma.$onlyDeleted.user.findFirst({
+  include: {
+    posts: {
+      where: excludeDeleted('Post', { published: true })
+    }
+  }
+});
+```
+
+#### Helper Functions
+
+| Function | Purpose | Example |
+|----------|---------|---------|
+| `onlyDeleted(model, where)` | Filter for deleted records | `onlyDeleted('Post', { author_id: '123' })` |
+| `excludeDeleted(model, where)` | Filter for active records | `excludeDeleted('User', { role: 'admin' })` |
+| `includingDeleted(where)` | No-op for clarity | `includingDeleted({ status: 'premium' })` |
+
+### Escape Hatch Comparison
+
+| Feature | `safePrisma.model` | `$includingDeleted` | `$onlyDeleted` | `model.includingDeleted` | `$prisma` |
+|---------|-------------------|---------------------|----------------|--------------------------|-----------|
+| **Filter mode** | Exclude deleted | Include all | Only deleted | Include all | No filtering |
+| **Propagates to relations** | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No | ❌ No |
+| **Can override per-relation** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | N/A |
+| **Available in transactions** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No |
+| **Soft delete methods** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
+| **TypeScript types** | Full safe client | Read-only | Read-only | Read-only | Raw Prisma |
+| **Use case** | Normal queries | View full history | Restore operations | Quick override | Raw SQL/migrations |
+
+#### When to Use Each
+
+- **`safePrisma.model`**: Default for all normal queries
+- **`$onlyDeleted`**: Restore workflows, viewing deleted records with their cascade children
+- **`$includingDeleted`**: Analytics, full history views (both active and deleted)
+- **`model.includingDeleted`**: Quick access to all records for a specific model
+- **`$prisma`**: Raw queries, migrations, or when you need to bypass all filtering
 
 ## Cascade Behavior
 
