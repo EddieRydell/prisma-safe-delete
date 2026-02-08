@@ -1,11 +1,25 @@
 import type { ParsedModel, ParsedSchema } from '../dmmf-parser.js';
 
 /**
+ * Strategy for handling unique constraints on soft delete.
+ */
+type UniqueStrategy = 'mangle' | 'none';
+
+interface EmitRuntimeOptions {
+  uniqueStrategy: UniqueStrategy;
+}
+
+/**
  * Generates the runtime wrapper functions
  * @param schema - The parsed Prisma schema
  * @param clientImportPath - The relative import path to the generated Prisma client (e.g., '../client')
+ * @param options - Configuration options
  */
-export function emitRuntime(schema: ParsedSchema, clientImportPath: string): string {
+export function emitRuntime(
+  schema: ParsedSchema,
+  clientImportPath: string,
+  options: EmitRuntimeOptions = { uniqueStrategy: 'mangle' },
+): string {
   const lines: string[] = [];
 
   lines.push('/* eslint-disable */');
@@ -87,6 +101,15 @@ export function emitRuntime(schema: ParsedSchema, clientImportPath: string): str
     }
   }
   lines.push('};');
+  lines.push('');
+
+  // Emit unique strategy constant
+  lines.push('/**');
+  lines.push(' * Strategy for handling unique constraints on soft delete.');
+  lines.push(" * - 'mangle': Append \"__deleted_{pk}\" suffix to unique string fields");
+  lines.push(" * - 'none': Skip mangling (user handles uniqueness via partial indexes)");
+  lines.push(' */');
+  lines.push(`const UNIQUE_STRATEGY: 'mangle' | 'none' = '${options.uniqueStrategy}';`);
   lines.push('');
 
   // Emit helper functions
@@ -264,12 +287,16 @@ const DEFAULT_MAX_STRING_LENGTH = 255;
 /**
  * Mangles unique string fields by appending the PK suffix.
  * Returns the update data object with mangled values, or throws if mangling would exceed max length.
+ * Returns empty object if UNIQUE_STRATEGY is 'none'.
  */
 function mangleUniqueFields(
   modelName: string,
   record: Record<string, unknown>,
   maxLength: number = DEFAULT_MAX_STRING_LENGTH
 ): Record<string, unknown> {
+  // Skip mangling if strategy is 'none'
+  if (UNIQUE_STRATEGY === 'none') return {};
+
   const uniqueFields = getUniqueStringFields(modelName);
   if (uniqueFields.length === 0) return {};
 
@@ -303,6 +330,43 @@ function mangleUniqueFields(
     }
 
     updates[field] = mangledValue;
+  }
+
+  return updates;
+}
+
+/**
+ * Unmangles unique string fields by removing the PK suffix.
+ * Returns the update data object with unmangled values.
+ * Returns empty object if UNIQUE_STRATEGY is 'none'.
+ */
+function unmangleUniqueFields(
+  modelName: string,
+  record: Record<string, unknown>
+): Record<string, unknown> {
+  // Skip unmangling if strategy is 'none' (nothing was mangled)
+  if (UNIQUE_STRATEGY === 'none') return {};
+
+  const uniqueFields = getUniqueStringFields(modelName);
+  if (uniqueFields.length === 0) return {};
+
+  const suffix = buildPkSuffix(modelName, record);
+  const updates: Record<string, unknown> = {};
+
+  for (const field of uniqueFields) {
+    const currentValue = record[field];
+
+    // Skip null/undefined values
+    if (currentValue === null || currentValue === undefined) {
+      continue;
+    }
+
+    const strValue = String(currentValue);
+
+    // Only unmangle if it has the suffix
+    if (strValue.endsWith(suffix)) {
+      updates[field] = strValue.slice(0, -suffix.length);
+    }
   }
 
   return updates;
@@ -722,6 +786,381 @@ async function cascadeToChildren(
       }
     }
   }
+}
+
+/**
+ * Restores a soft-deleted record by setting deleted_at to null and unmangling unique fields.
+ * Wrapped in a transaction for safety.
+ * Throws if unmangled unique values would conflict with existing records.
+ */
+async function restoreRecord(
+  prisma: PrismaClient,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  return prisma.$transaction(async (tx) => {
+    return restoreRecordInTx(tx, modelName, where);
+  });
+}
+
+/**
+ * Restores a soft-deleted record within a transaction.
+ */
+async function restoreRecordInTx(
+  tx: any,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
+  const delegate = tx[lowerModelName as keyof typeof tx] as any;
+  return restoreRecordWithDelegate(delegate, modelName, where);
+}
+
+/**
+ * Core restore logic used by both restoreRecord and restoreRecordInTx.
+ */
+async function restoreRecordWithDelegate(
+  delegate: any,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  const deletedAtField = getDeletedAtField(modelName);
+  if (!deletedAtField) {
+    throw new Error(\`Model \${modelName} is not soft-deletable\`);
+  }
+
+  // Decompose compound key where clause if needed
+  const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
+
+  // Find the soft-deleted record
+  const record = await delegate.findFirst({
+    where: {
+      ...decomposedWhere,
+      [deletedAtField]: { not: null }, // Only deleted records
+    },
+  });
+
+  if (!record) return null;
+
+  // Get unmangled field values
+  const unmangledFields = unmangleUniqueFields(modelName, record);
+
+  // Check for conflicts before restoring
+  if (Object.keys(unmangledFields).length > 0) {
+    for (const [field, value] of Object.entries(unmangledFields)) {
+      const existing = await delegate.findFirst({
+        where: {
+          [field]: value,
+          [deletedAtField]: null, // Only check against non-deleted records
+        },
+      });
+
+      if (existing) {
+        throw new Error(
+          \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+          \`already exists in an active record. Delete or modify the conflicting record first.\`
+        );
+      }
+    }
+  }
+
+  // Restore the record
+  const pkVal = extractPrimaryKey(modelName, record);
+  const deletedByField = getDeletedByField(modelName);
+
+  const updateData: Record<string, unknown> = {
+    ...unmangledFields,
+    [deletedAtField]: null,
+  };
+
+  // Clear deleted_by if the model has that field
+  if (deletedByField) {
+    updateData[deletedByField] = null;
+  }
+
+  return delegate.update({
+    where: createPkWhereFromValues(modelName, pkVal),
+    data: updateData,
+  });
+}
+
+/**
+ * Restores multiple soft-deleted records.
+ * Wrapped in a transaction for safety.
+ * Throws if any unmangled unique values would conflict.
+ */
+async function restoreManyRecords(
+  prisma: PrismaClient,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<{ count: number }> {
+  return prisma.$transaction(async (tx) => {
+    return restoreManyInTx(tx, modelName, where);
+  });
+}
+
+/**
+ * Restores multiple soft-deleted records within a transaction.
+ */
+async function restoreManyInTx(
+  tx: any,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<{ count: number }> {
+  const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
+  const delegate = tx[lowerModelName as keyof typeof tx] as any;
+  return restoreManyWithDelegate(delegate, modelName, where);
+}
+
+/**
+ * Core restoreMany logic used by both restoreManyRecords and restoreManyInTx.
+ */
+async function restoreManyWithDelegate(
+  delegate: any,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<{ count: number }> {
+  const deletedAtField = getDeletedAtField(modelName);
+  if (!deletedAtField) {
+    throw new Error(\`Model \${modelName} is not soft-deletable\`);
+  }
+
+  // Find all soft-deleted records matching the criteria
+  const records = await delegate.findMany({
+    where: {
+      ...where,
+      [deletedAtField]: { not: null },
+    },
+  });
+
+  if (records.length === 0) return { count: 0 };
+
+  // Check for conflicts and restore each record
+  const deletedByField = getDeletedByField(modelName);
+  let restoredCount = 0;
+
+  for (const record of records) {
+    const unmangledFields = unmangleUniqueFields(modelName, record);
+
+    // Check for conflicts
+    if (Object.keys(unmangledFields).length > 0) {
+      for (const [field, value] of Object.entries(unmangledFields)) {
+        const existing = await delegate.findFirst({
+          where: {
+            [field]: value,
+            [deletedAtField]: null,
+          },
+        });
+
+        if (existing) {
+          throw new Error(
+            \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+            \`already exists in an active record. Restored \${restoredCount} record(s) before failure.\`
+          );
+        }
+      }
+    }
+
+    // Restore this record
+    const pkVal = extractPrimaryKey(modelName, record);
+    const updateData: Record<string, unknown> = {
+      ...unmangledFields,
+      [deletedAtField]: null,
+    };
+
+    if (deletedByField) {
+      updateData[deletedByField] = null;
+    }
+
+    await delegate.update({
+      where: createPkWhereFromValues(modelName, pkVal),
+      data: updateData,
+    });
+
+    restoredCount++;
+  }
+
+  return { count: restoredCount };
+}
+
+/**
+ * Restores a soft-deleted record AND all its cascade-deleted children.
+ * Children are identified by having the same deleted_at timestamp as the parent.
+ * Wrapped in a transaction.
+ */
+async function restoreWithCascade(
+  prisma: PrismaClient,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  return prisma.$transaction(async (tx) => {
+    return restoreWithCascadeInTx(tx, modelName, where);
+  });
+}
+
+/**
+ * Restores a soft-deleted record AND all its cascade-deleted children within a transaction.
+ */
+async function restoreWithCascadeInTx(
+  tx: any,
+  modelName: string,
+  where: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  const deletedAtField = getDeletedAtField(modelName);
+  if (!deletedAtField) {
+    throw new Error(\`Model \${modelName} is not soft-deletable\`);
+  }
+
+  const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
+  const delegate = tx[lowerModelName as keyof typeof tx] as any;
+
+  // Decompose compound key where clause if needed
+  const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
+
+  // Find the soft-deleted record
+  const record = await delegate.findFirst({
+    where: {
+      ...decomposedWhere,
+      [deletedAtField]: { not: null },
+    },
+  });
+
+  if (!record) return null;
+
+  const deletedAt = record[deletedAtField];
+
+  // Restore children first (depth-first, reverse of cascade delete)
+  const pkVal = extractPrimaryKey(modelName, record);
+  await restoreCascadeChildren(tx, modelName, [pkVal], deletedAt);
+
+  // Now restore the parent record
+  const unmangledFields = unmangleUniqueFields(modelName, record);
+
+  // Check for conflicts
+  if (Object.keys(unmangledFields).length > 0) {
+    for (const [field, value] of Object.entries(unmangledFields)) {
+      const existing = await delegate.findFirst({
+        where: {
+          [field]: value,
+          [deletedAtField]: null,
+        },
+      });
+
+      if (existing) {
+        throw new Error(
+          \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+          \`already exists in an active record. Delete or modify the conflicting record first.\`
+        );
+      }
+    }
+  }
+
+  const deletedByField = getDeletedByField(modelName);
+  const updateData: Record<string, unknown> = {
+    ...unmangledFields,
+    [deletedAtField]: null,
+  };
+
+  if (deletedByField) {
+    updateData[deletedByField] = null;
+  }
+
+  return delegate.update({
+    where: createPkWhereFromValues(modelName, pkVal),
+    data: updateData,
+  });
+}
+
+/**
+ * Recursively restores cascade-deleted children.
+ * Only restores children with matching deleted_at timestamp.
+ */
+async function restoreCascadeChildren(
+  tx: any,
+  parentModel: string,
+  parentPkValues: Record<string, unknown>[],
+  deletedAt: Date
+): Promise<void> {
+  const children = CASCADE_GRAPH[parentModel] ?? [];
+
+  for (const child of children) {
+    if (!child.isSoftDeletable || !child.deletedAtField) continue;
+
+    const lowerChildModel = child.model.charAt(0).toLowerCase() + child.model.slice(1);
+    const childDelegate = tx[lowerChildModel as keyof typeof tx] as any;
+
+    // Build where clause to find children
+    if (child.foreignKey.length === 0 || child.parentKey.length === 0) continue;
+
+    const childWhereConditions = parentPkValues.map((pkVal) => {
+      const condition: Record<string, unknown> = {};
+      for (let i = 0; i < child.foreignKey.length; i++) {
+        const fkField = child.foreignKey[i];
+        const pkField = child.parentKey[i];
+        if (fkField && pkField) {
+          condition[fkField] = pkVal[pkField];
+        }
+      }
+      return condition;
+    });
+
+    // Find children with matching deleted_at timestamp
+    const childRecords = await childDelegate.findMany({
+      where: {
+        OR: childWhereConditions,
+        [child.deletedAtField]: deletedAt, // Must match exact timestamp
+      },
+    });
+
+    if (childRecords.length === 0) continue;
+
+    // Get child PKs for recursive restore
+    const childPkValues = childRecords.map((r: Record<string, unknown>) =>
+      extractPrimaryKey(child.model, r)
+    );
+
+    // Recurse to grandchildren first
+    await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt);
+
+    // Now restore the children
+    for (const childRecord of childRecords) {
+      const childPkVal = extractPrimaryKey(child.model, childRecord);
+      const unmangledFields = unmangleUniqueFields(child.model, childRecord);
+
+      // Check for conflicts
+      if (Object.keys(unmangledFields).length > 0) {
+        for (const [field, value] of Object.entries(unmangledFields)) {
+          const existing = await childDelegate.findFirst({
+            where: {
+              [field]: value,
+              [child.deletedAtField]: null,
+            },
+          });
+
+          if (existing) {
+            throw new Error(
+              \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
+              \`already exists in an active record.\`
+            );
+          }
+        }
+      }
+
+      const updateData: Record<string, unknown> = {
+        ...unmangledFields,
+        [child.deletedAtField]: null,
+      };
+
+      if (child.deletedByField) {
+        updateData[child.deletedByField] = null;
+      }
+
+      await childDelegate.update({
+        where: createPkWhereFromValues(child.model, childPkVal),
+        data: updateData,
+      });
+    }
+  }
 }`.trim();
 }
 
@@ -780,6 +1219,17 @@ function create${name}Delegate(prisma: PrismaClient): any {
       });
       await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
       return { count: records.length };
+    },
+
+    // Restore methods
+    restore: async (args: any) => {
+      return restoreRecord(prisma, '${name}', args.where);
+    },
+    restoreMany: async (args: any) => {
+      return restoreManyRecords(prisma, '${name}', args.where);
+    },
+    restoreCascade: async (args: any) => {
+      return restoreWithCascade(prisma, '${name}', args.where);
     },
 
     // Hard delete (intentionally ugly name to discourage use)
@@ -911,6 +1361,16 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
       lines.push(`        });`);
       lines.push(`        await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
       lines.push(`        return { count: records.length };`);
+      lines.push(`      },`);
+      // Restore methods
+      lines.push(`      restore: async (args: any) => {`);
+      lines.push(`        return restoreRecordInTx(tx, '${model.name}', args.where);`);
+      lines.push(`      },`);
+      lines.push(`      restoreMany: async (args: any) => {`);
+      lines.push(`        return restoreManyInTx(tx, '${model.name}', args.where);`);
+      lines.push(`      },`);
+      lines.push(`      restoreCascade: async (args: any) => {`);
+      lines.push(`        return restoreWithCascadeInTx(tx, '${model.name}', args.where);`);
       lines.push(`      },`);
       // Hard delete methods (intentionally scary names)
       lines.push(`      __dangerousHardDelete: (args: any) => tx.${lowerName}.delete(args),`);

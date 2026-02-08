@@ -121,6 +121,9 @@ describe('emitTypes', () => {
     expect(output).toContain("'delete' | 'deleteMany'");
     expect(output).toContain('softDelete:');
     expect(output).toContain('softDeleteMany:');
+    expect(output).toContain('restore:');
+    expect(output).toContain('restoreMany:');
+    expect(output).toContain('restoreCascade:');
     expect(output).toContain('__dangerousHardDelete:');
     expect(output).toContain('__dangerousHardDeleteMany:');
     expect(output).toContain('includingDeleted:');
@@ -221,6 +224,29 @@ describe('emitRuntime', () => {
     expect(output).toContain("import type { SafePrismaClient");
   });
 
+  it('defaults to mangle uniqueStrategy', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'mangle'");
+  });
+
+  it('respects uniqueStrategy: none option', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none' });
+
+    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'none'");
+    // mangleUniqueFields should still exist but will return {} at runtime
+    expect(output).toContain("if (UNIQUE_STRATEGY === 'none') return {}");
+  });
+
+  it('respects uniqueStrategy: mangle option', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle' });
+
+    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'mangle'");
+  });
+
   it('generates SOFT_DELETABLE_MODELS map', () => {
     const schema = createTestSchema();
     const output = emitRuntime(schema, TEST_CLIENT_PATH);
@@ -251,6 +277,28 @@ describe('emitRuntime', () => {
 
     expect(output).toContain('async function softDeleteWithCascade');
     expect(output).toContain('prisma.$transaction');
+  });
+
+  it('generates restore functions', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('async function restoreRecord');
+    expect(output).toContain('async function restoreRecordInTx');
+    expect(output).toContain('async function restoreManyRecords');
+    expect(output).toContain('async function restoreManyInTx');
+    expect(output).toContain('function unmangleUniqueFields');
+  });
+
+  it('generates cascade restore functions', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('async function restoreWithCascade');
+    expect(output).toContain('async function restoreWithCascadeInTx');
+    expect(output).toContain('async function restoreCascadeChildren');
+    // Check that restoreCascade is added to model delegates
+    expect(output).toContain('restoreCascade:');
   });
 
   it('generates model delegate creators', () => {

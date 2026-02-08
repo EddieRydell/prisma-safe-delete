@@ -215,6 +215,37 @@ const result = await safePrisma.user.softDeleteMany({ where: { name: 'Test' } })
 console.log(result.count); // Number of records soft-deleted
 ```
 
+### Restore
+
+Restore soft-deleted records by setting `deleted_at` back to `null` and unmangling unique fields:
+
+```typescript
+// Restore a single record (does NOT restore children)
+const user = await safePrisma.user.restore({ where: { id: 'user-1' } });
+
+// Restore multiple records
+const result = await safePrisma.user.restoreMany({ where: { name: 'Test' } });
+console.log(result.count); // Number of records restored
+
+// Restore with cascade - restores parent AND all cascade-deleted children
+const user = await safePrisma.user.restoreCascade({ where: { id: 'user-1' } });
+// ^ Restores the user AND all their posts AND comments that were cascade-deleted
+```
+
+**How cascade restore works:**
+- Children are identified by having the **exact same `deleted_at` timestamp** as the parent
+- This matches the behavior of cascade soft-delete, which uses a single timestamp for the whole tree
+- All operations are wrapped in a transaction
+
+**Conflict handling:** If the unmangled unique value already exists in an active record, `restore` throws an error. You must delete or modify the conflicting record first.
+
+```typescript
+// This will throw if 'john@example.com' is already taken by another active user
+await safePrisma.user.restore({ where: { id: 'deleted-user-id' } });
+// Error: Cannot restore User: unique field "email" with value "john@example.com"
+// already exists in an active record.
+```
+
 ### Hard Delete (Escape Hatch)
 
 ```typescript
@@ -318,20 +349,54 @@ await safePrisma.user.create({ data: { email: 'john@example.com' } });  // Works
 - Mangling is idempotent (won't double-mangle)
 - Fails with clear error if mangled value would exceed max string length
 
-### Non-String Unique Fields
+### Disabling Mangling
 
-For non-string unique fields (Int, UUID, etc.), use a **partial unique index** in your database:
+If you prefer to handle unique constraints yourself (e.g., via partial unique indexes), you can disable mangling:
+
+```prisma
+generator softDelete {
+  provider       = "prisma-safe-delete"
+  output         = "./generated/soft-delete"
+  uniqueStrategy = "none"  // Skip mangling, use partial indexes instead
+}
+```
+
+**Options:**
+- `"mangle"` (default): Append `__deleted_{pk}` suffix to unique string fields
+- `"none"`: Skip mangling entirely; you handle uniqueness via partial indexes
+
+When using `uniqueStrategy = "none"`, a warning is displayed during `prisma generate` listing all fields that need partial indexes:
+
+```
+⚠️  prisma-safe-delete: uniqueStrategy is 'none'
+   You must create partial unique indexes manually to prevent conflicts.
+
+   Models requiring partial unique indexes:
+     - User: email
+     - Customer: email, username
+
+   Example SQL (PostgreSQL):
+     CREATE UNIQUE INDEX user_email_active ON "User"(email) WHERE deleted_at IS NULL;
+     CREATE UNIQUE INDEX customer_email_active ON "Customer"(email) WHERE deleted_at IS NULL;
+```
+
+### Partial Unique Indexes
+
+For non-string unique fields (Int, UUID, etc.) or if you prefer not to mangle, use **partial unique indexes** in your database:
 
 ```sql
 -- PostgreSQL
+CREATE UNIQUE INDEX user_email_active ON "User"(email) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX user_employee_id_active ON "User"(employee_id) WHERE deleted_at IS NULL;
 
 -- MySQL (8.0+)
 -- Use a generated column + unique index
 
 -- SQLite
-CREATE UNIQUE INDEX user_employee_id_active ON User(employee_id) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX user_email_active ON User(email) WHERE deleted_at IS NULL;
 ```
+
+This approach works for all field types and avoids the max-length issues of mangling.
 
 ## Compound Primary Keys
 
@@ -410,6 +475,33 @@ await safePrisma.user.update({
   where: { id: 'deleted-user' },
   data: { deleted_at: null }  // Restore the user
 });
+```
+
+## Test Coverage
+
+This library has comprehensive test coverage across unit, integration, and end-to-end tests:
+
+| Scenario | Status |
+|----------|--------|
+| `findUnique` rewritten correctly | ✅ |
+| `include`/`select` nested 2–3 levels deep | ✅ |
+| Relation filters (`some`/`every`/`none`) with deleted children | ✅ |
+| `_count` correctness | ✅ |
+| `groupBy`/`aggregate` exclude deleted | ✅ |
+| Cascade with mixed children (some soft-deletable, some not) | ✅ |
+| Self-referential relations (cycles) handled safely | ✅ |
+| Compound primary key mangling stable | ✅ |
+| Idempotent `softDelete` (re-deleting is safe) | ✅ |
+| `restore` unmangles unique fields | ✅ |
+| `restoreCascade` restores parent + children | ✅ |
+| Restore conflict detection | ✅ |
+| Interactive transactions receive wrapped clients | ✅ |
+| Fluent API bypass confirmed (documented limitation) | ✅ |
+
+Run the full test suite:
+
+```bash
+pnpm test
 ```
 
 ## Requirements

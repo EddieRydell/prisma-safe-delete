@@ -2,7 +2,7 @@ import generatorHelper from '@prisma/generator-helper';
 const { generatorHandler } = generatorHelper;
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { parseDMMF } from './dmmf-parser.js';
+import { parseDMMF, type ParsedSchema } from './dmmf-parser.js';
 import { buildCascadeGraph } from './cascade-graph.js';
 import {
   emitTypes,
@@ -10,6 +10,111 @@ import {
   emitCascadeGraph,
   emitIndex,
 } from './codegen/index.js';
+
+/**
+ * Strategy for handling unique constraints on soft delete.
+ * - 'mangle': Append "__deleted_{pk}" suffix to unique string fields (default)
+ * - 'none': Skip mangling; use this if you set up partial unique indexes yourself
+ */
+export type UniqueStrategy = 'mangle' | 'none';
+
+/**
+ * ANSI color codes for terminal output
+ */
+const YELLOW = '\x1b[33m';
+const CYAN = '\x1b[36m';
+const RESET = '\x1b[0m';
+const BOLD = '\x1b[1m';
+
+/**
+ * Model info for unique strategy warning
+ */
+export interface UniqueFieldInfo {
+  model: string;
+  fields: string[];
+  deletedAtField: string;
+}
+
+/**
+ * Collects models that have unique string fields requiring partial indexes.
+ * Exported for testing.
+ */
+export function collectModelsWithUniqueFields(schema: ParsedSchema): UniqueFieldInfo[] {
+  const result: UniqueFieldInfo[] = [];
+
+  for (const model of schema.models) {
+    if (model.isSoftDeletable && model.uniqueStringFields.length > 0 && model.deletedAtField !== null) {
+      result.push({
+        model: model.name,
+        fields: model.uniqueStringFields,
+        deletedAtField: model.deletedAtField,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Builds the warning message lines (without ANSI colors for testing).
+ * Exported for testing.
+ */
+export function buildUniqueStrategyWarningLines(
+  modelsWithUniqueFields: UniqueFieldInfo[],
+  useColors = true,
+): string[] {
+  if (modelsWithUniqueFields.length === 0) {
+    return [];
+  }
+
+  const y = useColors ? YELLOW : '';
+  const c = useColors ? CYAN : '';
+  const r = useColors ? RESET : '';
+  const b = useColors ? BOLD : '';
+
+  const lines: string[] = [
+    '',
+    `${y}${b}⚠️  prisma-safe-delete: uniqueStrategy is 'none'${r}`,
+    `${y}   You must create partial unique indexes manually to prevent conflicts.${r}`,
+    '',
+    `${c}   Models requiring partial unique indexes:${r}`,
+  ];
+
+  for (const { model, fields } of modelsWithUniqueFields) {
+    lines.push(`     - ${model}: ${fields.join(', ')}`);
+  }
+
+  lines.push('');
+  lines.push(`${c}   Example SQL (PostgreSQL):${r}`);
+
+  for (const { model, fields, deletedAtField } of modelsWithUniqueFields) {
+    for (const field of fields) {
+      const indexName = `${model.toLowerCase()}_${field}_active`;
+      lines.push(`     CREATE UNIQUE INDEX ${indexName} ON "${model}"(${field}) WHERE ${deletedAtField} IS NULL;`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`${y}   Without these indexes, soft-deleted records will block new records with the same unique values.${r}`);
+  lines.push('');
+
+  return lines;
+}
+
+/**
+ * Emits a warning when uniqueStrategy is 'none' to remind users to create partial indexes.
+ */
+function emitUniqueStrategyWarning(schema: ParsedSchema): void {
+  const modelsWithUniqueFields = collectModelsWithUniqueFields(schema);
+  const lines = buildUniqueStrategyWarningLines(modelsWithUniqueFields);
+
+  if (lines.length > 0) {
+    // Print warning to console
+    // Using console.log because Prisma may suppress stderr
+    // eslint-disable-next-line no-console
+    console.log(lines.join('\n'));
+  }
+}
 
 /**
  * Computes the relative import path from our output directory to the Prisma client.
@@ -55,6 +160,11 @@ generatorHandler({
       throw new Error('No output directory specified for prisma-safe-delete');
     }
 
+    // Read custom config options
+    const rawStrategy = options.generator.config['uniqueStrategy'] as string | undefined;
+    const uniqueStrategy: UniqueStrategy =
+      rawStrategy === 'none' ? 'none' : 'mangle'; // Default to 'mangle'
+
     // Find the Prisma client generator to get its output path
     const clientGenerator = options.otherGenerators.find(
       (g) => g.provider.value === 'prisma-client',
@@ -81,13 +191,18 @@ generatorHandler({
     // Parse the DMMF
     const schema = parseDMMF(options.dmmf);
 
+    // Emit warning if uniqueStrategy is 'none' and there are unique fields
+    if (uniqueStrategy === 'none') {
+      emitUniqueStrategyWarning(schema);
+    }
+
     // Build the cascade graph
     const cascadeGraph = buildCascadeGraph(schema);
 
     // Generate all output files
     const typesContent = emitTypes(schema, clientImportPath);
     const cascadeGraphContent = emitCascadeGraph(cascadeGraph);
-    const runtimeContent = emitRuntime(schema, clientImportPath);
+    const runtimeContent = emitRuntime(schema, clientImportPath, { uniqueStrategy });
     const indexContent = emitIndex(schema);
 
     // Ensure output directory exists
