@@ -747,6 +747,13 @@ function create${name}Delegate(prisma: PrismaClient): any {
     // Soft delete methods
     softDelete: async (args: any) => {
       const { deletedBy, ...rest } = args;
+      const deletedByField = getDeletedByField('${name}');
+      if (deletedByField && deletedBy === undefined) {
+        throw new Error(
+          \`Model ${name} has a "\${deletedByField}" field, but "deletedBy" was not provided. \` +
+          \`Pass { deletedBy: "user-id" } to track who performed the deletion.\`
+        );
+      }
       await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
       // Decompose compound key for findFirst
       const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
@@ -754,6 +761,13 @@ function create${name}Delegate(prisma: PrismaClient): any {
     },
     softDeleteMany: async (args: any) => {
       const { deletedBy, ...rest } = args;
+      const deletedByField = getDeletedByField('${name}');
+      if (deletedByField && deletedBy === undefined) {
+        throw new Error(
+          \`Model ${name} has a "\${deletedByField}" field, but "deletedBy" was not provided. \` +
+          \`Pass { deletedBy: "user-id" } to track who performed the deletion.\`
+        );
+      }
       const deletedAtField = getDeletedAtField('${name}');
       const pk = PRIMARY_KEYS['${name}'];
       const pkFields = Array.isArray(pk) ? pk : [pk];

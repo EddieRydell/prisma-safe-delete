@@ -1827,7 +1827,7 @@ describe('E2E: Real database tests', () => {
         },
       });
 
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' } });
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
       // Check that fields were mangled
       const raw = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
@@ -1845,7 +1845,7 @@ describe('E2E: Real database tests', () => {
         },
       });
 
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' } });
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
       // Now we can create a new customer with the same email/username
       const newCustomer = await safePrisma.customer.create({
@@ -1875,7 +1875,7 @@ describe('E2E: Real database tests', () => {
         },
       });
 
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' } });
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
       // Check orders were mangled
       const orders = await prisma.order.findMany({ orderBy: { id: 'asc' } });
@@ -1903,7 +1903,7 @@ describe('E2E: Real database tests', () => {
         },
       });
 
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' } });
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
       const raw = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
       expect(raw.email).toContain('__deleted_');
@@ -1919,13 +1919,13 @@ describe('E2E: Real database tests', () => {
       });
 
       // Soft delete first time
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' } });
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
       const afterFirst = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
       const mangledEmail = afterFirst.email;
 
       // Soft delete again - should be no-op since already deleted
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' } });
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
       const afterSecond = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
       expect(afterSecond.email).toBe(mangledEmail); // No double-mangling
@@ -1971,7 +1971,7 @@ describe('E2E: Real database tests', () => {
         ],
       });
 
-      await safePrisma.customer.softDeleteMany({ where: { name: 'Batch' } });
+      await safePrisma.customer.softDeleteMany({ where: { name: 'Batch' }, deletedBy: 'test' });
 
       // Mangled records
       const cust1 = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
@@ -1992,92 +1992,115 @@ describe('E2E: Real database tests', () => {
 
   describe('deleted_by field support', () => {
     it('softDelete sets deleted_by when provided', async () => {
-      await prisma.user.create({
-        data: { id: 'user-1', email: 'test@test.com' },
+      await prisma.customer.create({
+        data: { id: 'cust-1', email: 'test@example.com', username: 'testuser' },
       });
 
-      await safePrisma.user.softDelete({
-        where: { id: 'user-1' },
+      await safePrisma.customer.softDelete({
+        where: { id: 'cust-1' },
         deletedBy: 'admin-123',
       });
 
-      const rawUser = await prisma.user.findUnique({ where: { id: 'user-1' } });
-      expect(rawUser.deleted_at).not.toBeNull();
-      expect(rawUser.deleted_by).toBe('admin-123');
+      const rawCustomer = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
+      expect(rawCustomer.deleted_at).not.toBeNull();
+      expect(rawCustomer.deleted_by).toBe('admin-123');
     });
 
-    it('softDelete without deletedBy leaves the field null', async () => {
+    it('softDelete throws error when model has deleted_by field but deletedBy not provided', async () => {
+      await prisma.customer.create({
+        data: { id: 'cust-1', email: 'test@example.com', username: 'testuser' },
+      });
+
+      await expect(
+        safePrisma.customer.softDelete({ where: { id: 'cust-1' } })
+      ).rejects.toThrow(/deletedBy.*was not provided/);
+
+      // Record should not be deleted
+      const rawCustomer = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
+      expect(rawCustomer.deleted_at).toBeNull();
+    });
+
+    it('softDeleteMany throws error when model has deleted_by field but deletedBy not provided', async () => {
+      await prisma.customer.createMany({
+        data: [
+          { id: 'cust-1', email: 'c1@example.com', username: 'user1' },
+          { id: 'cust-2', email: 'c2@example.com', username: 'user2' },
+        ],
+      });
+
+      await expect(
+        safePrisma.customer.softDeleteMany({ where: { id: { in: ['cust-1', 'cust-2'] } } })
+      ).rejects.toThrow(/deletedBy.*was not provided/);
+
+      // Records should not be deleted
+      const count = await prisma.customer.count({ where: { deleted_at: null } });
+      expect(count).toBe(2);
+    });
+
+    it('softDelete works without deletedBy on models that lack deleted_by field', async () => {
+      // User model has deleted_at but no deleted_by field
       await prisma.user.create({
         data: { id: 'user-1', email: 'test@test.com' },
       });
 
+      // Should not throw - User doesn't have deleted_by field
       await safePrisma.user.softDelete({ where: { id: 'user-1' } });
 
       const rawUser = await prisma.user.findUnique({ where: { id: 'user-1' } });
       expect(rawUser.deleted_at).not.toBeNull();
-      expect(rawUser.deleted_by).toBeNull();
     });
 
     it('softDelete cascade propagates deleted_by to children', async () => {
-      await prisma.user.create({
+      await prisma.customer.create({
         data: {
-          id: 'user-1',
-          email: 'author@test.com',
-          posts: {
-            create: {
-              id: 'post-1',
-              title: 'Post with comments',
-              comments: {
-                create: [
-                  { id: 'comment-1', content: 'Comment 1' },
-                  { id: 'comment-2', content: 'Comment 2' },
-                ],
-              },
-            },
+          id: 'cust-1',
+          email: 'cascade@example.com',
+          username: 'cascade',
+          orders: {
+            create: [
+              { id: 'order-1', orderNumber: 'ORD-001' },
+              { id: 'order-2', orderNumber: 'ORD-002' },
+            ],
           },
         },
       });
 
-      await safePrisma.user.softDelete({
-        where: { id: 'user-1' },
+      await safePrisma.customer.softDelete({
+        where: { id: 'cust-1' },
         deletedBy: 'admin-456',
       });
 
-      // Check user
-      const rawUser = await prisma.user.findUnique({ where: { id: 'user-1' } });
-      expect(rawUser.deleted_by).toBe('admin-456');
+      // Check customer
+      const rawCustomer = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
+      expect(rawCustomer.deleted_by).toBe('admin-456');
 
-      // Check post
-      const rawPost = await prisma.post.findUnique({ where: { id: 'post-1' } });
-      expect(rawPost.deleted_by).toBe('admin-456');
-
-      // Check comments
-      const rawComments = await prisma.comment.findMany();
-      expect(rawComments).toHaveLength(2);
-      expect(rawComments.every((c: any) => c.deleted_by === 'admin-456')).toBe(true);
+      // Check orders
+      const rawOrders = await prisma.order.findMany();
+      expect(rawOrders).toHaveLength(2);
+      expect(rawOrders.every((o: any) => o.deleted_by === 'admin-456')).toBe(true);
     });
 
     it('softDeleteMany sets deleted_by on all records', async () => {
-      await prisma.user.createMany({
+      await prisma.customer.createMany({
         data: [
-          { id: 'user-1', email: 'user1@test.com', name: 'ToDelete' },
-          { id: 'user-2', email: 'user2@test.com', name: 'ToDelete' },
-          { id: 'user-3', email: 'user3@test.com', name: 'Keep' },
+          { id: 'cust-1', email: 'c1@example.com', username: 'u1', name: 'ToDelete' },
+          { id: 'cust-2', email: 'c2@example.com', username: 'u2', name: 'ToDelete' },
+          { id: 'cust-3', email: 'c3@example.com', username: 'u3', name: 'Keep' },
         ],
       });
 
-      await safePrisma.user.softDeleteMany({
+      await safePrisma.customer.softDeleteMany({
         where: { name: 'ToDelete' },
         deletedBy: 'batch-admin',
       });
 
-      const user1 = await prisma.user.findUnique({ where: { id: 'user-1' } });
-      const user2 = await prisma.user.findUnique({ where: { id: 'user-2' } });
-      const user3 = await prisma.user.findUnique({ where: { id: 'user-3' } });
+      const cust1 = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
+      const cust2 = await prisma.customer.findUnique({ where: { id: 'cust-2' } });
+      const cust3 = await prisma.customer.findUnique({ where: { id: 'cust-3' } });
 
-      expect(user1.deleted_by).toBe('batch-admin');
-      expect(user2.deleted_by).toBe('batch-admin');
-      expect(user3.deleted_by).toBeNull(); // Not deleted
+      expect(cust1.deleted_by).toBe('batch-admin');
+      expect(cust2.deleted_by).toBe('batch-admin');
+      expect(cust3.deleted_by).toBeNull(); // Not deleted
     });
   });
 
