@@ -563,10 +563,24 @@ function injectIntoRelations(
 function emitSoftDeleteCascadeFunction(): string {
   return `
 /**
- * Performs a soft delete with cascade
+ * Performs a soft delete with cascade (with its own transaction)
  */
 async function softDeleteWithCascade(
   prisma: PrismaClient,
+  modelName: string,
+  where: Record<string, unknown>,
+  deletedBy?: string
+): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    await softDeleteWithCascadeInTx(tx, modelName, where, deletedBy);
+  });
+}
+
+/**
+ * Performs a soft delete with cascade within an existing transaction
+ */
+async function softDeleteWithCascadeInTx(
+  tx: any,
   modelName: string,
   where: Record<string, unknown>,
   deletedBy?: string
@@ -579,54 +593,52 @@ async function softDeleteWithCascade(
   const now = new Date();
   const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
 
-  await prisma.$transaction(async (tx) => {
-    // Find all records to delete
-    const delegate = tx[lowerModelName as keyof typeof tx] as any;
-    // Decompose compound key where clause if needed
-    const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
-    const records = await delegate.findMany({
-      where: {
-        ...decomposedWhere,
-        [deletedAtField]: null, // Only non-deleted records
-      },
-    });
-
-    if (records.length === 0) return;
-
-    // Get primary keys of records to delete
-    const pkValues = records.map((r: Record<string, unknown>) =>
-      extractPrimaryKey(modelName, r)
-    );
-
-    // Cascade to children (depth-first)
-    await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
-
-    // Update parent records - mangle unique fields first, then set deleted_at
-    const pk = PRIMARY_KEYS[modelName];
-    const pkField = Array.isArray(pk) ? pk.join('_') : pk;
-
-    // For each record, we need to mangle unique fields individually
-    // because each record has its own PK suffix
-    for (const record of records) {
-      const pkVal = extractPrimaryKey(modelName, record);
-      const mangledFields = mangleUniqueFields(modelName, record);
-
-      const updateData: Record<string, unknown> = {
-        ...mangledFields,
-        [deletedAtField]: now,
-      };
-
-      const deletedByField = getDeletedByField(modelName);
-      if (deletedByField && deletedBy) {
-        updateData[deletedByField] = deletedBy;
-      }
-
-      await delegate.update({
-        where: createPkWhereFromValues(modelName, pkVal),
-        data: updateData,
-      });
-    }
+  // Find all records to delete
+  const delegate = tx[lowerModelName as keyof typeof tx] as any;
+  // Decompose compound key where clause if needed
+  const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
+  const records = await delegate.findMany({
+    where: {
+      ...decomposedWhere,
+      [deletedAtField]: null, // Only non-deleted records
+    },
   });
+
+  if (records.length === 0) return;
+
+  // Get primary keys of records to delete
+  const pkValues = records.map((r: Record<string, unknown>) =>
+    extractPrimaryKey(modelName, r)
+  );
+
+  // Cascade to children (depth-first)
+  await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
+
+  // Update parent records - mangle unique fields first, then set deleted_at
+  const pk = PRIMARY_KEYS[modelName];
+  const pkField = Array.isArray(pk) ? pk.join('_') : pk;
+
+  // For each record, we need to mangle unique fields individually
+  // because each record has its own PK suffix
+  for (const record of records) {
+    const pkVal = extractPrimaryKey(modelName, record);
+    const mangledFields = mangleUniqueFields(modelName, record);
+
+    const updateData: Record<string, unknown> = {
+      ...mangledFields,
+      [deletedAtField]: now,
+    };
+
+    const deletedByField = getDeletedByField(modelName);
+    if (deletedByField && deletedBy) {
+      updateData[deletedByField] = deletedBy;
+    }
+
+    await delegate.update({
+      where: createPkWhereFromValues(modelName, pkVal),
+      data: updateData,
+    });
+  }
 }
 
 /**
@@ -745,6 +757,9 @@ function create${name}Delegate(prisma: PrismaClient): any {
     upsert: (args: any) => original.upsert(args),
 
     // Soft delete methods
+    // NOTE: deletedBy requirement is enforced at COMPILE-TIME only via TypeScript types.
+    // There is no runtime validation - callers bypassing TypeScript (e.g., plain JS) must
+    // ensure they pass deletedBy for models with deleted_by fields.
     softDelete: async (args: any) => {
       const { deletedBy, ...rest } = args;
       await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
@@ -767,9 +782,21 @@ function create${name}Delegate(prisma: PrismaClient): any {
       return { count: records.length };
     },
 
-    // Hard delete (escape hatch)
-    hardDelete: (args: any) => original.delete(args),
-    hardDeleteMany: (args: any) => original.deleteMany(args),
+    // Hard delete (intentionally ugly name to discourage use)
+    __dangerousHardDelete: (args: any) => original.delete(args),
+    __dangerousHardDeleteMany: (args: any) => original.deleteMany(args),
+
+    // Access raw delegate without soft-delete filtering
+    includingDeleted: {
+      findMany: (args?: any) => original.findMany(args),
+      findFirst: (args?: any) => original.findFirst(args),
+      findFirstOrThrow: (args?: any) => original.findFirstOrThrow(args),
+      findUnique: (args?: any) => original.findUnique(args),
+      findUniqueOrThrow: (args?: any) => original.findUniqueOrThrow(args),
+      count: (args?: any) => original.count(args),
+      aggregate: (args?: any) => original.aggregate(args),
+      groupBy: (args?: any) => original.groupBy(args),
+    },
   };
 }`.trim();
   }
@@ -841,7 +868,7 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
 function emitTransactionWrapper(schema: ParsedSchema): string {
   const lines: string[] = [];
   lines.push('/**');
-  lines.push(' * Wraps a transaction client with soft-delete filtering');
+  lines.push(' * Wraps a transaction client with soft-delete filtering and full API');
   lines.push(' */');
   lines.push('function wrapTransactionClient(tx: any): any {');
   lines.push('  return {');
@@ -850,6 +877,7 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
     const lowerName = toLowerFirst(model.name);
     if (model.isSoftDeletable) {
       lines.push(`    ${lowerName}: {`);
+      // Read operations with filter injection
       lines.push(`      findMany: (args?: any) => tx.${lowerName}.findMany(injectFilters(args, '${model.name}')),`);
       lines.push(`      findFirst: (args?: any) => tx.${lowerName}.findFirst(injectFilters(args, '${model.name}')),`);
       lines.push(`      findFirstOrThrow: (args?: any) => tx.${lowerName}.findFirstOrThrow(injectFilters(args, '${model.name}')),`);
@@ -858,13 +886,46 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
       lines.push(`      count: (args?: any) => tx.${lowerName}.count(injectFilters(args, '${model.name}')),`);
       lines.push(`      aggregate: (args?: any) => tx.${lowerName}.aggregate(injectFilters(args, '${model.name}')),`);
       lines.push(`      groupBy: (args?: any) => tx.${lowerName}.groupBy(injectFilters(args, '${model.name}')),`);
+      // Write operations (pass-through)
       lines.push(`      create: (args: any) => tx.${lowerName}.create(args),`);
       lines.push(`      createMany: (args: any) => tx.${lowerName}.createMany(args),`);
       lines.push(`      update: (args: any) => tx.${lowerName}.update(args),`);
       lines.push(`      updateMany: (args: any) => tx.${lowerName}.updateMany(args),`);
       lines.push(`      upsert: (args: any) => tx.${lowerName}.upsert(args),`);
-      lines.push(`      delete: (args: any) => tx.${lowerName}.delete(args),`);
-      lines.push(`      deleteMany: (args: any) => tx.${lowerName}.deleteMany(args),`);
+      // Soft delete methods (compile-time only validation - no runtime checks for deletedBy)
+      lines.push(`      softDelete: async (args: any) => {`);
+      lines.push(`        const { deletedBy, ...rest } = args;`);
+      lines.push(`        await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
+      lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
+      lines.push(`        return tx.${lowerName}.findFirst({ where: decomposedWhere });`);
+      lines.push(`      },`);
+      lines.push(`      softDeleteMany: async (args: any) => {`);
+      lines.push(`        const { deletedBy, ...rest } = args;`);
+      lines.push(`        const deletedAtField = getDeletedAtField('${model.name}');`);
+      lines.push(`        const pk = PRIMARY_KEYS['${model.name}'];`);
+      lines.push(`        const pkFields = Array.isArray(pk) ? pk : [pk];`);
+      lines.push(`        const selectClause = Object.fromEntries(pkFields.map(f => [f, true]));`);
+      lines.push(`        const records = await tx.${lowerName}.findMany({`);
+      lines.push(`          where: { ...rest.where, ...(deletedAtField ? { [deletedAtField]: null } : {}) },`);
+      lines.push(`          select: selectClause,`);
+      lines.push(`        });`);
+      lines.push(`        await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
+      lines.push(`        return { count: records.length };`);
+      lines.push(`      },`);
+      // Hard delete methods (intentionally scary names)
+      lines.push(`      __dangerousHardDelete: (args: any) => tx.${lowerName}.delete(args),`);
+      lines.push(`      __dangerousHardDeleteMany: (args: any) => tx.${lowerName}.deleteMany(args),`);
+      // includingDeleted sub-object for raw access
+      lines.push(`      includingDeleted: {`);
+      lines.push(`        findMany: (args?: any) => tx.${lowerName}.findMany(args),`);
+      lines.push(`        findFirst: (args?: any) => tx.${lowerName}.findFirst(args),`);
+      lines.push(`        findFirstOrThrow: (args?: any) => tx.${lowerName}.findFirstOrThrow(args),`);
+      lines.push(`        findUnique: (args?: any) => tx.${lowerName}.findUnique(args),`);
+      lines.push(`        findUniqueOrThrow: (args?: any) => tx.${lowerName}.findUniqueOrThrow(args),`);
+      lines.push(`        count: (args?: any) => tx.${lowerName}.count(args),`);
+      lines.push(`        aggregate: (args?: any) => tx.${lowerName}.aggregate(args),`);
+      lines.push(`        groupBy: (args?: any) => tx.${lowerName}.groupBy(args),`);
+      lines.push(`      },`);
       lines.push(`    },`);
     } else {
       lines.push(`    ${lowerName}: tx.${lowerName},`);

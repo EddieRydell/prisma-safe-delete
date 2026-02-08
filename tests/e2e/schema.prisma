@@ -17,7 +17,6 @@ model User {
   email      String    @unique
   name       String?
   deleted_at DateTime?
-  deleted_by String?
   posts      Post[]
   profile    Profile?
   createdAt  DateTime  @default(now())
@@ -39,7 +38,6 @@ model Post {
   author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
   comments   Comment[]
   deleted_at DateTime?
-  deleted_by String?
   createdAt  DateTime  @default(now())
 }
 
@@ -49,7 +47,6 @@ model Comment {
   postId     String
   post       Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
   deleted_at DateTime?
-  deleted_by String?
   createdAt  DateTime  @default(now())
 }
 
@@ -179,6 +176,7 @@ model Customer {
   name       String?
   orders     Order[]
   deleted_at DateTime?
+  deleted_by String?
 }
 
 model Order {
@@ -187,6 +185,7 @@ model Order {
   customerId  String
   customer    Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
   deleted_at  DateTime?
+  deleted_by  String?
 }
 
 // Model with compound unique constraint

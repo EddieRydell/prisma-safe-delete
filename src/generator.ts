@@ -13,6 +13,7 @@ import {
 
 /**
  * Computes the relative import path from our output directory to the Prisma client.
+ * Returns a path like '../client/client.js' for ESM compatibility with NodeNext module resolution.
  */
 function computeClientImportPath(
   ourOutputDir: string,
@@ -29,7 +30,8 @@ function computeClientImportPath(
     relativePath = './' + relativePath;
   }
 
-  return relativePath;
+  // Prisma 7 generates client.ts as the main entry point, and ESM requires explicit file extensions
+  return relativePath + '/client.js';
 }
 
 generatorHandler({

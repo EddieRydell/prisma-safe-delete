@@ -28,26 +28,48 @@ export function emitTypes(schema: ParsedSchema, clientImportPath: string): strin
   return lines.join('\n');
 }
 
+/** Type for read-only operations on a delegate (for includingDeleted) */
+function emitIncludingDeletedDelegateType(name: string, lowerName: string): string[] {
+  return [
+    `/** Read-only delegate for ${name} that includes soft-deleted records */`,
+    `export type IncludingDeleted${name}Delegate = Pick<`,
+    `  PrismaClient['${lowerName}'],`,
+    `  'findMany' | 'findFirst' | 'findFirstOrThrow' | 'findUnique' | 'findUniqueOrThrow' | 'count' | 'aggregate' | 'groupBy'`,
+    `>;`,
+  ];
+}
+
 function emitModelTypes(model: ParsedModel): string[] {
   const lines: string[] = [];
   const name = model.name;
   const lowerName = toLowerFirst(name);
 
   if (model.isSoftDeletable) {
+    // deletedBy is required if model has deleted_by field, optional otherwise.
+    // NOTE: This is COMPILE-TIME enforcement only via TypeScript. No runtime validation.
+    // Plain JavaScript callers must ensure they pass deletedBy appropriately.
+    const deletedByType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
+
+    // Emit includingDeleted delegate type first
+    lines.push(...emitIncludingDeletedDelegateType(name, lowerName));
+    lines.push('');
+
     // Soft-deletable model gets modified delegate type
     lines.push(`/** Soft-delete enabled delegate for ${name} */`);
     lines.push(`export type Safe${name}Delegate = Omit<`);
     lines.push(`  PrismaClient['${lowerName}'],`);
     lines.push(`  'delete' | 'deleteMany'`);
     lines.push(`> & {`);
-    lines.push(`  /** Soft delete a single ${name} record */`);
-    lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & { deletedBy?: string }) => Promise<Prisma.${name}GetPayload<{}>>;`);
-    lines.push(`  /** Soft delete multiple ${name} records */`);
-    lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & { deletedBy?: string }) => Promise<Prisma.BatchPayload>;`);
-    lines.push(`  /** Hard delete a single ${name} record (permanent) */`);
-    lines.push(`  hardDelete: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}>>;`);
-    lines.push(`  /** Hard delete multiple ${name} records (permanent) */`);
-    lines.push(`  hardDeleteMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Soft delete a single ${name} record with cascade */`);
+    lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & ${deletedByType}) => Promise<Prisma.${name}GetPayload<{}>>;`);
+    lines.push(`  /** Soft delete multiple ${name} records with cascade */`);
+    lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & ${deletedByType}) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Hard delete a single ${name} record (PERMANENT - bypasses soft delete) */`);
+    lines.push(`  __dangerousHardDelete: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}>>;`);
+    lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);
+    lines.push(`  __dangerousHardDeleteMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Query including soft-deleted records */`);
+    lines.push(`  includingDeleted: IncludingDeleted${name}Delegate;`);
     lines.push(`};`);
   } else {
     // Non-soft-deletable model keeps original type
@@ -60,6 +82,20 @@ function emitModelTypes(model: ParsedModel): string[] {
 
 function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   const lines: string[] = [];
+
+  // First emit the SafeTransactionClient type for typed transactions
+  lines.push('/** Type-safe transaction client with soft-delete support */');
+  lines.push('export interface SafeTransactionClient {');
+  for (const model of schema.models) {
+    const lowerName = toLowerFirst(model.name);
+    if (model.isSoftDeletable) {
+      lines.push(`  ${lowerName}: Safe${model.name}Delegate;`);
+    } else {
+      lines.push(`  ${lowerName}: PrismaClient['${lowerName}'];`);
+    }
+  }
+  lines.push('}');
+  lines.push('');
 
   lines.push('/** Type-safe Prisma client with soft-delete support */');
   lines.push('export interface SafePrismaClient {');
@@ -75,7 +111,12 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push("  $connect: PrismaClient['$connect'];");
   lines.push("  $disconnect: PrismaClient['$disconnect'];");
   lines.push("  $on: PrismaClient['$on'];");
-  lines.push("  $transaction: PrismaClient['$transaction'];");
+  // Typed $transaction with SafeTransactionClient
+  lines.push('  /** Execute operations in a transaction with full soft-delete support */');
+  lines.push('  $transaction: {');
+  lines.push('    <R>(fn: (tx: SafeTransactionClient) => Promise<R>, options?: { maxWait?: number; timeout?: number; isolationLevel?: Prisma.TransactionIsolationLevel }): Promise<R>;');
+  lines.push('    <P extends Prisma.PrismaPromise<unknown>[]>(arg: [...P], options?: { isolationLevel?: Prisma.TransactionIsolationLevel }): Promise<Prisma.runtime.Types.Utils.UnwrapTuple<P>>;');
+  lines.push('  };');
   lines.push("  $use: PrismaClient['$use'];");
   lines.push("  $extends: PrismaClient['$extends'];");
   lines.push("  $queryRaw: PrismaClient['$queryRaw'];");
@@ -86,7 +127,7 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('  /** Access to underlying Prisma client for escape hatches */');
   lines.push('  $prisma: PrismaClient;');
   lines.push('');
-  lines.push('  /** Query including soft-deleted records */');
+  lines.push('  /** @deprecated Use model.includingDeleted instead (e.g., safePrisma.user.includingDeleted.findMany()) */');
   lines.push('  $includingDeleted: IncludingDeletedClient;');
   lines.push('');
   lines.push('  /** Query only soft-deleted records */');
@@ -94,8 +135,8 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('}');
   lines.push('');
 
-  // Generate IncludingDeletedClient type
-  lines.push('/** Client that includes soft-deleted records in queries */');
+  // Generate IncludingDeletedClient type (kept for backward compatibility)
+  lines.push('/** @deprecated Use model.includingDeleted instead */');
   lines.push('export interface IncludingDeletedClient {');
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);

@@ -51,3 +51,11 @@ model AuditLog {
   action    String
   createdAt DateTime @default(now())
 }
+
+// Model with deleted_by for testing compile-time deletedBy requirement
+model Customer {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  deleted_at DateTime?
+  deleted_by String?
+}
