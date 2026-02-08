@@ -43,10 +43,12 @@ export function collectModelsWithUniqueFields(schema: ParsedSchema): UniqueField
   const result: UniqueFieldInfo[] = [];
 
   for (const model of schema.models) {
-    if (model.isSoftDeletable && model.uniqueStringFields.length > 0 && model.deletedAtField !== null) {
+    // Use allUniqueFields (not just uniqueStringFields) because when uniqueStrategy='none',
+    // ALL unique fields need partial indexes, not just the string ones that would be mangled
+    if (model.isSoftDeletable && model.allUniqueFields.length > 0 && model.deletedAtField !== null) {
       result.push({
         model: model.name,
-        fields: model.uniqueStringFields,
+        fields: model.allUniqueFields,
         deletedAtField: model.deletedAtField,
       });
     }

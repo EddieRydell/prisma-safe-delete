@@ -955,7 +955,7 @@ async function restoreManyWithDelegate(
         if (existing) {
           throw new Error(
             \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
-            \`already exists in an active record. Restored \${restoredCount} record(s) before failure.\`
+            \`already exists in an active record. Delete or modify the conflicting record first.\`
           );
         }
       }

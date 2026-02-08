@@ -84,8 +84,8 @@ describe('collectModelsWithUniqueFields', () => {
     const result = collectModelsWithUniqueFields(schema);
 
     expect(result).toHaveLength(1);
-    expect(result[0].fields).toContain('email');
-    expect(result[0].fields).toContain('username');
+    expect(result[0]!.fields).toContain('email');
+    expect(result[0]!.fields).toContain('username');
   });
 
   it('collects from multiple models', () => {
@@ -132,7 +132,31 @@ describe('collectModelsWithUniqueFields', () => {
     const result = collectModelsWithUniqueFields(schema);
 
     expect(result).toHaveLength(1);
-    expect(result[0].deletedAtField).toBe('deletedAt');
+    expect(result[0]!.deletedAtField).toBe('deletedAt');
+  });
+
+  it('includes non-string unique fields (Int, UUID, etc.)', () => {
+    const models = [
+      createMockModel({
+        name: 'Employee',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'employeeNumber', type: 'Int', isUnique: true }),
+          createMockField({ name: 'externalId', type: 'String', isUnique: true, nativeType: ['Uuid', []] }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = collectModelsWithUniqueFields(schema);
+
+    expect(result).toHaveLength(1);
+    // allUniqueFields should include ALL unique fields, not just strings
+    expect(result[0]!.fields).toContain('email');
+    expect(result[0]!.fields).toContain('employeeNumber'); // Int field
+    expect(result[0]!.fields).toContain('externalId'); // UUID field
   });
 });
 
