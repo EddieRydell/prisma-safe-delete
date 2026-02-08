@@ -64,6 +64,12 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & ${deletedByType}) => Promise<Prisma.${name}GetPayload<{}>>;`);
     lines.push(`  /** Soft delete multiple ${name} records with cascade */`);
     lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & ${deletedByType}) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Restore a soft-deleted ${name} record (unmangles unique fields) */`);
+    lines.push(`  restore: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}> | null>;`);
+    lines.push(`  /** Restore multiple soft-deleted ${name} records */`);
+    lines.push(`  restoreMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Restore a soft-deleted ${name} record AND all cascade-deleted children (matched by deleted_at timestamp) */`);
+    lines.push(`  restoreCascade: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}> | null>;`);
     lines.push(`  /** Hard delete a single ${name} record (PERMANENT - bypasses soft delete) */`);
     lines.push(`  __dangerousHardDelete: (args: Prisma.${name}DeleteArgs) => Promise<Prisma.${name}GetPayload<{}>>;`);
     lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);

@@ -39,6 +39,8 @@ export interface ParsedModel {
   relations: ParsedRelation[];
   /** String fields with @unique or part of @@unique that need mangling on soft delete */
   uniqueStringFields: string[];
+  /** All fields with @unique or part of @@unique (for partial index warnings) */
+  allUniqueFields: string[];
 }
 
 /**
@@ -203,6 +205,31 @@ function extractUniqueStringFields(model: DMMFModel): string[] {
 }
 
 /**
+ * Extracts ALL unique fields from a model (not just strings).
+ * Used for warning users about partial indexes needed when uniqueStrategy='none'.
+ */
+function extractAllUniqueFields(model: DMMFModel): string[] {
+  const uniqueFields = new Set<string>();
+
+  // Find all fields with @unique (any type)
+  for (const field of model.fields) {
+    if (field.isUnique && field.relationName === undefined) {
+      uniqueFields.add(field.name);
+    }
+  }
+
+  // Find all fields in @@unique compound constraints
+  for (const uniqueConstraint of model.uniqueFields) {
+    for (const fieldName of uniqueConstraint) {
+      uniqueFields.add(fieldName);
+    }
+  }
+
+  // Return sorted for deterministic output
+  return [...uniqueFields].sort();
+}
+
+/**
  * Parses a single DMMF model into our ParsedModel format
  */
 function parseModel(model: DMMFModel): ParsedModel {
@@ -247,6 +274,7 @@ function parseModel(model: DMMFModel): ParsedModel {
     fields,
     relations,
     uniqueStringFields: extractUniqueStringFields(model),
+    allUniqueFields: extractAllUniqueFields(model),
   };
 }
 

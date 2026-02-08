@@ -54,7 +54,7 @@ describe('E2E: Real database tests', () => {
     wrapPrismaClient = softCascadeModule.wrapPrismaClient;
 
     // Create pg pool and Prisma adapter (Prisma 7 requirement)
-    const connectionString = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/test';
+    const connectionString = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5433/test';
     pool = new pg.Pool({ connectionString });
     const adapter = new PrismaPg(pool);
 
@@ -2105,6 +2105,488 @@ describe('E2E: Real database tests', () => {
       // NOTE: Fluent API would NOT filter:
       // const posts = await safePrisma.user.findUnique({ where: { id: 'u1' } }).posts();
       // This would return BOTH posts because fluent API bypasses the wrapper
+    });
+  });
+
+  describe('Restore functionality', () => {
+    describe('Basic restore', () => {
+      it('restore returns null for non-existent record', async () => {
+        const result = await safePrisma.user.restore({
+          where: { id: 'non-existent-id' },
+        });
+        expect(result).toBeNull();
+      });
+
+      it('restore returns null for non-deleted record', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'active@test.com' },
+        });
+
+        const result = await safePrisma.user.restore({
+          where: { id: 'u1' },
+        });
+        expect(result).toBeNull();
+      });
+
+      it('restore sets deleted_at to null', async () => {
+        const deletedAt = new Date();
+        await prisma.user.create({
+          data: { id: 'u1', email: 'deleted@test.com', deleted_at: deletedAt },
+        });
+
+        const restored = await safePrisma.user.restore({
+          where: { id: 'u1' },
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored.deleted_at).toBeNull();
+
+        // Verify it's now visible in normal queries
+        const found = await safePrisma.user.findUnique({ where: { id: 'u1' } });
+        expect(found).not.toBeNull();
+      });
+
+      it('restore unmangles unique string fields', async () => {
+        // Create and soft-delete a customer (which mangles unique fields)
+        await prisma.customer.create({
+          data: { id: 'c1', email: 'john@test.com', username: 'johndoe' },
+        });
+        await safePrisma.customer.softDelete({ where: { id: 'c1' } });
+
+        // Verify fields are mangled
+        const deleted = await prisma.customer.findUnique({ where: { id: 'c1' } });
+        expect(deleted.email).toContain('__deleted_');
+        expect(deleted.username).toContain('__deleted_');
+
+        // Restore
+        const restored = await safePrisma.customer.restore({ where: { id: 'c1' } });
+
+        expect(restored.email).toBe('john@test.com');
+        expect(restored.username).toBe('johndoe');
+        expect(restored.deleted_at).toBeNull();
+      });
+
+      it('restore clears deleted_by field', async () => {
+        await prisma.customer.create({
+          data: {
+            id: 'c1',
+            email: 'john@test.com',
+            username: 'johndoe',
+            deleted_at: new Date(),
+            deleted_by: 'admin-user',
+          },
+        });
+
+        const restored = await safePrisma.customer.restore({ where: { id: 'c1' } });
+
+        expect(restored.deleted_at).toBeNull();
+        expect(restored.deleted_by).toBeNull();
+      });
+
+      it('restoreMany restores multiple records', async () => {
+        const deletedAt = new Date();
+        await prisma.user.createMany({
+          data: [
+            { id: 'u1', email: 'user1@test.com', name: 'Test', deleted_at: deletedAt },
+            { id: 'u2', email: 'user2@test.com', name: 'Test', deleted_at: deletedAt },
+            { id: 'u3', email: 'user3@test.com', name: 'Other', deleted_at: deletedAt },
+          ],
+        });
+
+        const result = await safePrisma.user.restoreMany({
+          where: { name: 'Test' },
+        });
+
+        expect(result.count).toBe(2);
+
+        // Verify restored users are visible
+        const users = await safePrisma.user.findMany({ where: { name: 'Test' } });
+        expect(users).toHaveLength(2);
+      });
+    });
+
+    describe('Restore conflict handling', () => {
+      it('restore throws on unique field conflict', async () => {
+        // Create an active customer with email
+        await prisma.customer.create({
+          data: { id: 'c-active', email: 'john@test.com', username: 'johndoe' },
+        });
+
+        // Create a soft-deleted customer with same email (mangled)
+        await prisma.customer.create({
+          data: {
+            id: 'c-deleted',
+            email: 'john@test.com__deleted_c-deleted',
+            username: 'johndoe2__deleted_c-deleted',
+            deleted_at: new Date(),
+          },
+        });
+
+        // Try to restore - should fail because email would conflict
+        await expect(
+          safePrisma.customer.restore({ where: { id: 'c-deleted' } })
+        ).rejects.toThrow(/unique field "email".*already exists/);
+      });
+
+      it('restoreMany throws on conflict and rolls back', async () => {
+        // Create active customer with email
+        await prisma.customer.create({
+          data: { id: 'c-active', email: 'taken@test.com', username: 'taken' },
+        });
+
+        // Create two soft-deleted customers
+        await prisma.customer.create({
+          data: {
+            id: 'c1',
+            email: 'safe@test.com__deleted_c1',
+            username: 'safe__deleted_c1',
+            name: 'ToRestore',
+            deleted_at: new Date(),
+          },
+        });
+        await prisma.customer.create({
+          data: {
+            id: 'c2',
+            email: 'taken@test.com__deleted_c2', // This will conflict
+            username: 'user2__deleted_c2',
+            name: 'ToRestore',
+            deleted_at: new Date(),
+          },
+        });
+
+        // Try to restore both - should fail on second one
+        await expect(
+          safePrisma.customer.restoreMany({ where: { name: 'ToRestore' } })
+        ).rejects.toThrow(/unique field.*already exists/);
+
+        // Verify first one was rolled back (still deleted)
+        const c1 = await prisma.customer.findUnique({ where: { id: 'c1' } });
+        expect(c1.deleted_at).not.toBeNull();
+      });
+    });
+
+    describe('Restore with compound primary key', () => {
+      it('restore works with compound primary key', async () => {
+        await prisma.tenantUser.create({
+          data: {
+            tenantId: 't1',
+            userId: 'u1',
+            email: 'user@tenant.com',
+            deleted_at: new Date(),
+          },
+        });
+
+        const restored = await safePrisma.tenantUser.restore({
+          where: { tenantId_userId: { tenantId: 't1', userId: 'u1' } },
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored.deleted_at).toBeNull();
+      });
+    });
+
+    describe('Restore in transaction', () => {
+      it('restore works in transaction context', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'tx@test.com', deleted_at: new Date() },
+        });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const restored = await tx.user.restore({ where: { id: 'u1' } });
+          expect(restored.deleted_at).toBeNull();
+        });
+
+        // Verify persisted
+        const user = await safePrisma.user.findUnique({ where: { id: 'u1' } });
+        expect(user).not.toBeNull();
+      });
+    });
+  });
+
+  describe('Restore cascade functionality', () => {
+    describe('Basic cascade restore', () => {
+      it('restoreCascade restores parent and children with same timestamp', async () => {
+        // Soft delete a user with posts and comments (cascade)
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'cascade@test.com',
+            posts: {
+              create: [
+                {
+                  id: 'p1',
+                  title: 'Post 1',
+                  comments: {
+                    create: [
+                      { id: 'c1', content: 'Comment 1' },
+                      { id: 'c2', content: 'Comment 2' },
+                    ],
+                  },
+                },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        // Verify all are deleted with same timestamp
+        const deletedUser = await prisma.user.findUnique({ where: { id: 'u1' } });
+        const deletedPost = await prisma.post.findUnique({ where: { id: 'p1' } });
+        const deletedComment = await prisma.comment.findUnique({ where: { id: 'c1' } });
+        expect(deletedUser.deleted_at).not.toBeNull();
+        expect(deletedPost.deleted_at?.getTime()).toBe(deletedUser.deleted_at?.getTime());
+        expect(deletedComment.deleted_at?.getTime()).toBe(deletedUser.deleted_at?.getTime());
+
+        // Restore with cascade
+        const restored = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+        expect(restored).not.toBeNull();
+        expect(restored.deleted_at).toBeNull();
+
+        // Verify all children are restored
+        const posts = await safePrisma.post.findMany({ where: { authorId: 'u1' } });
+        expect(posts).toHaveLength(2);
+
+        const comments = await safePrisma.comment.findMany({ where: { postId: 'p1' } });
+        expect(comments).toHaveLength(2);
+      });
+
+      it('restoreCascade only restores children with matching timestamp', async () => {
+        // Create user with posts
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'partial@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        // Soft delete post 1 independently first
+        await safePrisma.post.softDelete({ where: { id: 'p1' } });
+        const independentlyDeletedPost = await prisma.post.findUnique({ where: { id: 'p1' } });
+        const independentTimestamp = independentlyDeletedPost.deleted_at;
+
+        // Wait a tiny bit to ensure different timestamp
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Soft delete user (will cascade to post 2)
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        // Restore user with cascade
+        await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+
+        // Post 2 should be restored (same timestamp as user)
+        const post2 = await safePrisma.post.findUnique({ where: { id: 'p2' } });
+        expect(post2).not.toBeNull();
+
+        // Post 1 should still be deleted (different timestamp)
+        const post1 = await prisma.post.findUnique({ where: { id: 'p1' } });
+        expect(post1.deleted_at?.getTime()).toBe(independentTimestamp?.getTime());
+      });
+
+      it('restoreCascade returns null for non-deleted record', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'active@test.com' },
+        });
+
+        const result = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+        expect(result).toBeNull();
+      });
+    });
+
+    describe('Deep hierarchy cascade restore', () => {
+      it('restoreCascade handles 4-level deep hierarchy', async () => {
+        // Create: Category -> Product -> ProductVariant -> VariantOption
+        await prisma.category.create({
+          data: {
+            id: 'cat1',
+            name: 'Electronics',
+            products: {
+              create: {
+                id: 'prod1',
+                name: 'Phone',
+                variants: {
+                  create: {
+                    id: 'var1',
+                    sku: 'PHN-001',
+                    options: {
+                      create: [
+                        { id: 'opt1', name: 'Color', value: 'Black' },
+                        { id: 'opt2', name: 'Storage', value: '128GB' },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        // Soft delete category (cascades through all levels)
+        await safePrisma.category.softDelete({ where: { id: 'cat1' } });
+
+        // Verify all deleted
+        expect((await prisma.category.findUnique({ where: { id: 'cat1' } })).deleted_at).not.toBeNull();
+        expect((await prisma.product.findUnique({ where: { id: 'prod1' } })).deleted_at).not.toBeNull();
+        expect((await prisma.productVariant.findUnique({ where: { id: 'var1' } })).deleted_at).not.toBeNull();
+        expect((await prisma.variantOption.findUnique({ where: { id: 'opt1' } })).deleted_at).not.toBeNull();
+
+        // Restore with cascade
+        await safePrisma.category.restoreCascade({ where: { id: 'cat1' } });
+
+        // Verify all restored
+        const cat = await safePrisma.category.findUnique({ where: { id: 'cat1' } });
+        const prod = await safePrisma.product.findUnique({ where: { id: 'prod1' } });
+        const variant = await safePrisma.productVariant.findUnique({ where: { id: 'var1' } });
+        const options = await safePrisma.variantOption.findMany({ where: { variantId: 'var1' } });
+
+        expect(cat).not.toBeNull();
+        expect(prod).not.toBeNull();
+        expect(variant).not.toBeNull();
+        expect(options).toHaveLength(2);
+      });
+    });
+
+    describe('Self-referential cascade restore', () => {
+      it('restoreCascade handles self-referential model', async () => {
+        // Create category hierarchy: Root -> Child -> Grandchild
+        await prisma.category.create({
+          data: {
+            id: 'root',
+            name: 'Root',
+            children: {
+              create: {
+                id: 'child',
+                name: 'Child',
+                children: {
+                  create: { id: 'grandchild', name: 'Grandchild' },
+                },
+              },
+            },
+          },
+        });
+
+        // Soft delete root (cascades to children)
+        await safePrisma.category.softDelete({ where: { id: 'root' } });
+
+        // Verify all deleted
+        expect((await prisma.category.findUnique({ where: { id: 'root' } })).deleted_at).not.toBeNull();
+        expect((await prisma.category.findUnique({ where: { id: 'child' } })).deleted_at).not.toBeNull();
+        expect((await prisma.category.findUnique({ where: { id: 'grandchild' } })).deleted_at).not.toBeNull();
+
+        // Restore root with cascade
+        await safePrisma.category.restoreCascade({ where: { id: 'root' } });
+
+        // Verify all restored
+        const categories = await safePrisma.category.findMany();
+        expect(categories).toHaveLength(3);
+      });
+    });
+
+    describe('Cascade restore conflict handling', () => {
+      it('restoreCascade rolls back on child conflict', async () => {
+        // Create customer with orders
+        await prisma.customer.create({
+          data: {
+            id: 'cust1',
+            email: 'customer@test.com',
+            username: 'customer1',
+            orders: {
+              create: { id: 'ord1', orderNumber: 'ORD-001' },
+            },
+          },
+        });
+
+        // Soft delete customer (cascades to orders)
+        await safePrisma.customer.softDelete({ where: { id: 'cust1' } });
+
+        // Create a new order with the same orderNumber (conflict)
+        await prisma.order.create({
+          data: {
+            id: 'ord-new',
+            orderNumber: 'ORD-001',
+            customerId: 'cust1', // FK still valid since customer exists (just soft-deleted)
+          },
+        });
+
+        // Try to restore customer with cascade - should fail due to order conflict
+        await expect(
+          safePrisma.customer.restoreCascade({ where: { id: 'cust1' } })
+        ).rejects.toThrow(/unique field.*already exists/);
+
+        // Verify customer was rolled back (still deleted)
+        const customer = await prisma.customer.findUnique({ where: { id: 'cust1' } });
+        expect(customer.deleted_at).not.toBeNull();
+      });
+    });
+
+    describe('Cascade restore with unique field unmangling', () => {
+      it('restoreCascade unmangles unique fields at all levels', async () => {
+        // Create customer with orders (both have unique string fields)
+        await prisma.customer.create({
+          data: {
+            id: 'cust1',
+            email: 'cascade@test.com',
+            username: 'cascadeuser',
+            orders: {
+              create: { id: 'ord1', orderNumber: 'CASCADE-001' },
+            },
+          },
+        });
+
+        // Soft delete (mangles unique fields)
+        await safePrisma.customer.softDelete({ where: { id: 'cust1' } });
+
+        // Verify mangled
+        const deletedCustomer = await prisma.customer.findUnique({ where: { id: 'cust1' } });
+        const deletedOrder = await prisma.order.findUnique({ where: { id: 'ord1' } });
+        expect(deletedCustomer.email).toContain('__deleted_');
+        expect(deletedOrder.orderNumber).toContain('__deleted_');
+
+        // Restore with cascade
+        await safePrisma.customer.restoreCascade({ where: { id: 'cust1' } });
+
+        // Verify unmangled
+        const customer = await safePrisma.customer.findUnique({ where: { id: 'cust1' } });
+        const order = await safePrisma.order.findUnique({ where: { id: 'ord1' } });
+
+        expect(customer.email).toBe('cascade@test.com');
+        expect(customer.username).toBe('cascadeuser');
+        expect(order.orderNumber).toBe('CASCADE-001');
+      });
+    });
+
+    describe('Cascade restore in transaction', () => {
+      it('restoreCascade works in transaction context', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'txcascade@test.com',
+            posts: {
+              create: { id: 'p1', title: 'Post' },
+            },
+          },
+        });
+
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const restored = await tx.user.restoreCascade({ where: { id: 'u1' } });
+          expect(restored.deleted_at).toBeNull();
+        });
+
+        // Verify both restored
+        const user = await safePrisma.user.findUnique({ where: { id: 'u1' } });
+        const post = await safePrisma.post.findUnique({ where: { id: 'p1' } });
+        expect(user).not.toBeNull();
+        expect(post).not.toBeNull();
+      });
     });
   });
 });
