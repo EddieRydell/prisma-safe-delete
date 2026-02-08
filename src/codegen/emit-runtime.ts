@@ -756,7 +756,10 @@ function create${name}Delegate(prisma: PrismaClient): any {
     updateMany: (args: any) => original.updateMany(args),
     upsert: (args: any) => original.upsert(args),
 
-    // Soft delete methods (deletedBy requirement enforced at compile-time via types)
+    // Soft delete methods
+    // NOTE: deletedBy requirement is enforced at COMPILE-TIME only via TypeScript types.
+    // There is no runtime validation - callers bypassing TypeScript (e.g., plain JS) must
+    // ensure they pass deletedBy for models with deleted_by fields.
     softDelete: async (args: any) => {
       const { deletedBy, ...rest } = args;
       await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
@@ -889,7 +892,7 @@ function emitTransactionWrapper(schema: ParsedSchema): string {
       lines.push(`      update: (args: any) => tx.${lowerName}.update(args),`);
       lines.push(`      updateMany: (args: any) => tx.${lowerName}.updateMany(args),`);
       lines.push(`      upsert: (args: any) => tx.${lowerName}.upsert(args),`);
-      // Soft delete methods (using in-transaction cascade, deletedBy enforced at compile-time)
+      // Soft delete methods (compile-time only validation - no runtime checks for deletedBy)
       lines.push(`      softDelete: async (args: any) => {`);
       lines.push(`        const { deletedBy, ...rest } = args;`);
       lines.push(`        await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);

@@ -45,7 +45,9 @@ function emitModelTypes(model: ParsedModel): string[] {
   const lowerName = toLowerFirst(name);
 
   if (model.isSoftDeletable) {
-    // deletedBy is required if model has deleted_by field, optional otherwise
+    // deletedBy is required if model has deleted_by field, optional otherwise.
+    // NOTE: This is COMPILE-TIME enforcement only via TypeScript. No runtime validation.
+    // Plain JavaScript callers must ensure they pass deletedBy appropriately.
     const deletedByType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
 
     // Emit includingDeleted delegate type first
