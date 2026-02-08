@@ -56,6 +56,7 @@
     "url": "https://github.com/EddieRydell/prisma-safe-delete/issues"
   },
   "peerDependencies": {
+    "@prisma/generator-helper": ">=7.0.0",
     "prisma": ">=7.0.0"
   },
   "devDependencies": {
