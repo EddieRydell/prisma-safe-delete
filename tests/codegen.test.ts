@@ -377,8 +377,8 @@ describe('emitRuntime', () => {
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
     // Both User and Post delegates should inject filters on update/updateMany
-    expect(output).toContain("update: (args: any) => original.update(injectFilters(args, 'User'))");
-    expect(output).toContain("updateMany: (args: any) => original.updateMany(injectFilters(args, 'User'))");
+    expect(output).toContain("update: ((args: any) => original.update(injectFilters(args, 'User'))) as PrismaClient['user']['update']");
+    expect(output).toContain("updateMany: ((args: any) => original.updateMany(injectFilters(args, 'User'))) as PrismaClient['user']['updateMany']");
   });
 
   it('model with unique string fields but no children uses complex path with mangle strategy', () => {
