@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Removed `@ts-nocheck` from generated `runtime.ts` and `types.ts`, replacing blanket type suppression with explicit type casts that preserve Prisma's full generic signatures for consumers
+
 ## [0.2.0] - 2025-02-08
 
 ### Added
