@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Raw query methods (`$queryRaw`, `$executeRaw`, `$queryRawUnsafe`, `$executeRawUnsafe`) are now available in transaction contexts via `SafeTransactionClient`
+
+### Fixed
+- `softDelete` return type now correctly declares `record` as nullable (`| null`), matching runtime behavior where `record` is `null` if the target record does not exist
+
 ### Changed
 - Removed `@ts-nocheck` from generated `runtime.ts` and `types.ts`, replacing blanket type suppression with explicit type casts that preserve Prisma's full generic signatures for consumers
 
