@@ -32,8 +32,9 @@ describe('Integration: prisma generate', () => {
 
   it('generates valid TypeScript that compiles', () => {
     // Run tsc on the generated files - throws if compilation fails
+    // --noUnusedLocals catches dead code in generated output
     execSync(
-      `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 ${path.join(generatedDir, 'index.ts')}`,
+      `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --noUnusedLocals ${path.join(generatedDir, 'index.ts')}`,
       {
         cwd: integrationDir,
         stdio: 'pipe',
