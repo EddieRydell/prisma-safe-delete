@@ -141,7 +141,7 @@ describe('emitTypes', () => {
     const output = emitTypes(schema, TEST_CLIENT_PATH);
 
     expect(output).toContain('softDelete: (args: Prisma.UserDeleteArgs');
-    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}>; cascaded: CascadeResult }>');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}> | null; cascaded: CascadeResult }>');
     expect(output).toContain('softDeleteMany: (args: Prisma.UserDeleteManyArgs');
     expect(output).toContain('Promise<{ count: number; cascaded: CascadeResult }>');
     expect(output).toContain('restoreCascade: (args: Prisma.UserDeleteArgs)');
@@ -377,8 +377,8 @@ describe('emitRuntime', () => {
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
     // Both User and Post delegates should inject filters on update/updateMany
-    expect(output).toContain("update: (args: any) => original.update(injectFilters(args, 'User'))");
-    expect(output).toContain("updateMany: (args: any) => original.updateMany(injectFilters(args, 'User'))");
+    expect(output).toContain("update: ((args: any) => original.update(injectFilters(args, 'User'))) as PrismaClient['user']['update']");
+    expect(output).toContain("updateMany: ((args: any) => original.updateMany(injectFilters(args, 'User'))) as PrismaClient['user']['updateMany']");
   });
 
   it('model with unique string fields but no children uses complex path with mangle strategy', () => {
