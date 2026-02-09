@@ -783,7 +783,7 @@ async function softDeleteWithCascade(
  * Performs a soft delete with cascade within an existing transaction
  */
 async function softDeleteWithCascadeInTx(
-  tx: any,
+  tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>,
   deletedBy?: string
@@ -857,7 +857,7 @@ function getDeletedByField(modelName: string): string | null {
  * Recursively cascades soft delete to children
  */
 async function cascadeToChildren(
-  tx: any,
+  tx: Prisma.TransactionClient,
   parentModel: string,
   parentPkValues: Record<string, unknown>[],
   deletedAt: Date,
@@ -959,7 +959,7 @@ async function restoreRecord(
  * Restores a soft-deleted record within a transaction.
  */
 async function restoreRecordInTx(
-  tx: any,
+  tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>
 ): Promise<Record<string, unknown> | null> {
@@ -1055,7 +1055,7 @@ async function restoreManyRecords(
  * Restores multiple soft-deleted records within a transaction.
  */
 async function restoreManyInTx(
-  tx: any,
+  tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>
 ): Promise<{ count: number }> {
@@ -1154,7 +1154,7 @@ async function restoreWithCascade(
  * Restores a soft-deleted record AND all its cascade-deleted children within a transaction.
  */
 async function restoreWithCascadeInTx(
-  tx: any,
+  tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>
 ): Promise<{ record: Record<string, unknown> | null; cascaded: Record<string, number> }> {
@@ -1230,7 +1230,7 @@ async function restoreWithCascadeInTx(
  * Only restores children with matching deleted_at timestamp.
  */
 async function restoreCascadeChildren(
-  tx: any,
+  tx: Prisma.TransactionClient,
   parentModel: string,
   parentPkValues: Record<string, unknown>[],
   deletedAt: Date
@@ -1345,7 +1345,7 @@ async function previewSoftDelete(
  * Previews a soft delete with cascade within an existing transaction (read-only)
  */
 async function previewSoftDeleteInTx(
-  tx: any,
+  tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>
 ): Promise<{ wouldDelete: Record<string, number> }> {
@@ -1386,7 +1386,7 @@ async function previewSoftDeleteInTx(
  * Recursively previews cascade soft delete to children (read-only, no writes)
  */
 async function previewCascadeChildren(
-  tx: any,
+  tx: Prisma.TransactionClient,
   parentModel: string,
   parentPkValues: Record<string, unknown>[]
 ): Promise<Record<string, number>> {
@@ -1662,7 +1662,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
   lines.push('/**');
   lines.push(' * Wraps a transaction client with soft-delete filtering and full API');
   lines.push(' */');
-  lines.push('function wrapTransactionClient(tx: any): SafeTransactionClient {');
+  lines.push('function wrapTransactionClient(tx: Prisma.TransactionClient): SafeTransactionClient {');
   lines.push('  return {');
 
   for (const model of schema.models) {
@@ -1855,7 +1855,7 @@ function emitWrapperFunction(schema: ParsedSchema): string {
   lines.push('      // Handle both sequential and interactive transactions');
   lines.push('      if (typeof arg === "function") {');
   lines.push('        // Interactive transaction - wrap the callback to provide safe delegates');
-  lines.push('        return prisma.$transaction((tx: any) => {');
+  lines.push('        return prisma.$transaction((tx: Prisma.TransactionClient) => {');
   lines.push('          const wrappedTx = wrapTransactionClient(tx);');
   lines.push('          return arg(wrappedTx);');
   lines.push('        }, options);');
