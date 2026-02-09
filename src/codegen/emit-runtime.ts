@@ -1503,8 +1503,6 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       groupBy: ((args?: any) => original.groupBy(args)) as PrismaClient['${lowerName}']['groupBy'],
     },`;
 
-    const deletedByType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
-
     let softDeleteMethods: string;
     let previewMethod: string;
 
@@ -1672,8 +1670,6 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
     if (model.isSoftDeletable && model.deletedAtField !== null) {
       const simple = isSimpleModel(model, options);
       const deletedAtField = model.deletedAtField;
-      const deletedByType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
-
       lines.push(`    ${lowerName}: {`);
       // Read operations with filter injection
       lines.push(`      findMany: ((...args: any[]) => tx.${lowerName}.findMany(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findMany'],`);
