@@ -65,7 +65,7 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  'delete' | 'deleteMany'`);
     lines.push(`> & {`);
     lines.push(`  /** Soft delete a single ${name} record with cascade */`);
-    lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & ${deletedByType}) => Promise<{ record: Prisma.${name}GetPayload<{}>; cascaded: CascadeResult }>;`);
+    lines.push(`  softDelete: (args: Prisma.${name}DeleteArgs & ${deletedByType}) => Promise<{ record: Prisma.${name}GetPayload<{}> | null; cascaded: CascadeResult }>;`);
     lines.push(`  /** Soft delete multiple ${name} records with cascade */`);
     lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & ${deletedByType}) => Promise<{ count: number; cascaded: CascadeResult }>;`);
     lines.push(`  /** Preview what would be soft deleted (read-only, no writes) */`);
@@ -112,6 +112,12 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('');
   lines.push('  /** Query including soft-deleted records with filter propagation */');
   lines.push('  $includingDeleted: IncludingDeletedClient;');
+  lines.push('');
+  lines.push('  // Raw query methods');
+  lines.push("  $queryRaw: PrismaClient['$queryRaw'];");
+  lines.push("  $executeRaw: PrismaClient['$executeRaw'];");
+  lines.push("  $queryRawUnsafe: PrismaClient['$queryRawUnsafe'];");
+  lines.push("  $executeRawUnsafe: PrismaClient['$executeRawUnsafe'];");
   lines.push('}');
   lines.push('');
 

@@ -262,7 +262,10 @@ async function test() {
   // Must be able to access .record and .cascaded
   const record = result.record;
   const cascaded: CascadeResult = result.cascaded;
-  const email: string = record.email;
+  // record is nullable (null when not found)
+  if (record) {
+    const email: string = record.email;
+  }
   const count: number = cascaded['Post'] ?? 0;
 }
 `);

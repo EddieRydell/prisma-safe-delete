@@ -1822,6 +1822,12 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
     }
   }
   lines.push('    },');
+  lines.push('');
+  lines.push('    // Raw query methods');
+  lines.push("    $queryRaw: (tx.$queryRaw as any).bind(tx) as PrismaClient['$queryRaw'],");
+  lines.push("    $executeRaw: (tx.$executeRaw as any).bind(tx) as PrismaClient['$executeRaw'],");
+  lines.push("    $queryRawUnsafe: (tx.$queryRawUnsafe as any).bind(tx) as PrismaClient['$queryRawUnsafe'],");
+  lines.push("    $executeRawUnsafe: (tx.$executeRawUnsafe as any).bind(tx) as PrismaClient['$executeRawUnsafe'],");
 
   lines.push('  };');
   lines.push('}');

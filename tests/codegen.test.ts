@@ -141,7 +141,7 @@ describe('emitTypes', () => {
     const output = emitTypes(schema, TEST_CLIENT_PATH);
 
     expect(output).toContain('softDelete: (args: Prisma.UserDeleteArgs');
-    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}>; cascaded: CascadeResult }>');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}> | null; cascaded: CascadeResult }>');
     expect(output).toContain('softDeleteMany: (args: Prisma.UserDeleteManyArgs');
     expect(output).toContain('Promise<{ count: number; cascaded: CascadeResult }>');
     expect(output).toContain('restoreCascade: (args: Prisma.UserDeleteArgs)');
