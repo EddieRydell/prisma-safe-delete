@@ -6,5 +6,5 @@
     "noPropertyAccessFromIndexSignature": false
   },
   "include": ["src", "tests"],
-  "exclude": ["node_modules", "dist", "tests/integration/generated", "tests/e2e/generated"]
+  "exclude": ["node_modules", "dist", "tests/integration/generated", "tests/e2e/generated", "tests/e2e-sentinel/generated", "tests/e2e-none/generated"]
 }

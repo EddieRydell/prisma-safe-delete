@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider        = "node ../../dist/bin.js"
+  output          = "./generated/soft-cascade"
+  uniqueStrategy  = "none"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  name       String?
+  deleted_at DateTime?
+  posts      Post[]
+  createdAt  DateTime  @default(now())
+}
+
+model Post {
+  id         String    @id @default(cuid())
+  title      String
+  content    String?
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments   Comment[]
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+}
+
+model Comment {
+  id         String    @id @default(cuid())
+  content    String
+  postId     String
+  post       Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+  createdAt  DateTime  @default(now())
+}
+
+model Customer {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  name       String?
+  deleted_at DateTime?
+  deleted_by String?
+}

@@ -178,7 +178,7 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   for (const model of schema.models) {
     if (model.isSoftDeletable) {
       const lowerName = toLowerFirst(model.name);
-      lines.push(`  ${lowerName}: Pick<PrismaClient['${lowerName}'], 'findMany' | 'findFirst' | 'findUnique' | 'count'>;`);
+      lines.push(`  ${lowerName}: Pick<PrismaClient['${lowerName}'], 'findMany' | 'findFirst' | 'findFirstOrThrow' | 'findUnique' | 'findUniqueOrThrow' | 'count' | 'aggregate' | 'groupBy'>;`);
     }
   }
   lines.push('}');

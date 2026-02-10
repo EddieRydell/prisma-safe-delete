@@ -487,33 +487,44 @@ function transformSentinelFindUniqueWhere(
   const compoundUniques = SENTINEL_COMPOUND_UNIQUES[modelName];
   if (!compoundUniques || compoundUniques.length === 0) return where;
 
+  let result: Record<string, unknown> = { ...where };
+  const consumedFields = new Set<string>();
+
   for (const { keyName, fields, deletedAtField } of compoundUniques) {
     // Skip if already in compound form
-    if (keyName in where) continue;
+    if (keyName in result) continue;
 
-    // Check if all non-deleted_at fields are present in where
-    const allFieldsPresent = fields.every((f: string) => f in where);
+    // Check if all non-deleted_at fields are present in result and not yet consumed
+    const nonDeletedAtFields = fields.filter((f: string) => f !== deletedAtField);
+    const allFieldsPresent = nonDeletedAtFields.every((f: string) => f in result && !consumedFields.has(f));
     if (!allFieldsPresent) continue;
 
     // Build the compound key value
     const compoundValue: Record<string, unknown> = {};
     for (const f of fields) {
-      compoundValue[f] = where[f];
-    }
-    compoundValue[deletedAtField] = ACTIVE_DELETED_AT_VALUE;
-
-    // Remove the individual fields and add the compound key
-    const newWhere: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(where)) {
-      if (!fields.includes(k)) {
-        newWhere[k] = v;
+      if (f === deletedAtField) {
+        compoundValue[f] = ACTIVE_DELETED_AT_VALUE;
+      } else {
+        compoundValue[f] = result[f];
       }
     }
-    newWhere[keyName] = compoundValue;
-    return newWhere;
+
+    // Track consumed fields and remove them from result
+    for (const f of nonDeletedAtFields) {
+      consumedFields.add(f);
+    }
+
+    const newResult: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(result)) {
+      if (!consumedFields.has(k)) {
+        newResult[k] = v;
+      }
+    }
+    newResult[keyName] = compoundValue;
+    result = newResult;
   }
 
-  return where;
+  return result;
 }`.trim();
 }
 
@@ -879,26 +890,45 @@ async function softDeleteWithCascadeInTx(
   // Cascade to children (depth-first)
   const cascaded = await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
 
-  // Update parent records - mangle unique fields first, then set deleted_at
-  // For each record, we need to mangle unique fields individually
-  // because each record has its own PK suffix
-  for (const record of records) {
-    const pkVal = extractPrimaryKey(modelName, record);
-    const mangledFields = mangleUniqueFields(modelName, record);
+  // Update parent records
+  const needsMangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(modelName).length > 0);
 
-    const updateData: Record<string, unknown> = {
-      ...mangledFields,
+  if (needsMangling) {
+    // Per-record update: mangle unique fields individually (each record has its own PK suffix)
+    for (const record of records) {
+      const pkVal = extractPrimaryKey(modelName, record);
+      const mangledFields = mangleUniqueFields(modelName, record);
+
+      const updateData: Record<string, unknown> = {
+        ...mangledFields,
+        [deletedAtField]: now,
+      };
+
+      const deletedByField = getDeletedByField(modelName);
+      if (deletedByField && deletedBy) {
+        updateData[deletedByField] = deletedBy;
+      }
+
+      await delegate.update({
+        where: createPkWhereFromValues(modelName, pkVal),
+        data: updateData,
+      });
+    }
+  } else {
+    // Bulk update: no mangling needed, use updateMany for all records at once
+    const bulkUpdateData: Record<string, unknown> = {
       [deletedAtField]: now,
     };
 
     const deletedByField = getDeletedByField(modelName);
     if (deletedByField && deletedBy) {
-      updateData[deletedByField] = deletedBy;
+      bulkUpdateData[deletedByField] = deletedBy;
     }
 
-    await delegate.update({
-      where: createPkWhereFromValues(modelName, pkVal),
-      data: updateData,
+    const pkConditions = pkValues;
+    await delegate.updateMany({
+      where: { OR: pkConditions, [deletedAtField]: ACTIVE_DELETED_AT_VALUE },
+      data: bulkUpdateData,
     });
   }
 
@@ -970,24 +1000,42 @@ async function cascadeToChildren(
 
     // Soft delete children (if soft-deletable)
     if (child.isSoftDeletable && child.deletedAtField) {
-      // Mangle unique fields for each child individually
-      for (const childRecord of childRecords) {
-        const childPkVal = extractPrimaryKey(child.model, childRecord);
-        const mangledFields = mangleUniqueFields(child.model, childRecord);
+      const childNeedsMangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
 
-        const updateData: Record<string, unknown> = {
-          ...mangledFields,
+      if (childNeedsMangling) {
+        // Per-record update: mangle unique fields for each child individually
+        for (const childRecord of childRecords) {
+          const childPkVal = extractPrimaryKey(child.model, childRecord);
+          const mangledFields = mangleUniqueFields(child.model, childRecord);
+
+          const updateData: Record<string, unknown> = {
+            ...mangledFields,
+            [child.deletedAtField]: deletedAt,
+          };
+
+          if (child.deletedByField && deletedBy) {
+            updateData[child.deletedByField] = deletedBy;
+          }
+
+          await childDelegate.update({
+            where: createPkWhereFromValues(child.model, childPkVal),
+            data: updateData,
+          });
+        }
+      } else {
+        // Bulk update: no mangling needed
+        const bulkUpdateData: Record<string, unknown> = {
           [child.deletedAtField]: deletedAt,
         };
 
-        // Set deleted_by if the child model has the field and a value was provided
         if (child.deletedByField && deletedBy) {
-          updateData[child.deletedByField] = deletedBy;
+          bulkUpdateData[child.deletedByField] = deletedBy;
         }
 
-        await childDelegate.update({
-          where: createPkWhereFromValues(child.model, childPkVal),
-          data: updateData,
+        const childPkConditions = childPkValues;
+        await childDelegate.updateMany({
+          where: { OR: childPkConditions, [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE },
+          data: bulkUpdateData,
         });
       }
 
@@ -1146,52 +1194,74 @@ async function restoreManyWithDelegate(
 
   if (records.length === 0) return { count: 0 };
 
-  // Check for conflicts and restore each record
   const deletedByField = getDeletedByField(modelName);
-  let restoredCount = 0;
+  const needsUnmangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(modelName).length > 0);
 
-  for (const record of records) {
-    const unmangledFields = unmangleUniqueFields(modelName, record);
+  if (needsUnmangling) {
+    // Per-record restore: unmangle unique fields individually and check conflicts
+    let restoredCount = 0;
 
-    // Check for conflicts
-    if (Object.keys(unmangledFields).length > 0) {
-      for (const [field, value] of Object.entries(unmangledFields)) {
-        const existing = await delegate.findFirst({
-          where: {
-            [field]: value,
-            [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-          },
-        });
+    for (const record of records) {
+      const unmangledFields = unmangleUniqueFields(modelName, record);
 
-        if (existing) {
-          throw new Error(
-            \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
-            \`already exists in an active record. Delete or modify the conflicting record first.\`
-          );
+      // Check for conflicts
+      if (Object.keys(unmangledFields).length > 0) {
+        for (const [field, value] of Object.entries(unmangledFields)) {
+          const existing = await delegate.findFirst({
+            where: {
+              [field]: value,
+              [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+            },
+          });
+
+          if (existing) {
+            throw new Error(
+              \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+              \`already exists in an active record. Delete or modify the conflicting record first.\`
+            );
+          }
         }
       }
+
+      const pkVal = extractPrimaryKey(modelName, record);
+      const updateData: Record<string, unknown> = {
+        ...unmangledFields,
+        [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+      };
+
+      if (deletedByField) {
+        updateData[deletedByField] = null;
+      }
+
+      await delegate.update({
+        where: createPkWhereFromValues(modelName, pkVal),
+        data: updateData,
+      });
+
+      restoredCount++;
     }
 
-    // Restore this record
-    const pkVal = extractPrimaryKey(modelName, record);
-    const updateData: Record<string, unknown> = {
-      ...unmangledFields,
+    return { count: restoredCount };
+  } else {
+    // Bulk restore: no unmangling needed
+    const bulkUpdateData: Record<string, unknown> = {
       [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
     };
 
     if (deletedByField) {
-      updateData[deletedByField] = null;
+      bulkUpdateData[deletedByField] = null;
     }
 
-    await delegate.update({
-      where: createPkWhereFromValues(modelName, pkVal),
-      data: updateData,
+    const pkConditions = records.map((r: Record<string, unknown>) =>
+      extractPrimaryKey(modelName, r)
+    );
+    const result = await delegate.updateMany({
+      where: { OR: pkConditions, [deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE } },
+      data: bulkUpdateData,
     });
 
-    restoredCount++;
+    return { count: result.count };
   }
-
-  return { count: restoredCount };
 }
 
 /**
@@ -1342,41 +1412,61 @@ async function restoreCascadeChildren(
     }
 
     // Now restore the children
-    for (const childRecord of childRecords) {
-      const childPkVal = extractPrimaryKey(child.model, childRecord);
-      const unmangledFields = unmangleUniqueFields(child.model, childRecord);
+    const childNeedsUnmangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
 
-      // Check for conflicts
-      if (Object.keys(unmangledFields).length > 0) {
-        for (const [field, value] of Object.entries(unmangledFields)) {
-          const existing = await childDelegate.findFirst({
-            where: {
-              [field]: value,
-              [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-            },
-          });
+    if (childNeedsUnmangling) {
+      // Per-record restore: unmangle unique fields individually
+      for (const childRecord of childRecords) {
+        const childPkVal = extractPrimaryKey(child.model, childRecord);
+        const unmangledFields = unmangleUniqueFields(child.model, childRecord);
 
-          if (existing) {
-            throw new Error(
-              \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
-              \`already exists in an active record.\`
-            );
+        // Check for conflicts
+        if (Object.keys(unmangledFields).length > 0) {
+          for (const [field, value] of Object.entries(unmangledFields)) {
+            const existing = await childDelegate.findFirst({
+              where: {
+                [field]: value,
+                [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+              },
+            });
+
+            if (existing) {
+              throw new Error(
+                \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
+                \`already exists in an active record.\`
+              );
+            }
           }
         }
-      }
 
-      const updateData: Record<string, unknown> = {
-        ...unmangledFields,
+        const updateData: Record<string, unknown> = {
+          ...unmangledFields,
+          [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+        };
+
+        if (child.deletedByField) {
+          updateData[child.deletedByField] = null;
+        }
+
+        await childDelegate.update({
+          where: createPkWhereFromValues(child.model, childPkVal),
+          data: updateData,
+        });
+      }
+    } else {
+      // Bulk restore: no unmangling needed
+      const bulkUpdateData: Record<string, unknown> = {
         [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
       };
 
       if (child.deletedByField) {
-        updateData[child.deletedByField] = null;
+        bulkUpdateData[child.deletedByField] = null;
       }
 
-      await childDelegate.update({
-        where: createPkWhereFromValues(child.model, childPkVal),
-        data: updateData,
+      const childPkConditions = childPkValues;
+      await childDelegate.updateMany({
+        where: { OR: childPkConditions, [child.deletedAtField]: deletedAt },
+        data: bulkUpdateData,
       });
     }
 
@@ -1558,9 +1648,12 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
 
     const upsertMethod = options.uniqueStrategy === 'sentinel'
       ? `
-    upsert: ((args: any) => original.upsert({ ...args, create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['upsert'],`
+    upsert: ((args: any) => original.upsert(injectFilters({
+      ...args,
+      create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }
+    }, '${name}'))) as PrismaClient['${lowerName}']['upsert'],`
       : `
-    upsert: ((args: any) => original.upsert(args)) as PrismaClient['${lowerName}']['upsert'],`;
+    upsert: ((args: any) => original.upsert(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['upsert'],`;
 
     const writeMethods = `${createMethods}
     update: ((args: any) => original.update(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['update'],
@@ -1742,8 +1835,12 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
       lines.push(`    ${lowerName}: {`);
       lines.push(`      findMany: ((...args: any[]) => prisma.${lowerName}.findMany(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findMany'],`);
       lines.push(`      findFirst: ((...args: any[]) => prisma.${lowerName}.findFirst(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirst'],`);
+      lines.push(`      findFirstOrThrow: ((...args: any[]) => prisma.${lowerName}.findFirstOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
       lines.push(`      findUnique: ((...args: any[]) => prisma.${lowerName}.findUnique(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUnique'],`);
+      lines.push(`      findUniqueOrThrow: ((...args: any[]) => prisma.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       lines.push(`      count: ((...args: any[]) => prisma.${lowerName}.count(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['count'],`);
+      lines.push(`      aggregate: ((...args: any[]) => prisma.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
+      lines.push(`      groupBy: ((...args: any[]) => prisma.${lowerName}.groupBy(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['groupBy'],`);
       lines.push(`    },`);
     }
   }
@@ -1813,9 +1910,12 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`      updateMany: ((args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateMany'],`);
       lines.push(`      updateManyAndReturn: ((args: any) => tx.${lowerName}.updateManyAndReturn(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
       if (options.uniqueStrategy === 'sentinel') {
-        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert({ ...args, create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['upsert'],`);
+        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(injectFilters({`);
+        lines.push(`        ...args,`);
+        lines.push(`        create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
+        lines.push(`      }, '${model.name}'))) as PrismaClient['${lowerName}']['upsert'],`);
       } else {
-        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(args)) as PrismaClient['${lowerName}']['upsert'],`);
+        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['upsert'],`);
       }
       lines.push(`      fields: tx.${lowerName}.fields,`);
 
@@ -1922,8 +2022,12 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`      ${lowerName}: {`);
       lines.push(`        findMany: ((...args: any[]) => tx.${lowerName}.findMany(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findMany'],`);
       lines.push(`        findFirst: ((...args: any[]) => tx.${lowerName}.findFirst(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirst'],`);
+      lines.push(`        findFirstOrThrow: ((...args: any[]) => tx.${lowerName}.findFirstOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
       lines.push(`        findUnique: ((...args: any[]) => tx.${lowerName}.findUnique(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUnique'],`);
+      lines.push(`        findUniqueOrThrow: ((...args: any[]) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       lines.push(`        count: ((...args: any[]) => tx.${lowerName}.count(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['count'],`);
+      lines.push(`        aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
+      lines.push(`        groupBy: ((...args: any[]) => tx.${lowerName}.groupBy(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['groupBy'],`);
       lines.push(`      },`);
     }
   }

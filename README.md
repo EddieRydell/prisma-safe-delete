@@ -211,7 +211,8 @@ await safePrisma.user.createMany({ data: [...] });
 await safePrisma.user.update({ where: { id: 'user-1' }, data: { name: 'Jane' } });
 await safePrisma.user.updateMany({ where: { ... }, data: { ... } });
 
-// upsert passes through unchanged (can find soft-deleted records)
+// upsert filters out soft-deleted records from the where clause
+// (if a soft-deleted record matches, the create branch fires instead)
 await safePrisma.user.upsert({ where: { ... }, create: { ... }, update: { ... } });
 ```
 
@@ -493,6 +494,12 @@ console.log(cascaded); // { Post: 2, Comment: 5 }
 - All cascaded records get the same `deleted_at` timestamp
 - Entire operation is transactional (all-or-nothing)
 
+### Performance Characteristics
+
+- Models with unique string fields using the `mangle` strategy require per-record updates (each record gets a unique PK-based suffix), so cascade performance scales linearly with record count.
+- Models without unique string fields, or using `none`/`sentinel` strategy, use bulk `updateMany` operations for significantly better performance on large cascades.
+- All cascade operations execute within a single database transaction regardless of record count.
+
 ## Unique Constraint Handling
 
 When you soft-delete a record with unique string fields, the values are automatically mangled to free them up for reuse:
@@ -764,12 +771,12 @@ Raw queries bypass the wrapper entirely (by design):
 const users = await safePrisma.$queryRaw`SELECT * FROM User`;
 ```
 
-### Upsert on Soft-Deleted Records
+### Upsert Behavior
 
-`upsert` can still find soft-deleted records (it passes through to Prisma unchanged). This means a soft-deleted record may be found by its unique constraint and updated rather than creating a new one:
+`upsert` has soft-delete filter injection applied to its `where` clause, so it will not find soft-deleted records. If you soft-delete a record and then upsert with the same unique value, the `create` branch fires (assuming the unique value was freed by mangling or the strategy allows it).
 
 ```typescript
-// If 'john@example.com' exists but is soft-deleted, this updates it
+// If 'john@example.com' was soft-deleted (and mangled), this creates a new record
 await safePrisma.user.upsert({
   where: { email: 'john@example.com' },
   create: { email: 'john@example.com', name: 'John' },
@@ -777,7 +784,21 @@ await safePrisma.user.upsert({
 });
 ```
 
-**Note:** With the sentinel strategy, `upsert` automatically injects the sentinel value (`9999-12-31`) into the `create` branch, so newly created records are correctly marked as active. The `update` branch is not modified.
+**Note:** With the sentinel strategy, `upsert` also injects the sentinel value (`9999-12-31`) into the `create` branch, so newly created records are correctly marked as active.
+
+**Important:** With `none` strategy, the unique constraint is still occupied by the soft-deleted record (no mangling), so the `create` branch will fail with a unique constraint violation. Use `mangle` or `sentinel` strategy if you need to reuse unique values after soft-delete.
+
+### `$extends` Bypass
+
+`safePrisma.$extends(...)` returns a raw PrismaClient — all soft-delete safety is lost. If you need extensions, use `safePrisma.$prisma.$extends(...)` and be aware that the extended client has no soft-delete filtering.
+
+### Single-Relation (To-One) Includes
+
+Prisma's API does not support `where` on to-one relation includes. If a User has a soft-deleted Profile, `include: { profile: true }` will return the deleted profile. Workaround: use `select` with explicit field picking, or check `deleted_at` in application code.
+
+### Nested Writes
+
+Nested write operations within `data` (`connect`, `connectOrCreate`, nested `create`, nested `delete`) bypass soft-delete logic. A `connect` to a soft-deleted record succeeds silently. For sentinel strategy, nested creates within relations do NOT get sentinel value injection.
 
 ## Test Coverage
 

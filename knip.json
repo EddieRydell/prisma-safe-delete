@@ -4,7 +4,9 @@
   "ignore": [
     "tests/integration/generated/**",
     "tests/e2e/generated/**",
+    "tests/e2e-sentinel/generated/**",
+    "tests/e2e-none/generated/**",
     "tests/**/prisma.config.ts"
   ],
-  "ignoreDependencies": ["dotenv", "@prisma/client"]
+  "ignoreDependencies": ["dotenv"]
 }

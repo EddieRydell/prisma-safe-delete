@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider        = "node ../../dist/bin.js"
+  output          = "./generated/soft-cascade"
+  uniqueStrategy  = "sentinel"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id         String   @id @default(cuid())
+  email      String
+  name       String?
+  deleted_at DateTime @default(dbgenerated("'9999-12-31 00:00:00'"))
+  posts      Post[]
+  createdAt  DateTime @default(now())
+
+  @@unique([email, deleted_at])
+}
+
+model Post {
+  id         String    @id @default(cuid())
+  title      String
+  content    String?
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments   Comment[]
+  deleted_at DateTime  @default(dbgenerated("'9999-12-31 00:00:00'"))
+  createdAt  DateTime  @default(now())
+}
+
+model Comment {
+  id         String   @id @default(cuid())
+  content    String
+  postId     String
+  post       Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  deleted_at DateTime @default(dbgenerated("'9999-12-31 00:00:00'"))
+  createdAt  DateTime @default(now())
+}
+
+model Customer {
+  id         String   @id @default(cuid())
+  email      String
+  name       String?
+  deleted_at DateTime @default(dbgenerated("'9999-12-31 00:00:00'"))
+  deleted_by String?
+
+  @@unique([email, deleted_at])
+}
+
+// Model without soft-delete for testing non-soft-deletable behavior
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String
+  entityId  String
+  createdAt DateTime @default(now())
+}
