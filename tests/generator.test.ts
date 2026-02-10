@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   collectModelsWithUniqueFields,
   buildUniqueStrategyWarningLines,
+  buildMangleWarningLines,
   buildSentinelWarningLines,
   type UniqueFieldInfo,
 } from '../src/generator.js';
@@ -644,14 +645,33 @@ describe('buildSentinelWarningLines', () => {
     expect(result.some((line) => line.includes('User: email'))).toBe(true);
   });
 
-  it('shows correctly configured compound uniques', () => {
+  it('warns when deleted_at is nullable (traditional pattern)', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes('misconfigured for sentinel'))).toBe(true);
+    expect(result.some((line) => line.includes('User: deleted_at is nullable'))).toBe(true);
+    expect(result.some((line) => line.includes('must be non-nullable with @default'))).toBe(true);
+  });
+
+  it('shows correctly configured when deleted_at is non-nullable with @default', () => {
     const models = [
       createMockModel({
         name: 'User',
         fields: [
           createMockField({ name: 'id', type: 'String', isId: true }),
           createMockField({ name: 'email', type: 'String' }),
-          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: true, hasDefaultValue: true }),
         ],
         uniqueFields: [['email', 'deleted_at']],
       }),
@@ -660,11 +680,70 @@ describe('buildSentinelWarningLines', () => {
     const schema = parseDMMF(createMockDMMF(models));
     const result = buildSentinelWarningLines(schema, false);
 
-    expect(result.some((line) => line.includes('correctly configured'))).toBe(true);
+    expect(result.some((line) => line.includes('misconfigured'))).toBe(false);
+    expect(result.some((line) => line.includes('Correctly configured'))).toBe(true);
     expect(result.some((line) => line.includes('@@unique([email, deleted_at])'))).toBe(true);
+    expect(result.some((line) => line.includes('All models correctly configured'))).toBe(true);
   });
 
-  it('mentions schema requirements', () => {
+  it('shows compound uniques alongside field config in correctly configured section', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: true, hasDefaultValue: true }),
+        ],
+        uniqueFields: [['email', 'deleted_at']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    // Should show both field config and compound unique in one line
+    const correctLine = result.find((line) => line.includes('User:'));
+    expect(correctLine).toBeDefined();
+    expect(correctLine).toContain('deleted_at');
+    expect(correctLine).toContain('@@unique([email, deleted_at])');
+  });
+
+  it('shows mixed diagnostics for multiple models', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: true, hasDefaultValue: true }),
+        ],
+        uniqueFields: [['email', 'deleted_at']],
+      }),
+      createMockModel({
+        name: 'Post',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'slug', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    // User should be correctly configured
+    expect(result.some((line) => line.includes('User:') && line.includes('@@unique([email, deleted_at])'))).toBe(true);
+    // Post should have field misconfiguration warning
+    expect(result.some((line) => line.includes('Post: deleted_at is nullable'))).toBe(true);
+    // Post should have standalone unique warning
+    expect(result.some((line) => line.includes('Post: slug'))).toBe(true);
+    // Should NOT say "All models correctly configured"
+    expect(result.some((line) => line.includes('All models correctly configured'))).toBe(false);
+  });
+
+  it('includes migration SQL when fields are misconfigured', () => {
     const models = [
       createMockModel({
         name: 'User',
@@ -678,7 +757,153 @@ describe('buildSentinelWarningLines', () => {
     const schema = parseDMMF(createMockDMMF(models));
     const result = buildSentinelWarningLines(schema, false);
 
-    expect(result.some((line) => line.includes('non-nullable DateTime'))).toBe(true);
-    expect(result.some((line) => line.includes('@@unique([field, deleted_at])'))).toBe(true);
+    expect(result.some((line) => line.includes('DateTime @default(dbgenerated'))).toBe(true);
+    expect(result.some((line) => line.includes('UPDATE "Model"'))).toBe(true);
+  });
+});
+
+describe('buildMangleWarningLines', () => {
+  it('returns empty array when no soft-deletable models', () => {
+    const models = [
+      createMockModel({
+        name: 'AuditLog',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'action', type: 'String' }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    expect(result).toEqual([]);
+  });
+
+  it('returns empty array when all unique fields are mangleable strings', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    expect(result).toEqual([]);
+  });
+
+  it('warns about Int unique fields that cannot be mangled', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'employee_id', type: 'Int', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes("uniqueStrategy is 'mangle'"))).toBe(true);
+    expect(result.some((line) => line.includes('cannot be mangled'))).toBe(true);
+    expect(result.some((line) => line.includes('User: employee_id (Int)'))).toBe(true);
+    expect(result.some((line) => line.includes('CREATE UNIQUE INDEX'))).toBe(true);
+  });
+
+  it('warns about UUID native type fields', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'external_id', type: 'String', isUnique: true, nativeType: ['Uuid', []] }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes('User: external_id (String)'))).toBe(true);
+    expect(result.some((line) => line.includes('CREATE UNIQUE INDEX'))).toBe(true);
+  });
+
+  it('does not warn about mangleable string fields alongside unmangleable ones', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'employee_id', type: 'Int', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    // Should warn about employee_id but not email
+    expect(result.some((line) => line.includes('employee_id (Int)'))).toBe(true);
+    expect(result.some((line) => line.includes('email'))).toBe(false);
+  });
+
+  it('generates correct SQL for multiple models', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'employee_id', type: 'Int', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+      createMockModel({
+        name: 'Product',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'sku', type: 'Int', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes('User: employee_id (Int)'))).toBe(true);
+    expect(result.some((line) => line.includes('Product: sku (Int)'))).toBe(true);
+    expect(result.some((line) => line.includes('ON "User"(employee_id) WHERE deleted_at IS NULL'))).toBe(true);
+    expect(result.some((line) => line.includes('ON "Product"(sku) WHERE deleted_at IS NULL'))).toBe(true);
+  });
+
+  it('skips deleted_at field itself from warnings', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'employee_id', type: 'Int', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildMangleWarningLines(schema, false);
+
+    // Should not list deleted_at as an unmangleable field
+    expect(result.some((line) => line.includes('deleted_at (DateTime)'))).toBe(false);
   });
 });
