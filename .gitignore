@@ -16,3 +16,9 @@ tests/integration/*.db-journal
 tests/e2e/generated/
 tests/e2e/*.db
 tests/e2e/*.db-journal
+tests/e2e-sentinel/generated/
+tests/e2e-sentinel/*.db
+tests/e2e-sentinel/*.db-journal
+tests/e2e-none/generated/
+tests/e2e-none/*.db
+tests/e2e-none/*.db-journal

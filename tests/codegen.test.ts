@@ -768,23 +768,204 @@ describe('emitRuntime - sentinel strategy', () => {
     expect(output).toContain("if (UNIQUE_STRATEGY === 'none' || UNIQUE_STRATEGY === 'sentinel') return {}");
   });
 
-  it('sentinel upsert injects ACTIVE_DELETED_AT_VALUE on create branch', () => {
+  it('sentinel upsert injects ACTIVE_DELETED_AT_VALUE on create branch and applies transformSentinelFindUniqueWhere', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
 
-    // Model delegate upsert should inject sentinel into create data
-    expect(output).toContain("upsert: ((args: any) => original.upsert({ ...args, create: { ...args.create");
+    // Model delegate upsert should inject sentinel into create data, call injectFilters, and transform where
     expect(output).toContain("ACTIVE_DELETED_AT_VALUE");
+    expect(output).toContain("filtered.where = transformSentinelFindUniqueWhere(filtered.where");
+    expect(output).toContain("return original.upsert(filtered)");
   });
 
-  it('non-sentinel upsert is pass-through', () => {
+  it('non-sentinel upsert applies injectFilters', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    // Upsert should be pass-through for mangle
-    expect(output).toContain("upsert: ((args: any) => original.upsert(args))");
+    // Upsert should call injectFilters for mangle strategy
+    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters(args,");
+  });
+});
+
+describe('emitTypes - $onlyDeleted parity', () => {
+  it('OnlyDeletedClient includes all 8 read operations', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // OnlyDeletedClient should have parity with IncludingDeletedClient
+    const onlyDeletedMatch = /export interface OnlyDeletedClient \{[\s\S]*?\}/.exec(output);
+    expect(onlyDeletedMatch).not.toBeNull();
+    const onlyDeletedBlock = onlyDeletedMatch![0];
+    expect(onlyDeletedBlock).toContain("'findMany'");
+    expect(onlyDeletedBlock).toContain("'findFirst'");
+    expect(onlyDeletedBlock).toContain("'findFirstOrThrow'");
+    expect(onlyDeletedBlock).toContain("'findUnique'");
+    expect(onlyDeletedBlock).toContain("'findUniqueOrThrow'");
+    expect(onlyDeletedBlock).toContain("'count'");
+    expect(onlyDeletedBlock).toContain("'aggregate'");
+    expect(onlyDeletedBlock).toContain("'groupBy'");
+  });
+});
+
+describe('emitRuntime - $onlyDeleted parity', () => {
+  it('$onlyDeleted client includes all 8 read operations', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // The createOnlyDeletedClient function should emit all 8 ops
+    const onlyDeletedFunc = /function createOnlyDeletedClient[\s\S]*?^}/m.exec(output);
+    expect(onlyDeletedFunc).not.toBeNull();
+    const funcBody = onlyDeletedFunc![0];
+    expect(funcBody).toContain('findMany');
+    expect(funcBody).toContain('findFirst');
+    expect(funcBody).toContain('findFirstOrThrow');
+    expect(funcBody).toContain('findUnique');
+    expect(funcBody).toContain('findUniqueOrThrow');
+    expect(funcBody).toContain('count');
+    expect(funcBody).toContain('aggregate');
+    expect(funcBody).toContain('groupBy');
+  });
+
+  it('transaction $onlyDeleted includes all 8 read operations', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+    // Find the $onlyDeleted section within the tx wrapper
+    const onlyDeletedSection = /\$onlyDeleted: \{[\s\S]*?\},\n\n/.exec(txContent);
+    expect(onlyDeletedSection).not.toBeNull();
+    const section = onlyDeletedSection![0];
+    expect(section).toContain("'only-deleted'");
+    expect(section).toContain('findFirstOrThrow');
+    expect(section).toContain('findUniqueOrThrow');
+    expect(section).toContain('aggregate');
+    expect(section).toContain('groupBy');
+  });
+});
+
+describe('emitRuntime - sentinel transformSentinelFindUniqueWhere multi-compound', () => {
+  it('transforms multiple compound uniques containing deleted_at', () => {
+    // Create a model with two compound uniques both including deleted_at
+    const models = [
+      createMockModel({
+        name: 'Member',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String' }),
+          createMockField({ name: 'orgId', type: 'String' }),
+          createMockField({
+            name: 'deleted_at',
+            type: 'DateTime',
+            isRequired: true,
+            hasDefaultValue: true,
+          }),
+        ],
+        uniqueFields: [['email', 'deleted_at'], ['orgId', 'deleted_at']],
+        uniqueIndexes: [
+          { name: 'email_deleted_at', fields: ['email', 'deleted_at'] },
+          { name: 'orgId_deleted_at', fields: ['orgId', 'deleted_at'] },
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // Should have both compound uniques in metadata
+    expect(output).toContain('email_deleted_at');
+    expect(output).toContain('orgId_deleted_at');
+    // The transform function should not return early on first match
+    expect(output).toContain('const consumedFields = new Set');
+  });
+
+  it('transform filters out deleted_at from field presence check', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // The function should filter deleted_at out of the fields check so that
+    // a simple { email: 'foo' } where clause triggers the compound transform.
+    // This is critical: without this, users must always pass the compound key form.
+    expect(output).toContain('const nonDeletedAtFields = fields.filter');
+    expect(output).toContain('f !== deletedAtField');
+    expect(output).toContain('nonDeletedAtFields.every');
+  });
+});
+
+describe('emitRuntime - cascade N+1 optimization', () => {
+  it('emits bulk updateMany optimization in cascadeToChildren', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Should contain the bulk optimization path
+    expect(output).toContain("const childNeedsMangling = UNIQUE_STRATEGY === 'mangle'");
+    expect(output).toContain('childDelegate.updateMany');
+  });
+
+  it('emits bulk updateMany optimization in softDeleteWithCascadeInTx', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).toContain("const needsMangling = UNIQUE_STRATEGY === 'mangle'");
+  });
+
+  it('emits bulk updateMany optimization in restoreCascadeChildren', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).toContain("const childNeedsUnmangling = UNIQUE_STRATEGY === 'mangle'");
+  });
+});
+
+describe('emitRuntime - upsert filter injection', () => {
+  it('mangle upsert calls injectFilters', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters(args, 'User')))");
+  });
+
+  it('none upsert calls injectFilters', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
+
+    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters(args, 'User')))");
+  });
+
+  it('transaction wrapper upsert calls injectFilters for mangle', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    expect(txWrapper![0]).toContain("upsert: ((args: any) => tx.user.upsert(injectFilters(args, 'User')))");
+  });
+
+  it('transaction wrapper sentinel upsert applies transformSentinelFindUniqueWhere', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+    // Sentinel tx upsert should call injectFilters, inject sentinel value, and transform where
+    expect(txContent).toContain('ACTIVE_DELETED_AT_VALUE');
+    expect(txContent).toContain('transformSentinelFindUniqueWhere(filtered.where');
+    expect(txContent).toContain('return tx.user.upsert(filtered)');
   });
 });
 

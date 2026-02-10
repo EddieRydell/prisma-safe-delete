@@ -1599,23 +1599,77 @@ describe('E2E: Real database tests', () => {
       ).rejects.toThrow();
     });
 
-    it('upsert creates new when existing record is soft-deleted', async () => {
-      // Create and soft-delete a user with unique email
-      await prisma.user.create({
-        data: { id: 'u1', email: 'reuse@test.com', deleted_at: new Date() },
+    it('upsert does not find soft-deleted records (create branch fires)', async () => {
+      // Create a user, then soft-delete via safePrisma (which mangles email)
+      await safePrisma.user.create({
+        data: { id: 'u1', email: 'reuse@test.com' },
       });
+      await safePrisma.user.softDelete({ where: { id: 'u1' } });
 
-      // Note: upsert will find the soft-deleted record and update it
-      // This is Prisma's default behavior - unique constraint still applies
+      // Upsert with the original email - should NOT find the soft-deleted record
+      // The create branch fires because the mangled email frees the unique constraint
       const result = await safePrisma.user.upsert({
         where: { email: 'reuse@test.com' },
         create: { id: 'u2', email: 'reuse@test.com', name: 'New User' },
         update: { name: 'Updated User' },
       });
 
-      // It found the soft-deleted record and updated it
+      // Create branch fired - new record
+      expect(result.id).toBe('u2');
+      expect(result.name).toBe('New User');
+    });
+
+    it('upsert on non-existent record creates new record', async () => {
+      const result = await safePrisma.user.upsert({
+        where: { email: 'fresh@test.com' },
+        create: { id: 'u1', email: 'fresh@test.com', name: 'Fresh' },
+        update: { name: 'Should Not Update' },
+      });
+
       expect(result.id).toBe('u1');
-      expect(result.name).toBe('Updated User');
+      expect(result.name).toBe('Fresh');
+    });
+
+    it('upsert on active record uses update branch', async () => {
+      await safePrisma.user.create({
+        data: { id: 'u1', email: 'active@test.com', name: 'Original' },
+      });
+
+      const result = await safePrisma.user.upsert({
+        where: { email: 'active@test.com' },
+        create: { id: 'u2', email: 'active@test.com', name: 'Should Not Create' },
+        update: { name: 'Updated' },
+      });
+
+      expect(result.id).toBe('u1');
+      expect(result.name).toBe('Updated');
+    });
+  });
+
+  describe('updateManyAndReturn', () => {
+    it('updateManyAndReturn filters soft-deleted records', async () => {
+      await prisma.user.createMany({
+        data: [
+          { id: 'u1', email: 'active1@test.com', name: 'Active1' },
+          { id: 'u2', email: 'active2@test.com', name: 'Active2' },
+          { id: 'u3', email: 'deleted@test.com', name: 'Deleted', deleted_at: new Date() },
+        ],
+      });
+
+      const result = await safePrisma.user.updateManyAndReturn({
+        where: {},
+        data: { name: 'Bulk Updated' },
+      });
+
+      // Should only return and update the 2 active records
+      expect(result).toHaveLength(2);
+      const ids = result.map((r: { id: string }) => r.id).sort();
+      expect(ids).toEqual(['u1', 'u2']);
+      expect(result.every((r: { name: string | null }) => r.name === 'Bulk Updated')).toBe(true);
+
+      // Verify deleted record was not modified
+      const deletedUser = await prisma.user.findUnique({ where: { id: 'u3' } });
+      expect(deletedUser.name).toBe('Deleted');
     });
   });
 
