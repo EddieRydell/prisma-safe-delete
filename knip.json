@@ -8,5 +8,5 @@
     "tests/e2e-none/generated/**",
     "tests/**/prisma.config.ts"
   ],
-  "ignoreDependencies": ["dotenv"]
+  "ignoreDependencies": ["dotenv", "@prisma/client"]
 }
