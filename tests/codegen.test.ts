@@ -768,14 +768,15 @@ describe('emitRuntime - sentinel strategy', () => {
     expect(output).toContain("if (UNIQUE_STRATEGY === 'none' || UNIQUE_STRATEGY === 'sentinel') return {}");
   });
 
-  it('sentinel upsert injects ACTIVE_DELETED_AT_VALUE on create branch and injectFilters', () => {
+  it('sentinel upsert injects ACTIVE_DELETED_AT_VALUE on create branch and applies transformSentinelFindUniqueWhere', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
 
-    // Model delegate upsert should inject sentinel into create data AND call injectFilters
-    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters({");
+    // Model delegate upsert should inject sentinel into create data, call injectFilters, and transform where
     expect(output).toContain("ACTIVE_DELETED_AT_VALUE");
+    expect(output).toContain("filtered.where = transformSentinelFindUniqueWhere(filtered.where");
+    expect(output).toContain("return original.upsert(filtered)");
   });
 
   it('non-sentinel upsert applies injectFilters', () => {
@@ -953,7 +954,7 @@ describe('emitRuntime - upsert filter injection', () => {
     expect(txWrapper![0]).toContain("upsert: ((args: any) => tx.user.upsert(injectFilters(args, 'User')))");
   });
 
-  it('transaction wrapper upsert calls injectFilters with sentinel value for sentinel', () => {
+  it('transaction wrapper sentinel upsert applies transformSentinelFindUniqueWhere', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
@@ -961,9 +962,10 @@ describe('emitRuntime - upsert filter injection', () => {
     const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
     expect(txWrapper).not.toBeNull();
     const txContent = txWrapper![0];
-    // Sentinel tx upsert should call injectFilters AND inject sentinel value on create
-    expect(txContent).toContain('tx.user.upsert(injectFilters({');
+    // Sentinel tx upsert should call injectFilters, inject sentinel value, and transform where
     expect(txContent).toContain('ACTIVE_DELETED_AT_VALUE');
+    expect(txContent).toContain('transformSentinelFindUniqueWhere(filtered.where');
+    expect(txContent).toContain('return tx.user.upsert(filtered)');
   });
 });
 

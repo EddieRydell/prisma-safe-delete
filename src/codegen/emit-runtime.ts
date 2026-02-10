@@ -1648,10 +1648,14 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
 
     const upsertMethod = options.uniqueStrategy === 'sentinel'
       ? `
-    upsert: ((args: any) => original.upsert(injectFilters({
-      ...args,
-      create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }
-    }, '${name}'))) as PrismaClient['${lowerName}']['upsert'],`
+    upsert: ((args: any) => {
+      const filtered = injectFilters({
+        ...args,
+        create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }
+      }, '${name}');
+      if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');
+      return original.upsert(filtered);
+    }) as PrismaClient['${lowerName}']['upsert'],`
       : `
     upsert: ((args: any) => original.upsert(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['upsert'],`;
 
@@ -1910,10 +1914,14 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`      updateMany: ((args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateMany'],`);
       lines.push(`      updateManyAndReturn: ((args: any) => tx.${lowerName}.updateManyAndReturn(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
       if (options.uniqueStrategy === 'sentinel') {
-        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(injectFilters({`);
-        lines.push(`        ...args,`);
-        lines.push(`        create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
-        lines.push(`      }, '${model.name}'))) as PrismaClient['${lowerName}']['upsert'],`);
+        lines.push(`      upsert: ((args: any) => {`);
+        lines.push(`        const filtered = injectFilters({`);
+        lines.push(`          ...args,`);
+        lines.push(`          create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
+        lines.push(`        }, '${model.name}');`);
+        lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
+        lines.push(`        return tx.${lowerName}.upsert(filtered);`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
       } else {
         lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['upsert'],`);
       }
