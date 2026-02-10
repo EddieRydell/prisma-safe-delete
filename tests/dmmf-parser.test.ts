@@ -119,7 +119,7 @@ describe('parseDMMF', () => {
     expect(parsedModel.deletedAtField).toBeNull();
   });
 
-  it('rejects deleted_at field if required', () => {
+  it('rejects deleted_at field if required without default', () => {
     const model = createMockModel({
       name: 'Post',
       fields: [
@@ -137,6 +137,28 @@ describe('parseDMMF', () => {
 
     const parsedModel = result.models[0] as ParsedModel;
     expect(parsedModel.isSoftDeletable).toBe(false);
+  });
+
+  it('accepts deleted_at field if required with default (sentinel strategy)', () => {
+    const model = createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: true,
+          hasDefaultValue: true,
+        }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.isSoftDeletable).toBe(true);
+    expect(parsedModel.deletedAtField).toBe('deleted_at');
   });
 
   it('parses compound primary key', () => {
@@ -502,5 +524,90 @@ describe('uniqueStringFields', () => {
     const parsedModel = result.models[0] as ParsedModel;
     // No fields should be mangled since the only unique string is a UUID
     expect(parsedModel.uniqueStringFields).toEqual([]);
+  });
+});
+
+describe('uniqueConstraints - compoundKeyName', () => {
+  it('extracts compound key name from uniqueIndexes', () => {
+    const model = createMockModel({
+      name: 'User',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String' }),
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ],
+      uniqueFields: [['email', 'deleted_at']],
+      uniqueIndexes: [{ name: 'email_deleted_at', fields: ['email', 'deleted_at'] }],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.uniqueConstraints).toEqual([
+      { fields: ['email'], includesDeletedAt: true, compoundKeyName: 'email_deleted_at' },
+    ]);
+  });
+
+  it('falls back to joined field names when uniqueIndex name is null', () => {
+    const model = createMockModel({
+      name: 'User',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String' }),
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ],
+      uniqueFields: [['email', 'deleted_at']],
+      uniqueIndexes: [{ name: null as unknown as string, fields: ['email', 'deleted_at'] }],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.uniqueConstraints).toEqual([
+      { fields: ['email'], includesDeletedAt: true, compoundKeyName: 'email_deleted_at' },
+    ]);
+  });
+
+  it('falls back to joined fields when uniqueIndexes is empty', () => {
+    const model = createMockModel({
+      name: 'Tenant',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'org_id', type: 'String' }),
+        createMockField({ name: 'name', type: 'String' }),
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ],
+      uniqueFields: [['org_id', 'name']],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    expect(parsedModel.uniqueConstraints).toEqual([
+      { fields: ['org_id', 'name'], includesDeletedAt: false, compoundKeyName: 'org_id_name' },
+    ]);
+  });
+
+  it('standalone @unique fields do not have compoundKeyName', () => {
+    const model = createMockModel({
+      name: 'User',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String', isUnique: true }),
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ],
+    });
+
+    const dmmf = createMockDMMF([model]);
+    const result = parseDMMF(dmmf);
+
+    const parsedModel = result.models[0] as ParsedModel;
+    // Standalone @unique fields should not have compoundKeyName
+    expect(parsedModel.uniqueConstraints).toEqual([
+      { fields: ['email'], includesDeletedAt: false },
+    ]);
   });
 });

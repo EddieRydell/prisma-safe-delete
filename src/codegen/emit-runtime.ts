@@ -4,7 +4,7 @@ import type { CascadeGraph } from '../cascade-graph.js';
 /**
  * Strategy for handling unique constraints on soft delete.
  */
-type UniqueStrategy = 'mangle' | 'none';
+type UniqueStrategy = 'mangle' | 'none' | 'sentinel';
 
 interface EmitRuntimeOptions {
   uniqueStrategy: UniqueStrategy;
@@ -18,7 +18,7 @@ interface EmitRuntimeOptions {
 function isSimpleModel(model: ParsedModel, options: EmitRuntimeOptions): boolean {
   const children = options.cascadeGraph[model.name] ?? [];
   if (children.length > 0) return false;
-  if (options.uniqueStrategy === 'none') return true;
+  if (options.uniqueStrategy === 'none' || options.uniqueStrategy === 'sentinel') return true;
   return model.uniqueStringFields.length === 0;
 }
 
@@ -121,13 +121,53 @@ export function emitRuntime(
   lines.push(' * Strategy for handling unique constraints on soft delete.');
   lines.push(" * - 'mangle': Append \"__deleted_{pk}\" suffix to unique string fields");
   lines.push(" * - 'none': Skip mangling (user handles uniqueness via partial indexes)");
+  lines.push(" * - 'sentinel': Use a far-future sentinel date instead of NULL for active records");
   lines.push(' */');
-  lines.push(`const UNIQUE_STRATEGY: 'mangle' | 'none' = '${options.uniqueStrategy}';`);
+  lines.push(`const UNIQUE_STRATEGY: 'mangle' | 'none' | 'sentinel' = '${options.uniqueStrategy}';`);
   lines.push('');
+
+  // Emit ACTIVE_DELETED_AT_VALUE constant
+  lines.push('/**');
+  lines.push(' * The value used to represent "active" (not deleted) in the deleted_at column.');
+  lines.push(" * - For mangle/none strategies: null (deleted_at IS NULL means active)");
+  lines.push(" * - For sentinel strategy: far-future date (deleted_at = sentinel means active)");
+  lines.push(' */');
+  if (options.uniqueStrategy === 'sentinel') {
+    lines.push("const ACTIVE_DELETED_AT_VALUE: Date = new Date('9999-12-31T00:00:00.000Z');");
+  } else {
+    lines.push('const ACTIVE_DELETED_AT_VALUE: null = null;');
+  }
+  lines.push('');
+
+  // Emit SENTINEL_COMPOUND_UNIQUES metadata (only for sentinel strategy)
+  if (options.uniqueStrategy === 'sentinel') {
+    lines.push('/**');
+    lines.push(' * Compound unique constraints that include deleted_at, per model.');
+    lines.push(' * Used to transform findUnique where clauses for sentinel strategy.');
+    lines.push(' */');
+    lines.push('const SENTINEL_COMPOUND_UNIQUES: Record<string, { keyName: string; fields: string[]; deletedAtField: string }[]> = {');
+    for (const model of schema.models) {
+      if (!model.isSoftDeletable || model.deletedAtField === null) continue;
+      const sentinelUniques = model.uniqueConstraints.filter(c => c.includesDeletedAt && c.compoundKeyName !== undefined);
+      if (sentinelUniques.length === 0) continue;
+      const entries = sentinelUniques.map(c =>
+        `{ keyName: ${JSON.stringify(c.compoundKeyName)}, fields: ${JSON.stringify(c.fields)}, deletedAtField: ${JSON.stringify(model.deletedAtField)} }`
+      );
+      lines.push(`  ${model.name}: [${entries.join(', ')}],`);
+    }
+    lines.push('};');
+    lines.push('');
+  }
 
   // Emit helper functions
   lines.push(emitHelperFunctions());
   lines.push('');
+
+  // Emit sentinel findUnique transformation helper (only for sentinel strategy)
+  if (options.uniqueStrategy === 'sentinel') {
+    lines.push(emitSentinelFindUniqueHelper());
+    lines.push('');
+  }
 
   // Emit injectFilters function
   lines.push(emitInjectFiltersFunction());
@@ -187,7 +227,7 @@ export function onlyDeleted<T extends Record<string, unknown>>(
 ): T & Record<string, unknown> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) return where;
-  return { ...where, [deletedAtField]: { not: null } } as T & Record<string, unknown>;
+  return { ...where, [deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE } } as T & Record<string, unknown>;
 }
 
 /**
@@ -209,7 +249,7 @@ export function excludeDeleted<T extends Record<string, unknown>>(
 ): T & Record<string, unknown> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) return where;
-  return { ...where, [deletedAtField]: null } as T & Record<string, unknown>;
+  return { ...where, [deletedAtField]: ACTIVE_DELETED_AT_VALUE } as T & Record<string, unknown>;
 }
 
 /**
@@ -353,8 +393,8 @@ function mangleUniqueFields(
   record: Record<string, unknown>,
   maxLength: number = DEFAULT_MAX_STRING_LENGTH
 ): Record<string, unknown> {
-  // Skip mangling if strategy is 'none'
-  if (UNIQUE_STRATEGY === 'none') return {};
+  // Skip mangling if strategy is 'none' or 'sentinel'
+  if (UNIQUE_STRATEGY === 'none' || UNIQUE_STRATEGY === 'sentinel') return {};
 
   const uniqueFields = getUniqueStringFields(modelName);
   if (uniqueFields.length === 0) return {};
@@ -403,8 +443,8 @@ function unmangleUniqueFields(
   modelName: string,
   record: Record<string, unknown>
 ): Record<string, unknown> {
-  // Skip unmangling if strategy is 'none' (nothing was mangled)
-  if (UNIQUE_STRATEGY === 'none') return {};
+  // Skip unmangling if strategy is 'none' or 'sentinel' (nothing was mangled)
+  if (UNIQUE_STRATEGY === 'none' || UNIQUE_STRATEGY === 'sentinel') return {};
 
   const uniqueFields = getUniqueStringFields(modelName);
   if (uniqueFields.length === 0) return {};
@@ -432,6 +472,51 @@ function unmangleUniqueFields(
 }`.trim();
 }
 
+function emitSentinelFindUniqueHelper(): string {
+  return `
+/**
+ * Transforms a findUnique where clause for sentinel strategy.
+ * When using @@unique([email, deleted_at]), Prisma requires { email_deleted_at: { email, deleted_at } }.
+ * This helper detects when the user passes { email: "foo" } and rewrites it to the compound form
+ * with ACTIVE_DELETED_AT_VALUE injected for deleted_at.
+ */
+function transformSentinelFindUniqueWhere(
+  where: Record<string, unknown>,
+  modelName: string
+): Record<string, unknown> {
+  const compoundUniques = SENTINEL_COMPOUND_UNIQUES[modelName];
+  if (!compoundUniques || compoundUniques.length === 0) return where;
+
+  for (const { keyName, fields, deletedAtField } of compoundUniques) {
+    // Skip if already in compound form
+    if (keyName in where) continue;
+
+    // Check if all non-deleted_at fields are present in where
+    const allFieldsPresent = fields.every((f: string) => f in where);
+    if (!allFieldsPresent) continue;
+
+    // Build the compound key value
+    const compoundValue: Record<string, unknown> = {};
+    for (const f of fields) {
+      compoundValue[f] = where[f];
+    }
+    compoundValue[deletedAtField] = ACTIVE_DELETED_AT_VALUE;
+
+    // Remove the individual fields and add the compound key
+    const newWhere: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(where)) {
+      if (!fields.includes(k)) {
+        newWhere[k] = v;
+      }
+    }
+    newWhere[keyName] = compoundValue;
+    return newWhere;
+  }
+
+  return where;
+}`.trim();
+}
+
 function emitInjectFiltersFunction(): string {
   return `
 /**
@@ -448,9 +533,9 @@ type FilterMode = 'exclude-deleted' | 'include-deleted' | 'only-deleted';
 function getModeFilter(mode: FilterMode, deletedAtField: string): Record<string, unknown> | null {
   switch (mode) {
     case 'exclude-deleted':
-      return { [deletedAtField]: null };
+      return { [deletedAtField]: ACTIVE_DELETED_AT_VALUE };
     case 'only-deleted':
-      return { [deletedAtField]: { not: null } };
+      return { [deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE } };
     case 'include-deleted':
       return null; // No filter
   }
@@ -780,7 +865,7 @@ async function softDeleteWithCascadeInTx(
   const records = await delegate.findMany({
     where: {
       ...decomposedWhere,
-      [deletedAtField]: null, // Only non-deleted records
+      [deletedAtField]: ACTIVE_DELETED_AT_VALUE, // Only active records
     },
   });
 
@@ -864,7 +949,7 @@ async function cascadeToChildren(
     const childRecords = await childDelegate.findMany({
       where: {
         OR: childWhereConditions,
-        ...(child.deletedAtField ? { [child.deletedAtField]: null } : {}),
+        ...(child.deletedAtField ? { [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE } : {}),
       },
     });
 
@@ -962,7 +1047,7 @@ async function restoreRecordWithDelegate(
   const record = await delegate.findFirst({
     where: {
       ...decomposedWhere,
-      [deletedAtField]: { not: null }, // Only deleted records
+      [deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE }, // Only deleted records
     },
   });
 
@@ -977,7 +1062,7 @@ async function restoreRecordWithDelegate(
       const existing = await delegate.findFirst({
         where: {
           [field]: value,
-          [deletedAtField]: null, // Only check against non-deleted records
+          [deletedAtField]: ACTIVE_DELETED_AT_VALUE, // Only check against active records
         },
       });
 
@@ -996,7 +1081,7 @@ async function restoreRecordWithDelegate(
 
   const updateData: Record<string, unknown> = {
     ...unmangledFields,
-    [deletedAtField]: null,
+    [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
   };
 
   // Clear deleted_by if the model has that field
@@ -1055,7 +1140,7 @@ async function restoreManyWithDelegate(
   const records = await delegate.findMany({
     where: {
       ...where,
-      [deletedAtField]: { not: null },
+      [deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE },
     },
   });
 
@@ -1074,7 +1159,7 @@ async function restoreManyWithDelegate(
         const existing = await delegate.findFirst({
           where: {
             [field]: value,
-            [deletedAtField]: null,
+            [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
           },
         });
 
@@ -1091,7 +1176,7 @@ async function restoreManyWithDelegate(
     const pkVal = extractPrimaryKey(modelName, record);
     const updateData: Record<string, unknown> = {
       ...unmangledFields,
-      [deletedAtField]: null,
+      [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
     };
 
     if (deletedByField) {
@@ -1147,7 +1232,7 @@ async function restoreWithCascadeInTx(
   const record = await delegate.findFirst({
     where: {
       ...decomposedWhere,
-      [deletedAtField]: { not: null },
+      [deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE },
     },
   });
 
@@ -1168,7 +1253,7 @@ async function restoreWithCascadeInTx(
       const existing = await delegate.findFirst({
         where: {
           [field]: value,
-          [deletedAtField]: null,
+          [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
         },
       });
 
@@ -1184,7 +1269,7 @@ async function restoreWithCascadeInTx(
   const deletedByField = getDeletedByField(modelName);
   const updateData: Record<string, unknown> = {
     ...unmangledFields,
-    [deletedAtField]: null,
+    [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
   };
 
   if (deletedByField) {
@@ -1267,7 +1352,7 @@ async function restoreCascadeChildren(
           const existing = await childDelegate.findFirst({
             where: {
               [field]: value,
-              [child.deletedAtField]: null,
+              [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
             },
           });
 
@@ -1282,7 +1367,7 @@ async function restoreCascadeChildren(
 
       const updateData: Record<string, unknown> = {
         ...unmangledFields,
-        [child.deletedAtField]: null,
+        [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
       };
 
       if (child.deletedByField) {
@@ -1336,7 +1421,7 @@ async function previewSoftDeleteInTx(
   const records = await delegate.findMany({
     where: {
       ...decomposedWhere,
-      [deletedAtField]: null,
+      [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
     },
   });
 
@@ -1388,7 +1473,7 @@ async function previewCascadeChildren(
     const childRecords = await childDelegate.findMany({
       where: {
         OR: childWhereConditions,
-        ...(child.deletedAtField ? { [child.deletedAtField]: null } : {}),
+        ...(child.deletedAtField ? { [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE } : {}),
       },
     });
 
@@ -1424,26 +1509,63 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     const simple = isSimpleModel(model, options);
 
     // Common parts shared between simple and complex delegates
+    const findUniqueMethods = options.uniqueStrategy === 'sentinel'
+      ? `
+    findUnique: ((...args: any[]) => {
+      const filtered = injectFilters(args[0], '${name}');
+      if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');
+      return original.findUnique(filtered);
+    }) as PrismaClient['${lowerName}']['findUnique'],
+    findUniqueOrThrow: ((...args: any[]) => {
+      const filtered = injectFilters(args[0], '${name}');
+      if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');
+      return original.findUniqueOrThrow(filtered);
+    }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`
+      : `
+    findUnique: ((...args: any[]) => original.findUnique(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findUnique'],
+    findUniqueOrThrow: ((...args: any[]) => original.findUniqueOrThrow(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`;
+
     const readMethods = `
     // Wrapped methods with filter injection
     findMany: ((...args: any[]) => original.findMany(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findMany'],
     findFirst: ((...args: any[]) => original.findFirst(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findFirst'],
-    findFirstOrThrow: ((...args: any[]) => original.findFirstOrThrow(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],
-    findUnique: ((...args: any[]) => original.findUnique(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findUnique'],
-    findUniqueOrThrow: ((...args: any[]) => original.findUniqueOrThrow(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],
+    findFirstOrThrow: ((...args: any[]) => original.findFirstOrThrow(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],${findUniqueMethods}
     count: ((...args: any[]) => original.count(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['count'],
     aggregate: ((...args: any[]) => original.aggregate(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['aggregate'],
     groupBy: ((...args: any[]) => original.groupBy(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['groupBy'],`;
 
-    const writeMethods = `
-    // Pass-through methods (no filter needed for writes)
+    const createMethods = options.uniqueStrategy === 'sentinel'
+      ? `
+    // Create methods - inject sentinel value for deleted_at
+    create: ((args: any) => original.create({ ...args, data: { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['create'],
+    createMany: ((args: any) => {
+      const data = Array.isArray(args.data)
+        ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))
+        : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };
+      return original.createMany({ ...args, data });
+    }) as PrismaClient['${lowerName}']['createMany'],
+    createManyAndReturn: ((args: any) => {
+      const data = Array.isArray(args.data)
+        ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))
+        : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };
+      return original.createManyAndReturn({ ...args, data });
+    }) as PrismaClient['${lowerName}']['createManyAndReturn'],`
+      : `
+    // Pass-through methods (no filter needed for creates)
     create: ((args: any) => original.create(args)) as PrismaClient['${lowerName}']['create'],
     createMany: ((args: any) => original.createMany(args)) as PrismaClient['${lowerName}']['createMany'],
-    createManyAndReturn: ((args: any) => original.createManyAndReturn(args)) as PrismaClient['${lowerName}']['createManyAndReturn'],
+    createManyAndReturn: ((args: any) => original.createManyAndReturn(args)) as PrismaClient['${lowerName}']['createManyAndReturn'],`;
+
+    const upsertMethod = options.uniqueStrategy === 'sentinel'
+      ? `
+    upsert: ((args: any) => original.upsert({ ...args, create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['upsert'],`
+      : `
+    upsert: ((args: any) => original.upsert(args)) as PrismaClient['${lowerName}']['upsert'],`;
+
+    const writeMethods = `${createMethods}
     update: ((args: any) => original.update(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['update'],
     updateMany: ((args: any) => original.updateMany(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['updateMany'],
-    updateManyAndReturn: ((args: any) => original.updateManyAndReturn(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],
-    upsert: ((args: any) => original.upsert(args)) as PrismaClient['${lowerName}']['upsert'],
+    updateManyAndReturn: ((args: any) => original.updateManyAndReturn(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],${upsertMethod}
     fields: original.fields,`;
 
     const restoreMethods = `
@@ -1494,7 +1616,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       const now = new Date();
       const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };${deletedByUpdate}
       await original.updateMany({
-        where: { ...decomposedWhere, ['${deletedAtField}']: null },
+        where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
         data: updateData,
       });
       const record = await original.findFirst({ where: decomposedWhere });
@@ -1504,7 +1626,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       const { deletedBy, ...rest } = args;
       const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdate}
       const result = await original.updateMany({
-        where: { ...rest.where, ['${deletedAtField}']: null },
+        where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
         data: updateData,
       });
       return { count: result.count, cascaded: {} };
@@ -1514,7 +1636,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     // Preview soft delete (read-only)
     softDeletePreview: (async (args: any) => {
       const count = await original.count({
-        where: { ...args.where, ['${deletedAtField}']: null },
+        where: { ...args.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
       });
       return { wouldDelete: count > 0 ? { ['${name}']: count } : {} };
     }) as Safe${name}Delegate['softDeletePreview'],`;
@@ -1649,19 +1771,52 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`      findMany: ((...args: any[]) => tx.${lowerName}.findMany(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findMany'],`);
       lines.push(`      findFirst: ((...args: any[]) => tx.${lowerName}.findFirst(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findFirst'],`);
       lines.push(`      findFirstOrThrow: ((...args: any[]) => tx.${lowerName}.findFirstOrThrow(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
-      lines.push(`      findUnique: ((...args: any[]) => tx.${lowerName}.findUnique(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findUnique'],`);
-      lines.push(`      findUniqueOrThrow: ((...args: any[]) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
+      if (options.uniqueStrategy === 'sentinel') {
+        lines.push(`      findUnique: ((...args: any[]) => {`);
+        lines.push(`        const filtered = injectFilters(args[0], '${model.name}');`);
+        lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
+        lines.push(`        return tx.${lowerName}.findUnique(filtered);`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['findUnique'],`);
+        lines.push(`      findUniqueOrThrow: ((...args: any[]) => {`);
+        lines.push(`        const filtered = injectFilters(args[0], '${model.name}');`);
+        lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
+        lines.push(`        return tx.${lowerName}.findUniqueOrThrow(filtered);`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
+      } else {
+        lines.push(`      findUnique: ((...args: any[]) => tx.${lowerName}.findUnique(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findUnique'],`);
+        lines.push(`      findUniqueOrThrow: ((...args: any[]) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
+      }
       lines.push(`      count: ((...args: any[]) => tx.${lowerName}.count(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['count'],`);
       lines.push(`      aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`      groupBy: ((...args: any[]) => tx.${lowerName}.groupBy(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['groupBy'],`);
       // Write operations
-      lines.push(`      create: ((args: any) => tx.${lowerName}.create(args)) as PrismaClient['${lowerName}']['create'],`);
-      lines.push(`      createMany: ((args: any) => tx.${lowerName}.createMany(args)) as PrismaClient['${lowerName}']['createMany'],`);
-      lines.push(`      createManyAndReturn: ((args: any) => tx.${lowerName}.createManyAndReturn(args)) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
+      if (options.uniqueStrategy === 'sentinel') {
+        lines.push(`      create: ((args: any) => tx.${lowerName}.create({ ...args, data: { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['create'],`);
+        lines.push(`      createMany: ((args: any) => {`);
+        lines.push(`        const data = Array.isArray(args.data)`);
+        lines.push(`          ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+        lines.push(`          : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+        lines.push(`        return tx.${lowerName}.createMany({ ...args, data });`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['createMany'],`);
+        lines.push(`      createManyAndReturn: ((args: any) => {`);
+        lines.push(`        const data = Array.isArray(args.data)`);
+        lines.push(`          ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+        lines.push(`          : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+        lines.push(`        return tx.${lowerName}.createManyAndReturn({ ...args, data });`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
+      } else {
+        lines.push(`      create: ((args: any) => tx.${lowerName}.create(args)) as PrismaClient['${lowerName}']['create'],`);
+        lines.push(`      createMany: ((args: any) => tx.${lowerName}.createMany(args)) as PrismaClient['${lowerName}']['createMany'],`);
+        lines.push(`      createManyAndReturn: ((args: any) => tx.${lowerName}.createManyAndReturn(args)) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
+      }
       lines.push(`      update: ((args: any) => tx.${lowerName}.update(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['update'],`);
       lines.push(`      updateMany: ((args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateMany'],`);
       lines.push(`      updateManyAndReturn: ((args: any) => tx.${lowerName}.updateManyAndReturn(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
-      lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(args)) as PrismaClient['${lowerName}']['upsert'],`);
+      if (options.uniqueStrategy === 'sentinel') {
+        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert({ ...args, create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['upsert'],`);
+      } else {
+        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(args)) as PrismaClient['${lowerName}']['upsert'],`);
+      }
       lines.push(`      fields: tx.${lowerName}.fields,`);
 
       if (simple) {
@@ -1678,7 +1833,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`        }`);
         }
         lines.push(`        await tx.${lowerName}.updateMany({`);
-        lines.push(`          where: { ...decomposedWhere, ['${deletedAtField}']: null },`);
+        lines.push(`          where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },`);
         lines.push(`          data: updateData,`);
         lines.push(`        });`);
         lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere });`);
@@ -1694,7 +1849,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`        }`);
         }
         lines.push(`        const result = await tx.${lowerName}.updateMany({`);
-        lines.push(`          where: { ...rest.where, ['${deletedAtField}']: null },`);
+        lines.push(`          where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },`);
         lines.push(`          data: updateData,`);
         lines.push(`        });`);
         lines.push(`        return { count: result.count, cascaded: {} };`);
@@ -1702,7 +1857,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         // Preview (fast path - simple count)
         lines.push(`      softDeletePreview: (async (args: any) => {`);
         lines.push(`        const count = await tx.${lowerName}.count({`);
-        lines.push(`          where: { ...args.where, ['${deletedAtField}']: null },`);
+        lines.push(`          where: { ...args.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },`);
         lines.push(`        });`);
         lines.push(`        return { wouldDelete: count > 0 ? { ['${model.name}']: count } : {} };`);
         lines.push(`      }) as Safe${model.name}Delegate['softDeletePreview'],`);

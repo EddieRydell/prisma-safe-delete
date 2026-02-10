@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
   parseDMMF,
+  type ParsedModel,
   type ParsedSchema,
   type UniqueConstraintInfo,
 } from './dmmf-parser.js';
@@ -19,8 +20,10 @@ import {
  * Strategy for handling unique constraints on soft delete.
  * - 'mangle': Append "__deleted_{pk}" suffix to unique string fields (default)
  * - 'none': Skip mangling; use this if you set up partial unique indexes yourself
+ * - 'sentinel': Use a far-future sentinel date (9999-12-31) instead of NULL for active records,
+ *   enabling @@unique([field, deleted_at]) compound constraints at the DB level
  */
-export type UniqueStrategy = 'mangle' | 'none';
+export type UniqueStrategy = 'mangle' | 'none' | 'sentinel';
 
 /**
  * ANSI color codes for terminal output
@@ -200,6 +203,237 @@ function emitUniqueStrategyWarning(schema: ParsedSchema): void {
 }
 
 /**
+ * Info about a unique field that cannot be mangled.
+ */
+interface UnmangleableFieldInfo {
+  model: string;
+  deletedAtField: string;
+  fieldName: string;
+  fieldType: string;
+}
+
+/**
+ * Builds warning lines for mangle strategy when there are unique fields that
+ * cannot be mangled (non-string types, UUID native types, etc.).
+ * Exported for testing.
+ */
+export function buildMangleWarningLines(
+  schema: ParsedSchema,
+  useColors = true,
+): string[] {
+  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  if (softDeletableModels.length === 0) return [];
+
+  const unmangleableFields: UnmangleableFieldInfo[] = [];
+
+  for (const model of softDeletableModels) {
+    const deletedAtField = model.deletedAtField ?? 'deleted_at';
+    const mangleableSet = new Set(model.uniqueStringFields);
+
+    for (const fieldName of model.allUniqueFields) {
+      // Skip deleted_at itself
+      if (fieldName === model.deletedAtField) continue;
+      if (!mangleableSet.has(fieldName)) {
+        const field = model.fields.find(f => f.name === fieldName);
+        unmangleableFields.push({
+          model: model.name,
+          deletedAtField,
+          fieldName,
+          fieldType: field?.type ?? 'unknown',
+        });
+      }
+    }
+  }
+
+  if (unmangleableFields.length === 0) return [];
+
+  const y = useColors ? YELLOW : '';
+  const cn = useColors ? CYAN : '';
+  const r = useColors ? RESET : '';
+  const b = useColors ? BOLD : '';
+
+  const lines: string[] = [
+    '',
+    `${y}${b}⚠️  prisma-safe-delete: uniqueStrategy is 'mangle'${r}`,
+    `${y}   Some unique fields cannot be mangled and need partial unique indexes instead.${r}`,
+    `${y}   Mangling only works on String fields (excluding @db.Uuid).${r}`,
+    '',
+  ];
+
+  // Group by model
+  const byModel = new Map<string, UnmangleableFieldInfo[]>();
+  for (const info of unmangleableFields) {
+    const existing = byModel.get(info.model) ?? [];
+    existing.push(info);
+    byModel.set(info.model, existing);
+  }
+
+  lines.push(`${cn}   Fields requiring partial unique indexes:${r}`);
+  for (const [model, fields] of byModel) {
+    const desc = fields.map(f => `${f.fieldName} (${f.fieldType})`).join(', ');
+    lines.push(`     - ${model}: ${desc}`);
+  }
+
+  lines.push('');
+  lines.push(`${cn}   Example SQL (PostgreSQL):${r}`);
+  for (const info of unmangleableFields) {
+    const indexName = `${info.model.toLowerCase()}_${info.fieldName}_active`;
+    lines.push(
+      `     CREATE UNIQUE INDEX ${indexName} ON "${info.model}"(${info.fieldName}) WHERE ${info.deletedAtField} IS NULL;`,
+    );
+  }
+
+  lines.push('');
+
+  return lines;
+}
+
+/**
+ * Emits a warning when uniqueStrategy is 'mangle' and there are unmangleable unique fields.
+ */
+function emitMangleWarning(schema: ParsedSchema): void {
+  const lines = buildMangleWarningLines(schema);
+  if (lines.length > 0) {
+    // eslint-disable-next-line no-console
+    console.log(lines.join('\n'));
+  }
+}
+
+/**
+ * Sentinel field configuration status for a model.
+ */
+interface SentinelFieldStatus {
+  model: string;
+  deletedAtField: string;
+  /** true if the field is non-nullable with a default (correct for sentinel) */
+  isCorrectlyConfigured: boolean;
+  /** true if the field is nullable (traditional mangle/none pattern) */
+  isNullable: boolean;
+}
+
+/**
+ * Checks whether a soft-deletable model's deleted_at field is correctly configured
+ * for the sentinel strategy (non-nullable DateTime with @default).
+ */
+function checkSentinelFieldConfig(model: ParsedModel): SentinelFieldStatus | null {
+  if (!model.isSoftDeletable || model.deletedAtField === null) return null;
+
+  const field = model.fields.find(f => f.name === model.deletedAtField);
+  if (field === undefined) return null;
+
+  return {
+    model: model.name,
+    deletedAtField: model.deletedAtField,
+    isCorrectlyConfigured: field.isRequired && field.hasDefaultValue,
+    isNullable: !field.isRequired,
+  };
+}
+
+/**
+ * Builds warning lines for sentinel strategy.
+ * Validates per-model field configuration and unique constraint setup.
+ * Exported for testing.
+ */
+export function buildSentinelWarningLines(
+  schema: ParsedSchema,
+  useColors = true,
+): string[] {
+  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  if (softDeletableModels.length === 0) return [];
+
+  const y = useColors ? YELLOW : '';
+  const cn = useColors ? CYAN : '';
+  const r = useColors ? RESET : '';
+  const b = useColors ? BOLD : '';
+
+  const lines: string[] = [
+    '',
+    `${y}${b}ℹ️  prisma-safe-delete: uniqueStrategy is 'sentinel'${r}`,
+    `${y}   Active records use deleted_at = '9999-12-31' (sentinel) instead of NULL.${r}`,
+  ];
+
+  // Check each model's deleted_at field configuration
+  const fieldStatuses = softDeletableModels
+    .map(m => checkSentinelFieldConfig(m))
+    .filter((s): s is SentinelFieldStatus => s !== null);
+
+  const misconfiguredFields = fieldStatuses.filter(s => !s.isCorrectlyConfigured);
+  const correctlyConfiguredFields = fieldStatuses.filter(s => s.isCorrectlyConfigured);
+
+  if (misconfiguredFields.length > 0) {
+    lines.push('');
+    lines.push(`${y}${b}   ⚠️  deleted_at field misconfigured for sentinel strategy:${r}`);
+    for (const status of misconfiguredFields) {
+      if (status.isNullable) {
+        lines.push(`     - ${status.model}: ${status.deletedAtField} is nullable (DateTime?) — must be non-nullable with @default`);
+      } else {
+        lines.push(`     - ${status.model}: ${status.deletedAtField} is non-nullable but missing @default`);
+      }
+    }
+    lines.push(`${cn}   Required: ${misconfiguredFields[0]?.deletedAtField ?? 'deleted_at'} DateTime @default(dbgenerated("'9999-12-31 00:00:00'"))${r}`);
+    lines.push(`${cn}   Migration: UPDATE "Model" SET ${misconfiguredFields[0]?.deletedAtField ?? 'deleted_at'} = '9999-12-31' WHERE ${misconfiguredFields[0]?.deletedAtField ?? 'deleted_at'} IS NULL${r}`);
+  }
+
+  // List models with unique constraints that include deleted_at (good pattern for sentinel)
+  const modelsWithCompound = softDeletableModels.filter(m =>
+    m.uniqueConstraints.some(c => c.includesDeletedAt)
+  );
+  if (modelsWithCompound.length > 0 || correctlyConfiguredFields.length > 0) {
+    lines.push('');
+    lines.push(`${cn}   Correctly configured:${r}`);
+    // Show field config status for correctly configured models
+    for (const status of correctlyConfiguredFields) {
+      const model = softDeletableModels.find(m => m.name === status.model);
+      const compounds = model?.uniqueConstraints.filter(c => c.includesDeletedAt) ?? [];
+      if (compounds.length > 0) {
+        const desc = compounds.map(c => `@@unique([${c.fields.join(', ')}, ${status.deletedAtField}])`).join(', ');
+        lines.push(`     - ${status.model}: ${status.deletedAtField} ✓, ${desc}`);
+      } else {
+        lines.push(`     - ${status.model}: ${status.deletedAtField} ✓`);
+      }
+    }
+  }
+
+  // Warn about standalone @unique fields that should be compound
+  const modelsWithStandalone = softDeletableModels.filter(m =>
+    m.uniqueConstraints.some(c => !c.includesDeletedAt)
+  );
+  if (modelsWithStandalone.length > 0) {
+    lines.push('');
+    lines.push(`${y}${b}   ⚠️  Standalone unique constraints detected (should include deleted_at):${r}`);
+    for (const model of modelsWithStandalone) {
+      const standalones = model.uniqueConstraints.filter(c => !c.includesDeletedAt);
+      const desc = standalones.map(c =>
+        c.fields.length > 1 ? `(${c.fields.join(', ')})` : c.fields[0]
+      ).join(', ');
+      lines.push(`     - ${model.name}: ${desc}`);
+    }
+    lines.push(`${cn}   Convert to compound: @@unique([field, ${softDeletableModels[0]?.deletedAtField ?? 'deleted_at'}])${r}`);
+  }
+
+  // If there are no issues at all, show a brief confirmation
+  if (misconfiguredFields.length === 0 && modelsWithStandalone.length === 0) {
+    lines.push('');
+    lines.push(`${cn}   All models correctly configured for sentinel strategy.${r}`);
+  }
+
+  lines.push('');
+
+  return lines;
+}
+
+/**
+ * Emits a warning when uniqueStrategy is 'sentinel' about schema requirements.
+ */
+function emitSentinelWarning(schema: ParsedSchema): void {
+  const lines = buildSentinelWarningLines(schema);
+  if (lines.length > 0) {
+    // eslint-disable-next-line no-console
+    console.log(lines.join('\n'));
+  }
+}
+
+/**
  * Computes the relative import path from our output directory to the Prisma client.
  * Returns a path like '../client/client.js' for ESM compatibility with NodeNext module resolution.
  */
@@ -246,7 +480,9 @@ generatorHandler({
     // Read custom config options
     const rawStrategy = options.generator.config['uniqueStrategy'] as string | undefined;
     const uniqueStrategy: UniqueStrategy =
-      rawStrategy === 'none' ? 'none' : 'mangle'; // Default to 'mangle'
+      rawStrategy === 'none' ? 'none'
+      : rawStrategy === 'sentinel' ? 'sentinel'
+      : 'mangle'; // Default to 'mangle'
 
     const deletedAtFieldName = options.generator.config['deletedAtField'] as string | undefined;
     const deletedByFieldName = options.generator.config['deletedByField'] as string | undefined;
@@ -280,9 +516,13 @@ generatorHandler({
       ...(deletedByFieldName !== undefined ? { deletedByField: deletedByFieldName } : {}),
     });
 
-    // Emit warning if uniqueStrategy is 'none' and there are unique fields
+    // Emit strategy-specific warnings about unique constraint configuration
     if (uniqueStrategy === 'none') {
       emitUniqueStrategyWarning(schema);
+    } else if (uniqueStrategy === 'sentinel') {
+      emitSentinelWarning(schema);
+    } else {
+      emitMangleWarning(schema);
     }
 
     // Build the cascade graph
