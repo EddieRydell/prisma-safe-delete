@@ -3,6 +3,10 @@ import { execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseDMMF } from '../../src/dmmf-parser.js';
+import { buildCascadeGraph } from '../../src/cascade-graph.js';
+import { emitRuntime, emitTypes, emitCascadeGraph, emitIndex } from '../../src/codegen/index.js';
+import { createMockField, createMockModel, createMockDMMF } from '../helpers/mock-dmmf.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const integrationDir = __dirname;
@@ -411,6 +415,94 @@ async function test() {
     expect(content).toContain('createUserDelegate');
     expect(content).toContain('createPostDelegate');
     expect(content).toContain('createAuditLogDelegate');
+  });
+});
+
+describe('Integration: sentinel strategy compilation', () => {
+  it('sentinel-generated code compiles with --noUnusedLocals', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String' }),
+          createMockField({
+            name: 'deleted_at',
+            type: 'DateTime',
+            isRequired: true,
+            hasDefaultValue: true,
+          }),
+          createMockField({
+            name: 'posts',
+            type: 'Post',
+            kind: 'object',
+            isList: true,
+            relationName: 'UserPosts',
+          }),
+        ],
+        uniqueFields: [['email', 'deleted_at']],
+        uniqueIndexes: [{ name: 'email_deleted_at', fields: ['email', 'deleted_at'] }],
+      }),
+      createMockModel({
+        name: 'Post',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'title', type: 'String' }),
+          createMockField({ name: 'authorId', type: 'String' }),
+          createMockField({
+            name: 'author',
+            type: 'User',
+            kind: 'object',
+            relationName: 'UserPosts',
+            relationFromFields: ['authorId'],
+            relationToFields: ['id'],
+            relationOnDelete: 'Cascade',
+          }),
+          createMockField({
+            name: 'deleted_at',
+            type: 'DateTime',
+            isRequired: true,
+            hasDefaultValue: true,
+          }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const cascadeGraph = buildCascadeGraph(schema);
+
+    // Use the same client import path as the integration test
+    const clientImportPath = '../client/client.js';
+    const runtimeContent = emitRuntime(schema, clientImportPath, { uniqueStrategy: 'sentinel', cascadeGraph });
+    const typesContent = emitTypes(schema, clientImportPath);
+    const cascadeGraphContent = emitCascadeGraph(cascadeGraph);
+    const indexContent = emitIndex(schema);
+
+    // Write to temporary directory
+    const sentinelDir = path.join(integrationDir, 'generated', 'sentinel-test');
+    fs.mkdirSync(sentinelDir, { recursive: true });
+
+    try {
+      fs.writeFileSync(path.join(sentinelDir, 'runtime.ts'), runtimeContent, 'utf-8');
+      fs.writeFileSync(path.join(sentinelDir, 'types.ts'), typesContent, 'utf-8');
+      fs.writeFileSync(path.join(sentinelDir, 'cascade-graph.ts'), cascadeGraphContent, 'utf-8');
+      fs.writeFileSync(path.join(sentinelDir, 'index.ts'), indexContent, 'utf-8');
+
+      // Compile with --noUnusedLocals (same as main integration test)
+      execSync(
+        `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --noUnusedLocals ${path.join(sentinelDir, 'index.ts')}`,
+        {
+          cwd: integrationDir,
+          stdio: 'pipe',
+          encoding: 'utf-8',
+        }
+      );
+      // If we get here, it compiled successfully
+      expect(true).toBe(true);
+    } finally {
+      // Clean up
+      fs.rmSync(sentinelDir, { recursive: true, force: true });
+    }
   });
 });
 

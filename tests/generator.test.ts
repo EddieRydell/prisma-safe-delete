@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   collectModelsWithUniqueFields,
   buildUniqueStrategyWarningLines,
+  buildSentinelWarningLines,
   type UniqueFieldInfo,
 } from '../src/generator.js';
 import { parseDMMF } from '../src/dmmf-parser.js';
@@ -182,7 +183,7 @@ describe('collectModelsWithUniqueFields', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0]!.compoundWithDeletedAt).toEqual([
-      { fields: ['org_id', 'name'], includesDeletedAt: true },
+      { fields: ['org_id', 'name'], includesDeletedAt: true, compoundKeyName: 'org_id_name_deleted_at' },
     ]);
     expect(result[0]!.constraintsNeedingIndexes).toEqual([]);
   });
@@ -206,7 +207,7 @@ describe('collectModelsWithUniqueFields', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0]!.constraintsNeedingIndexes).toEqual([
-      { fields: ['org_id', 'name'], includesDeletedAt: false },
+      { fields: ['org_id', 'name'], includesDeletedAt: false, compoundKeyName: 'org_id_name' },
     ]);
     expect(result[0]!.compoundWithDeletedAt).toEqual([]);
   });
@@ -237,10 +238,10 @@ describe('collectModelsWithUniqueFields', () => {
     expect(result).toHaveLength(1);
     expect(result[0]!.constraintsNeedingIndexes).toEqual([
       { fields: ['slug'], includesDeletedAt: false },
-      { fields: ['tenant_id', 'code'], includesDeletedAt: false },
+      { fields: ['tenant_id', 'code'], includesDeletedAt: false, compoundKeyName: 'tenant_id_code' },
     ]);
     expect(result[0]!.compoundWithDeletedAt).toEqual([
-      { fields: ['org_id', 'name'], includesDeletedAt: true },
+      { fields: ['org_id', 'name'], includesDeletedAt: true, compoundKeyName: 'org_id_name_deleted_at' },
     ]);
   });
 
@@ -263,7 +264,7 @@ describe('collectModelsWithUniqueFields', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0]!.compoundWithDeletedAt).toEqual([
-      { fields: ['orgId', 'slug'], includesDeletedAt: true },
+      { fields: ['orgId', 'slug'], includesDeletedAt: true, compoundKeyName: 'orgId_slug_deletedAt' },
     ]);
   });
 
@@ -584,5 +585,100 @@ describe('buildUniqueStrategyWarningLines', () => {
         line.includes('resource_slug_active ON "Resource"(slug)')
       )
     ).toBe(true);
+  });
+});
+
+describe('buildSentinelWarningLines', () => {
+  it('returns empty array when no soft-deletable models', () => {
+    const models = [
+      createMockModel({
+        name: 'AuditLog',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'action', type: 'String' }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    expect(result).toEqual([]);
+  });
+
+  it('includes sentinel strategy header', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes("uniqueStrategy is 'sentinel'"))).toBe(true);
+    expect(result.some((line) => line.includes('9999-12-31'))).toBe(true);
+  });
+
+  it('warns about standalone unique constraints', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes('Standalone unique constraints detected'))).toBe(true);
+    expect(result.some((line) => line.includes('User: email'))).toBe(true);
+  });
+
+  it('shows correctly configured compound uniques', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+        uniqueFields: [['email', 'deleted_at']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes('correctly configured'))).toBe(true);
+    expect(result.some((line) => line.includes('@@unique([email, deleted_at])'))).toBe(true);
+  });
+
+  it('mentions schema requirements', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = buildSentinelWarningLines(schema, false);
+
+    expect(result.some((line) => line.includes('non-nullable DateTime'))).toBe(true);
+    expect(result.some((line) => line.includes('@@unique([field, deleted_at])'))).toBe(true);
   });
 });

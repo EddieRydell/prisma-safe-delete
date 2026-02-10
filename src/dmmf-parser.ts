@@ -35,6 +35,8 @@ export interface UniqueConstraintInfo {
   fields: string[];
   /** Whether deleted_at/deletedAt was part of a compound @@unique */
   includesDeletedAt: boolean;
+  /** The compound key name used by Prisma for findUnique where clauses (e.g. "email_deleted_at") */
+  compoundKeyName?: string;
 }
 
 /**
@@ -93,11 +95,18 @@ function findFieldByNames(
 }
 
 /**
- * Determines if a field is suitable as a deleted_at marker
- * Must be DateTime and nullable
+ * Determines if a field is suitable as a deleted_at marker.
+ * Accepts:
+ * - Nullable DateTime (traditional: deleted_at DateTime?)
+ * - Non-nullable DateTime with default (sentinel: deleted_at DateTime @default(...))
  */
 function isValidDeletedAtField(field: DMMFField): boolean {
-  return field.type === 'DateTime' && !field.isRequired;
+  if (field.type !== 'DateTime') return false;
+  // Nullable DateTime — traditional mangle/none strategy
+  if (!field.isRequired) return true;
+  // Non-nullable DateTime with default — sentinel strategy
+  if (field.hasDefaultValue) return true;
+  return false;
 }
 
 /**
@@ -274,8 +283,15 @@ function extractUniqueConstraints(
     }
   }
 
-  // Compound @@unique constraints
-  for (const uniqueConstraint of model.uniqueFields) {
+  // Compound @@unique constraints — use uniqueIndexes for name, fall back to uniqueFields
+  // uniqueIndexes has { name, fields } while uniqueFields is just string[][]
+  // This property exists at runtime but is not in the @prisma/generator-helper types
+  interface UniqueIndex { name: string | null; fields: string[] }
+  const uniqueIndexes = (model as unknown as { uniqueIndexes?: UniqueIndex[] }).uniqueIndexes;
+
+  for (let i = 0; i < model.uniqueFields.length; i++) {
+    const uniqueConstraint = model.uniqueFields[i];
+    if (uniqueConstraint === undefined) continue;
     const hasDeletedAt =
       deletedAtFieldName !== null &&
       uniqueConstraint.includes(deletedAtFieldName);
@@ -284,9 +300,14 @@ function extractUniqueConstraints(
       : [...uniqueConstraint];
 
     if (fieldsWithoutDeletedAt.length > 0) {
+      // Get the compound key name from uniqueIndexes if available
+      const indexInfo = uniqueIndexes?.[i];
+      const compoundKeyName = indexInfo?.name ?? uniqueConstraint.join('_');
+
       constraints.push({
         fields: fieldsWithoutDeletedAt,
         includesDeletedAt: hasDeletedAt,
+        compoundKeyName,
       });
     }
   }

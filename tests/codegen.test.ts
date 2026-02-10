@@ -255,7 +255,7 @@ describe('emitRuntime', () => {
     const schema = createTestSchema();
     const output = emitRuntime(schema, TEST_CLIENT_PATH);
 
-    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'mangle'");
+    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' | 'sentinel' = 'mangle'");
   });
 
   it('respects uniqueStrategy: none option', () => {
@@ -263,9 +263,9 @@ describe('emitRuntime', () => {
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
 
-    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'none'");
+    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' | 'sentinel' = 'none'");
     // mangleUniqueFields should still exist but will return {} at runtime
-    expect(output).toContain("if (UNIQUE_STRATEGY === 'none') return {}");
+    expect(output).toContain("if (UNIQUE_STRATEGY === 'none' || UNIQUE_STRATEGY === 'sentinel') return {}");
   });
 
   it('respects uniqueStrategy: mangle option', () => {
@@ -273,7 +273,7 @@ describe('emitRuntime', () => {
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' = 'mangle'");
+    expect(output).toContain("const UNIQUE_STRATEGY: 'mangle' | 'none' | 'sentinel' = 'mangle'");
   });
 
   it('generates SOFT_DELETABLE_MODELS map', () => {
@@ -585,6 +585,206 @@ describe('emitRuntime', () => {
     expect(userSection).not.toBeNull();
     expect(userSection![0]).toContain('softDeletePreview');
     expect(userSection![0]).toContain('previewSoftDeleteInTx');
+  });
+});
+
+function createSentinelSchema() {
+  // Sentinel strategy: deleted_at is non-nullable DateTime with default
+  const models = [
+    createMockModel({
+      name: 'User',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String' }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: true,
+          hasDefaultValue: true,
+        }),
+      ],
+      uniqueFields: [['email', 'deleted_at']],
+      uniqueIndexes: [{ name: 'email_deleted_at', fields: ['email', 'deleted_at'] }],
+    }),
+    createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'title', type: 'String' }),
+        createMockField({ name: 'authorId', type: 'String' }),
+        createMockField({
+          name: 'author',
+          type: 'User',
+          kind: 'object',
+          relationName: 'UserPosts',
+          relationFromFields: ['authorId'],
+          relationToFields: ['id'],
+          relationOnDelete: 'Cascade',
+        }),
+        createMockField({
+          name: 'deleted_at',
+          type: 'DateTime',
+          isRequired: true,
+          hasDefaultValue: true,
+        }),
+      ],
+    }),
+  ];
+
+  return parseDMMF(createMockDMMF(models));
+}
+
+describe('emitRuntime - sentinel strategy', () => {
+  it('emits ACTIVE_DELETED_AT_VALUE as Date for sentinel', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    expect(output).toContain("const ACTIVE_DELETED_AT_VALUE: Date = new Date('9999-12-31T00:00:00.000Z')");
+  });
+
+  it('emits ACTIVE_DELETED_AT_VALUE as null for mangle', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).toContain('const ACTIVE_DELETED_AT_VALUE: null = null');
+  });
+
+  it('emits ACTIVE_DELETED_AT_VALUE as null for none', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
+
+    expect(output).toContain('const ACTIVE_DELETED_AT_VALUE: null = null');
+  });
+
+  it('emits SENTINEL_COMPOUND_UNIQUES metadata for sentinel', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    expect(output).toContain('const SENTINEL_COMPOUND_UNIQUES');
+    expect(output).toContain('User: [{ keyName: "email_deleted_at"');
+  });
+
+  it('does not emit SENTINEL_COMPOUND_UNIQUES for mangle', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).not.toContain('SENTINEL_COMPOUND_UNIQUES');
+  });
+
+  it('emits transformSentinelFindUniqueWhere for sentinel', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    expect(output).toContain('function transformSentinelFindUniqueWhere');
+  });
+
+  it('does not emit transformSentinelFindUniqueWhere for mangle', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).not.toContain('transformSentinelFindUniqueWhere');
+  });
+
+  it('sentinel uses fast path for leaf models (like none)', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // Post is a leaf model (no children) - should use fast path with sentinel
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    expect(postDelegate![0]).not.toContain('softDeleteWithCascade');
+    expect(postDelegate![0]).toContain('original.updateMany');
+  });
+
+  it('sentinel uses complex path for models with children', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // User has cascade child Post - should use complex path
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('softDeleteWithCascade');
+  });
+
+  it('sentinel create methods inject ACTIVE_DELETED_AT_VALUE', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // Model delegate should inject sentinel into create
+    expect(output).toContain("ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['user']['create']");
+    expect(output).toContain("ACTIVE_DELETED_AT_VALUE }))");
+  });
+
+  it('non-sentinel create methods are pass-through', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Create should be pass-through for mangle
+    expect(output).toContain("create: ((args: any) => original.create(args))");
+  });
+
+  it('sentinel findUnique calls transformSentinelFindUniqueWhere', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    expect(output).toContain('transformSentinelFindUniqueWhere');
+  });
+
+  it('uses ACTIVE_DELETED_AT_VALUE in getModeFilter', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    expect(output).toContain('[deletedAtField]: ACTIVE_DELETED_AT_VALUE');
+    expect(output).toContain('[deletedAtField]: { not: ACTIVE_DELETED_AT_VALUE }');
+  });
+
+  it('uses ACTIVE_DELETED_AT_VALUE in soft delete where clauses', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // Simple-path softDelete should use ACTIVE_DELETED_AT_VALUE
+    expect(output).toContain("['deleted_at']: ACTIVE_DELETED_AT_VALUE }");
+  });
+
+  it('mangle/unmangle return empty for sentinel', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    expect(output).toContain("if (UNIQUE_STRATEGY === 'none' || UNIQUE_STRATEGY === 'sentinel') return {}");
+  });
+
+  it('sentinel upsert injects ACTIVE_DELETED_AT_VALUE on create branch', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
+
+    // Model delegate upsert should inject sentinel into create data
+    expect(output).toContain("upsert: ((args: any) => original.upsert({ ...args, create: { ...args.create");
+    expect(output).toContain("ACTIVE_DELETED_AT_VALUE");
+  });
+
+  it('non-sentinel upsert is pass-through', () => {
+    const schema = createSentinelSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Upsert should be pass-through for mangle
+    expect(output).toContain("upsert: ((args: any) => original.upsert(args))");
   });
 });
 

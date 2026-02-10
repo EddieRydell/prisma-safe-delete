@@ -19,8 +19,10 @@ import {
  * Strategy for handling unique constraints on soft delete.
  * - 'mangle': Append "__deleted_{pk}" suffix to unique string fields (default)
  * - 'none': Skip mangling; use this if you set up partial unique indexes yourself
+ * - 'sentinel': Use a far-future sentinel date (9999-12-31) instead of NULL for active records,
+ *   enabling @@unique([field, deleted_at]) compound constraints at the DB level
  */
-export type UniqueStrategy = 'mangle' | 'none';
+export type UniqueStrategy = 'mangle' | 'none' | 'sentinel';
 
 /**
  * ANSI color codes for terminal output
@@ -200,6 +202,82 @@ function emitUniqueStrategyWarning(schema: ParsedSchema): void {
 }
 
 /**
+ * Builds warning lines for sentinel strategy.
+ * Exported for testing.
+ */
+export function buildSentinelWarningLines(
+  schema: ParsedSchema,
+  useColors = true,
+): string[] {
+  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  if (softDeletableModels.length === 0) return [];
+
+  const y = useColors ? YELLOW : '';
+  const cn = useColors ? CYAN : '';
+  const r = useColors ? RESET : '';
+  const b = useColors ? BOLD : '';
+
+  const lines: string[] = [
+    '',
+    `${y}${b}ℹ️  prisma-safe-delete: uniqueStrategy is 'sentinel'${r}`,
+    `${y}   Active records use deleted_at = '9999-12-31' (sentinel) instead of NULL.${r}`,
+    '',
+    `${cn}   Schema requirements for each soft-deletable model:${r}`,
+    `${cn}   1. deleted_at must be a non-nullable DateTime with a sentinel default:${r}`,
+    `     deleted_at DateTime @default(dbgenerated("'9999-12-31 00:00:00'"))`,
+    `${cn}   2. Use @@unique([field, deleted_at]) instead of standalone @unique(field):${r}`,
+    `     @@unique([email, deleted_at])`,
+    `${cn}   3. Existing active rows must be migrated: UPDATE "Model" SET deleted_at = '9999-12-31' WHERE deleted_at IS NULL${r}`,
+  ];
+
+  // List models with unique constraints that include deleted_at (good pattern for sentinel)
+  const modelsWithCompound = softDeletableModels.filter(m =>
+    m.uniqueConstraints.some(c => c.includesDeletedAt)
+  );
+  if (modelsWithCompound.length > 0) {
+    lines.push('');
+    lines.push(`${cn}   Models with sentinel compound uniques (correctly configured):${r}`);
+    for (const model of modelsWithCompound) {
+      const compounds = model.uniqueConstraints.filter(c => c.includesDeletedAt);
+      const desc = compounds.map(c => `@@unique([${c.fields.join(', ')}, ${String(model.deletedAtField)}])`).join(', ');
+      lines.push(`     - ${model.name}: ${desc}`);
+    }
+  }
+
+  // Warn about standalone @unique fields that should be compound
+  const modelsWithStandalone = softDeletableModels.filter(m =>
+    m.uniqueConstraints.some(c => !c.includesDeletedAt)
+  );
+  if (modelsWithStandalone.length > 0) {
+    lines.push('');
+    lines.push(`${y}${b}   ⚠️  Standalone unique constraints detected (should include deleted_at):${r}`);
+    for (const model of modelsWithStandalone) {
+      const standalones = model.uniqueConstraints.filter(c => !c.includesDeletedAt);
+      const desc = standalones.map(c =>
+        c.fields.length > 1 ? `(${c.fields.join(', ')})` : c.fields[0]
+      ).join(', ');
+      lines.push(`     - ${model.name}: ${desc}`);
+    }
+    lines.push(`${cn}   Convert to compound: @@unique([field, ${softDeletableModels[0]?.deletedAtField ?? 'deleted_at'}])${r}`);
+  }
+
+  lines.push('');
+
+  return lines;
+}
+
+/**
+ * Emits a warning when uniqueStrategy is 'sentinel' about schema requirements.
+ */
+function emitSentinelWarning(schema: ParsedSchema): void {
+  const lines = buildSentinelWarningLines(schema);
+  if (lines.length > 0) {
+    // eslint-disable-next-line no-console
+    console.log(lines.join('\n'));
+  }
+}
+
+/**
  * Computes the relative import path from our output directory to the Prisma client.
  * Returns a path like '../client/client.js' for ESM compatibility with NodeNext module resolution.
  */
@@ -246,7 +324,9 @@ generatorHandler({
     // Read custom config options
     const rawStrategy = options.generator.config['uniqueStrategy'] as string | undefined;
     const uniqueStrategy: UniqueStrategy =
-      rawStrategy === 'none' ? 'none' : 'mangle'; // Default to 'mangle'
+      rawStrategy === 'none' ? 'none'
+      : rawStrategy === 'sentinel' ? 'sentinel'
+      : 'mangle'; // Default to 'mangle'
 
     const deletedAtFieldName = options.generator.config['deletedAtField'] as string | undefined;
     const deletedByFieldName = options.generator.config['deletedByField'] as string | undefined;
@@ -283,6 +363,8 @@ generatorHandler({
     // Emit warning if uniqueStrategy is 'none' and there are unique fields
     if (uniqueStrategy === 'none') {
       emitUniqueStrategyWarning(schema);
+    } else if (uniqueStrategy === 'sentinel') {
+      emitSentinelWarning(schema);
     }
 
     // Build the cascade graph
