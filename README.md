@@ -232,6 +232,39 @@ console.log(cascaded);  // Aggregated cascade counts across all matched records
 
 The `cascaded` field is a `Record<string, number>` mapping model names to the number of records that were cascade-deleted. It's empty (`{}`) when there are no cascade children.
 
+### Soft Delete Preview
+
+Preview what would be cascade-deleted without making any changes:
+
+```typescript
+const { wouldDelete } = await safePrisma.user.softDeletePreview({ where: { name: 'Test' } });
+console.log(wouldDelete); // { User: 2, Post: 5, Comment: 12 }
+```
+
+### Tracking Who Deleted a Record
+
+If a model has a nullable `String` field named `deleted_by` or `deletedBy`, the `deletedBy` parameter becomes **required** on `softDelete` and `softDeleteMany` (enforced at compile time):
+
+```prisma
+model Customer {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  deleted_at DateTime?
+  deleted_by String?   // Enables deletedBy tracking
+}
+```
+
+```typescript
+// TypeScript requires deletedBy for models with a deleted_by field
+await safePrisma.customer.softDelete({
+  where: { id: 'cust-1' },
+  deletedBy: 'admin-user-id',  // Required — won't compile without it
+});
+
+// Models without deleted_by don't need it
+await safePrisma.user.softDelete({ where: { id: 'user-1' } });
+```
+
 ### Restore
 
 Restore soft-deleted records by setting `deleted_at` back to `null` and unmangling unique fields:

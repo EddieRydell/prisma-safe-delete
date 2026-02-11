@@ -25,6 +25,15 @@ describe('Integration: prisma generate', () => {
       cwd: integrationDir,
       stdio: 'pipe',
     });
+
+    // Strip // @ts-nocheck from generated files so CI still type-checks them
+    for (const file of fs.readdirSync(generatedDir)) {
+      if (file.endsWith('.ts')) {
+        const filePath = path.join(generatedDir, file);
+        const content = fs.readFileSync(filePath, 'utf-8');
+        fs.writeFileSync(filePath, content.replace(/^\/\/ @ts-nocheck\n/m, ''), 'utf-8');
+      }
+    }
   }, 60000);
 
   it('generates output files', () => {
@@ -336,6 +345,15 @@ const count: number = result['Post']!;
 `);
   });
 
+  it('filter helpers are importable from index', () => {
+    expectNoTypeError(`
+import { onlyDeleted, excludeDeleted, includingDeleted } from './soft-cascade/index.js';
+const a = onlyDeleted('User');
+const b = excludeDeleted('User');
+const c = includingDeleted();
+`);
+  });
+
   it('softDelete cascaded return type works in transaction', () => {
     expectNoTypeError(`
 import type { SafePrismaClient, CascadeResult } from './soft-cascade/types.js';
@@ -482,11 +500,14 @@ describe('Integration: sentinel strategy compilation', () => {
     const sentinelDir = path.join(integrationDir, 'generated', 'sentinel-test');
     fs.mkdirSync(sentinelDir, { recursive: true });
 
+    // Strip // @ts-nocheck so CI still type-checks sentinel-generated code
+    const stripTsNocheck = (s: string) => s.replace(/^\/\/ @ts-nocheck\n/m, '');
+
     try {
-      fs.writeFileSync(path.join(sentinelDir, 'runtime.ts'), runtimeContent, 'utf-8');
-      fs.writeFileSync(path.join(sentinelDir, 'types.ts'), typesContent, 'utf-8');
+      fs.writeFileSync(path.join(sentinelDir, 'runtime.ts'), stripTsNocheck(runtimeContent), 'utf-8');
+      fs.writeFileSync(path.join(sentinelDir, 'types.ts'), stripTsNocheck(typesContent), 'utf-8');
       fs.writeFileSync(path.join(sentinelDir, 'cascade-graph.ts'), cascadeGraphContent, 'utf-8');
-      fs.writeFileSync(path.join(sentinelDir, 'index.ts'), indexContent, 'utf-8');
+      fs.writeFileSync(path.join(sentinelDir, 'index.ts'), stripTsNocheck(indexContent), 'utf-8');
 
       // Compile with --noUnusedLocals (same as main integration test)
       execSync(

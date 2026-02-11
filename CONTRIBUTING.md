@@ -82,9 +82,9 @@ pnpm run test:coverage
 
 ### Test Structure
 
-- `tests/unit/` - Unit tests for individual functions
-- `tests/integration/` - Integration tests against a real database
-- `tests/e2e/` - End-to-end tests for the full workflow
+- `tests/*.test.ts` - Unit tests for codegen, DMMF parser, cascade graph, and generator
+- `tests/integration/` - Integration tests (prisma generate + TypeScript compilation checks)
+- `tests/e2e/`, `tests/e2e-none/`, `tests/e2e-sentinel/` - End-to-end tests against a real PostgreSQL database
 
 ## Pull Request Process
 
