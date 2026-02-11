@@ -9,6 +9,7 @@ CLAUDE.md
 
 # Integration test generated files
 tests/integration/generated/
+tests/integration/tmp-*/
 tests/integration/*.db
 tests/integration/*.db-journal
 

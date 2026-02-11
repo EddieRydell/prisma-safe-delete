@@ -188,18 +188,64 @@ export function buildUniqueStrategyWarningLines(
 }
 
 /**
- * Emits a warning when uniqueStrategy is 'none' to remind users to create partial indexes.
+ * Result of validating unique constraints for a given schema and strategy.
  */
-function emitUniqueStrategyWarning(schema: ParsedSchema): void {
-  const modelsWithUniqueFields = collectModelsWithUniqueFields(schema);
-  const lines = buildUniqueStrategyWarningLines(modelsWithUniqueFields);
+export interface UniqueConstraintValidation {
+  warningLines: string[];
+  hasIssues: boolean;
+}
 
-  if (lines.length > 0) {
-    // Print warning to console
-    // Using console.log because Prisma may suppress stderr
-    // eslint-disable-next-line no-console
-    console.log(lines.join('\n'));
+/**
+ * Checks whether a sentinel-configured schema has any issues:
+ * - Misconfigured deleted_at fields (nullable or missing @default)
+ * - Standalone unique constraints that should include deleted_at
+ */
+function checkSentinelHasIssues(schema: ParsedSchema): boolean {
+  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  if (softDeletableModels.length === 0) return false;
+
+  const hasMisconfiguredFields = softDeletableModels.some(m => {
+    const status = checkSentinelFieldConfig(m);
+    return status !== null && !status.isCorrectlyConfigured;
+  });
+
+  const hasStandaloneUniques = softDeletableModels.some(m =>
+    m.uniqueConstraints.some(c => !c.includesDeletedAt)
+  );
+
+  return hasMisconfiguredFields || hasStandaloneUniques;
+}
+
+/**
+ * Validates unique constraints for a schema given the chosen unique strategy.
+ * Returns warning lines for display and whether any issues were found.
+ * Exported for testing.
+ */
+export function validateUniqueConstraints(
+  schema: ParsedSchema,
+  strategy: UniqueStrategy,
+): UniqueConstraintValidation {
+  if (strategy === 'none') {
+    const modelsWithUniqueFields = collectModelsWithUniqueFields(schema);
+    return {
+      warningLines: buildUniqueStrategyWarningLines(modelsWithUniqueFields),
+      hasIssues: modelsWithUniqueFields.length > 0,
+    };
   }
+
+  if (strategy === 'sentinel') {
+    return {
+      warningLines: buildSentinelWarningLines(schema),
+      hasIssues: checkSentinelHasIssues(schema),
+    };
+  }
+
+  // mangle
+  const lines = buildMangleWarningLines(schema);
+  return {
+    warningLines: lines,
+    hasIssues: lines.length > 0,
+  };
 }
 
 /**
@@ -288,16 +334,6 @@ export function buildMangleWarningLines(
   return lines;
 }
 
-/**
- * Emits a warning when uniqueStrategy is 'mangle' and there are unmangleable unique fields.
- */
-function emitMangleWarning(schema: ParsedSchema): void {
-  const lines = buildMangleWarningLines(schema);
-  if (lines.length > 0) {
-    // eslint-disable-next-line no-console
-    console.log(lines.join('\n'));
-  }
-}
 
 /**
  * Sentinel field configuration status for a model.
@@ -422,16 +458,6 @@ export function buildSentinelWarningLines(
   return lines;
 }
 
-/**
- * Emits a warning when uniqueStrategy is 'sentinel' about schema requirements.
- */
-function emitSentinelWarning(schema: ParsedSchema): void {
-  const lines = buildSentinelWarningLines(schema);
-  if (lines.length > 0) {
-    // eslint-disable-next-line no-console
-    console.log(lines.join('\n'));
-  }
-}
 
 /**
  * Computes the relative import path from our output directory to the Prisma client.
@@ -484,6 +510,7 @@ generatorHandler({
       : rawStrategy === 'sentinel' ? 'sentinel'
       : 'mangle'; // Default to 'mangle'
 
+    const strictUniqueChecks = options.generator.config['strictUniqueChecks'] === 'true';
     const deletedAtFieldName = options.generator.config['deletedAtField'] as string | undefined;
     const deletedByFieldName = options.generator.config['deletedByField'] as string | undefined;
 
@@ -516,13 +543,16 @@ generatorHandler({
       ...(deletedByFieldName !== undefined ? { deletedByField: deletedByFieldName } : {}),
     });
 
-    // Emit strategy-specific warnings about unique constraint configuration
-    if (uniqueStrategy === 'none') {
-      emitUniqueStrategyWarning(schema);
-    } else if (uniqueStrategy === 'sentinel') {
-      emitSentinelWarning(schema);
-    } else {
-      emitMangleWarning(schema);
+    // Validate unique constraints and emit warnings
+    const validation = validateUniqueConstraints(schema, uniqueStrategy);
+    if (validation.warningLines.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log(validation.warningLines.join('\n'));
+    }
+    if (strictUniqueChecks && validation.hasIssues) {
+      throw new Error(
+        'prisma-safe-delete: Unique constraint issues detected and strictUniqueChecks is enabled. See warnings above.'
+      );
     }
 
     // Build the cascade graph

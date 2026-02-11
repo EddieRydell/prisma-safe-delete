@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -827,4 +827,112 @@ describe('Integration: Runtime behavior', () => {
       },
     });
   });
+});
+
+describe('Integration: strictUniqueChecks', () => {
+  const tmpDirs: string[] = [];
+
+  afterAll(() => {
+    // Deferred cleanup to avoid Windows EBUSY file lock issues
+    for (const dir of tmpDirs) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup errors (Windows file locks release after process exits)
+      }
+    }
+  });
+
+  it('prisma generate fails when strictUniqueChecks is enabled and unique issues exist', () => {
+    // Create temp directory with a schema that has strictUniqueChecks = "true"
+    const tmpDir = path.join(integrationDir, 'tmp-strict-unique-test');
+    tmpDirs.push(tmpDir);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const schemaContent = `
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider           = "node ${path.join(integrationDir, '..', '..', 'dist', 'bin.js').split(path.sep).join('/')}"
+  output             = "./generated/soft-cascade"
+  uniqueStrategy     = "none"
+  strictUniqueChecks = "true"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  deleted_at DateTime?
+}
+`;
+
+    fs.writeFileSync(path.join(tmpDir, 'schema.prisma'), schemaContent, 'utf-8');
+
+    try {
+      execSync('npx prisma generate', {
+        cwd: tmpDir,
+        stdio: 'pipe',
+        encoding: 'utf-8',
+      });
+      // If we get here, prisma generate didn't fail — that's wrong
+      throw new Error('Expected prisma generate to fail with strictUniqueChecks, but it succeeded');
+    } catch (error: unknown) {
+      const execError = error as { status?: number; stdout?: string; stderr?: string; message?: string };
+      // Check it's not our own thrown error
+      if (execError.message?.includes('Expected prisma generate to fail') === true) {
+        throw error;
+      }
+      expect(execError.status).not.toBe(0);
+      const output = (execError.stdout ?? '') + (execError.stderr ?? '');
+      expect(output).toContain('strictUniqueChecks');
+    }
+  }, 60000);
+
+  it('prisma generate succeeds when strictUniqueChecks is enabled and no issues exist', () => {
+    // Create temp directory with a schema that has strictUniqueChecks but no unique fields
+    const tmpDir = path.join(integrationDir, 'tmp-strict-unique-pass');
+    tmpDirs.push(tmpDir);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const schemaContent = `
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider           = "node ${path.join(integrationDir, '..', '..', 'dist', 'bin.js').split(path.sep).join('/')}"
+  output             = "./generated/soft-cascade"
+  uniqueStrategy     = "none"
+  strictUniqueChecks = "true"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id         String    @id @default(cuid())
+  name       String
+  deleted_at DateTime?
+}
+`;
+
+    fs.writeFileSync(path.join(tmpDir, 'schema.prisma'), schemaContent, 'utf-8');
+
+    execSync('npx prisma generate', {
+      cwd: tmpDir,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+    });
+    // If we get here, prisma generate succeeded — correct
+    expect(true).toBe(true);
+  }, 60000);
 });
