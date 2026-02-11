@@ -5,25 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-- Raw query methods (`$queryRaw`, `$executeRaw`, `$queryRawUnsafe`, `$executeRawUnsafe`) are now available in transaction contexts via `SafeTransactionClient`
-- **Sentinel unique strategy** (`uniqueStrategy = "sentinel"`): Uses a far-future date (9999-12-31) instead of NULL for active records' `deleted_at`, enabling `@@unique([field, deleted_at])` compound constraints at the DB level without mangling
-  - Transparent `findUnique` rewriting for compound keys
-  - Automatic sentinel injection on `create`, `createMany`, `createManyAndReturn`, and `upsert`
-  - Generator validation warnings: detects nullable `deleted_at` fields, missing `@default`, and standalone unique constraints that should be compound
-- **Mangle strategy warnings**: Generator now warns when unique fields cannot be mangled (non-string types like `Int`, `@db.Uuid`, etc.) and suggests partial unique index SQL
-
-### Fixed
-- `softDelete` return type now correctly declares `record` as nullable (`| null`), matching runtime behavior where `record` is `null` if the target record does not exist
-- Removed dead code from generated runtime: unused `CascadeChild` import, `isSoftDeletable()` function, `createPkWhere()` function, and `pkField` variable
-- Integration tests now use `--noUnusedLocals` to catch dead code in generated output
-
-### Changed
-- Removed `@ts-nocheck` from generated `runtime.ts` and `types.ts`, replacing blanket type suppression with explicit type casts that preserve Prisma's full generic signatures for consumers
-- Soft-delete detection now accepts non-nullable `DateTime` fields with `@default` (required for sentinel strategy), in addition to nullable `DateTime?`
-
 ## [0.2.0] - 2025-02-08
 
 ### Added

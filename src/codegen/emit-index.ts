@@ -26,6 +26,9 @@ export function emitIndex(schema: ParsedSchema): string {
   lines.push('');
   lines.push('// Re-export wrapper function');
   lines.push("export { wrapPrismaClient } from './runtime.js';");
+  lines.push('');
+  lines.push('// Re-export filter helpers');
+  lines.push("export { onlyDeleted, excludeDeleted, includingDeleted } from './runtime.js';");
 
   return lines.join('\n');
 }
