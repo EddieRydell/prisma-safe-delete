@@ -94,10 +94,19 @@ pnpm run test:coverage
 4. Update documentation if needed
 5. Submit a pull request
 
+### PR Title Convention
+
+This project uses [semantic-release](https://semantic-release.gitbook.io/) to automate versioning and publishing. The repo is configured for **squash merges only**, so your PR title becomes the commit message on `main`. PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/) format:
+
+- `fix: description` — patch release (bug fixes)
+- `feat: description` — minor release (new features)
+- `feat!: description` or `BREAKING CHANGE:` in body — major release
+
+Commits during development can use any format — only the PR title matters.
+
 ### PR Guidelines
 
 - Keep changes focused and atomic
-- Write clear commit messages
 - Add tests for new functionality
 - Update the README if adding user-facing features
 
