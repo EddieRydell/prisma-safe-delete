@@ -4,6 +4,7 @@ import {
   buildUniqueStrategyWarningLines,
   buildMangleWarningLines,
   buildSentinelWarningLines,
+  validateUniqueConstraints,
   type UniqueFieldInfo,
 } from '../src/generator.js';
 import { parseDMMF } from '../src/dmmf-parser.js';
@@ -905,5 +906,142 @@ describe('buildMangleWarningLines', () => {
 
     // Should not list deleted_at as an unmangleable field
     expect(result.some((line) => line.includes('deleted_at (DateTime)'))).toBe(false);
+  });
+});
+
+describe('validateUniqueConstraints', () => {
+  // --- none strategy ---
+  it('none: no issues when no unique fields', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'name', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'none');
+
+    expect(result.hasIssues).toBe(false);
+    expect(result.warningLines).toEqual([]);
+  });
+
+  it('none: has issues when unique fields present', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'none');
+
+    expect(result.hasIssues).toBe(true);
+    expect(result.warningLines.length).toBeGreaterThan(0);
+  });
+
+  // --- mangle strategy ---
+  it('mangle: no issues when all unique fields are mangleable strings', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'mangle');
+
+    expect(result.hasIssues).toBe(false);
+    expect(result.warningLines).toEqual([]);
+  });
+
+  it('mangle: has issues when Int unique field present', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'employee_id', type: 'Int', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'mangle');
+
+    expect(result.hasIssues).toBe(true);
+    expect(result.warningLines.length).toBeGreaterThan(0);
+  });
+
+  // --- sentinel strategy ---
+  it('sentinel: no issues when correctly configured', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String' }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: true, hasDefaultValue: true }),
+        ],
+        uniqueFields: [['email', 'deleted_at']],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'sentinel');
+
+    expect(result.hasIssues).toBe(false);
+    // Sentinel always emits informational lines for soft-deletable models
+    expect(result.warningLines.length).toBeGreaterThan(0);
+  });
+
+  it('sentinel: has issues when deleted_at is nullable', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'sentinel');
+
+    expect(result.hasIssues).toBe(true);
+  });
+
+  it('sentinel: has issues when standalone @unique present', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: true, hasDefaultValue: true }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const result = validateUniqueConstraints(schema, 'sentinel');
+
+    expect(result.hasIssues).toBe(true);
   });
 });
