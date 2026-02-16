@@ -2825,6 +2825,459 @@ describe('E2E: Real database tests', () => {
     });
   });
 
+  describe('Projection forwarding (include/select/omit)', () => {
+    describe('softDelete (complex model — cascade path)', () => {
+      it('include returns relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'proj@test.com',
+            posts: {
+              create: [
+                { id: 'p1', title: 'Post 1' },
+                { id: 'p2', title: 'Post 2' },
+              ],
+            },
+          },
+        });
+
+        const result = await safePrisma.user.softDelete({
+          where: { id: 'u1' },
+          include: { posts: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.posts).toBeDefined();
+        expect(result.record.posts).toHaveLength(2);
+      });
+
+      it('select returns only selected fields', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'select@test.com' },
+        });
+
+        const result = await safePrisma.user.softDelete({
+          where: { id: 'u1' },
+          select: { id: true, email: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('u1');
+        // email is mangled after soft delete
+        expect(result.record.email).toContain('select@test.com');
+        // Fields not in select should be absent
+        expect(result.record).not.toHaveProperty('deleted_at');
+        expect(result.record).not.toHaveProperty('name');
+      });
+
+      it('select with nested relation select', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'nested-sel@test.com',
+            posts: {
+              create: [{ id: 'p1', title: 'Post 1' }],
+            },
+          },
+        });
+
+        const result = await safePrisma.user.softDelete({
+          where: { id: 'u1' },
+          select: { id: true, posts: { select: { title: true } } },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('u1');
+        expect(result.record).not.toHaveProperty('email');
+        expect(result.record.posts).toHaveLength(1);
+        expect(result.record.posts[0].title).toBe('Post 1');
+        expect(result.record.posts[0]).not.toHaveProperty('id');
+      });
+
+      it('omit excludes specified fields', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'omit@test.com', name: 'Omit User' },
+        });
+
+        const result = await safePrisma.user.softDelete({
+          where: { id: 'u1' },
+          omit: { name: true, deleted_at: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('u1');
+        expect(result.record).not.toHaveProperty('name');
+        expect(result.record).not.toHaveProperty('deleted_at');
+      });
+    });
+
+    describe('softDelete (simple model — fast path)', () => {
+      it('include returns relations', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'simple-inc@test.com' },
+        });
+        await prisma.post.create({
+          data: {
+            id: 'p1',
+            title: 'Simple Post',
+            authorId: 'u1',
+            comments: {
+              create: [{ id: 'c1', content: 'A comment' }],
+            },
+          },
+        });
+
+        // Comment is a simple/leaf model
+        const result = await safePrisma.comment.softDelete({
+          where: { id: 'c1' },
+          include: { post: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.post).toBeDefined();
+        expect(result.record.post.title).toBe('Simple Post');
+      });
+
+      it('select returns only selected fields', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'simsel@test.com' },
+        });
+        await prisma.post.create({
+          data: {
+            id: 'p1',
+            title: 'Sel Post',
+            authorId: 'u1',
+            comments: {
+              create: [{ id: 'c1', content: 'Comment sel' }],
+            },
+          },
+        });
+
+        const result = await safePrisma.comment.softDelete({
+          where: { id: 'c1' },
+          select: { id: true, content: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('c1');
+        expect(result.record.content).toBe('Comment sel');
+        expect(result.record).not.toHaveProperty('postId');
+        expect(result.record).not.toHaveProperty('deleted_at');
+      });
+    });
+
+    describe('restore', () => {
+      it('include returns relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'restore-proj@test.com',
+            deleted_at: new Date(),
+            posts: {
+              create: [{ id: 'p1', title: 'Post 1' }],
+            },
+          },
+        });
+
+        const restored = await safePrisma.user.restore({
+          where: { id: 'u1' },
+          include: { posts: true },
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored.posts).toBeDefined();
+        expect(restored.posts).toHaveLength(1);
+        expect(restored.posts[0].title).toBe('Post 1');
+      });
+
+      it('select returns only selected fields', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'restore-sel@test.com',
+            deleted_at: new Date(),
+          },
+        });
+
+        const restored = await safePrisma.user.restore({
+          where: { id: 'u1' },
+          select: { id: true, email: true },
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored.id).toBe('u1');
+        expect(restored.email).toBe('restore-sel@test.com');
+        expect(restored).not.toHaveProperty('deleted_at');
+        expect(restored).not.toHaveProperty('name');
+      });
+
+      it('omit excludes specified fields', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'restore-omit@test.com',
+            name: 'Omit Restore',
+            deleted_at: new Date(),
+          },
+        });
+
+        const restored = await safePrisma.user.restore({
+          where: { id: 'u1' },
+          omit: { name: true },
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored.id).toBe('u1');
+        expect(restored).not.toHaveProperty('name');
+        expect(restored).toHaveProperty('email');
+      });
+    });
+
+    describe('restoreCascade', () => {
+      it('include returns relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'rc-proj@test.com',
+            posts: {
+              create: [{ id: 'p1', title: 'Post RC' }],
+            },
+          },
+        });
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const result = await safePrisma.user.restoreCascade({
+          where: { id: 'u1' },
+          include: { posts: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.posts).toBeDefined();
+        expect(result.record.posts).toHaveLength(1);
+        expect(result.record.posts[0].title).toBe('Post RC');
+      });
+
+      it('select returns only selected fields', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'rc-sel@test.com',
+            posts: {
+              create: [{ id: 'p1', title: 'Post RC Sel' }],
+            },
+          },
+        });
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const result = await safePrisma.user.restoreCascade({
+          where: { id: 'u1' },
+          select: { id: true, posts: { select: { title: true } } },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('u1');
+        expect(result.record).not.toHaveProperty('email');
+        expect(result.record.posts).toHaveLength(1);
+        expect(result.record.posts[0].title).toBe('Post RC Sel');
+      });
+
+      it('omit excludes specified fields', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'rc-omit@test.com',
+            name: 'RC Omit',
+            posts: {
+              create: [{ id: 'p1', title: 'Post RC Omit' }],
+            },
+          },
+        });
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const result = await safePrisma.user.restoreCascade({
+          where: { id: 'u1' },
+          omit: { name: true },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record).not.toHaveProperty('name');
+        expect(result.record).toHaveProperty('email');
+      });
+    });
+
+    describe('transaction wrapper paths', () => {
+      it('tx softDelete (complex model) with include returns relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'tx-sd@test.com',
+            posts: {
+              create: [{ id: 'p1', title: 'TX Post' }],
+            },
+          },
+        });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const result = await tx.user.softDelete({
+            where: { id: 'u1' },
+            include: { posts: true },
+          });
+
+          expect(result.record).not.toBeNull();
+          expect(result.record.posts).toBeDefined();
+          expect(result.record.posts).toHaveLength(1);
+          expect(result.record.posts[0].title).toBe('TX Post');
+        });
+      });
+
+      it('tx softDelete (simple model) with include returns relations', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'tx-simple@test.com' },
+        });
+        await prisma.post.create({
+          data: {
+            id: 'p1',
+            title: 'TX Simple Post',
+            authorId: 'u1',
+            comments: {
+              create: [{ id: 'c1', content: 'TX comment' }],
+            },
+          },
+        });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const result = await tx.comment.softDelete({
+            where: { id: 'c1' },
+            include: { post: true },
+          });
+
+          expect(result.record).not.toBeNull();
+          expect(result.record.post).toBeDefined();
+          expect(result.record.post.title).toBe('TX Simple Post');
+        });
+      });
+
+      it('tx restore with include returns relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'tx-restore@test.com',
+            deleted_at: new Date(),
+            posts: {
+              create: [{ id: 'p1', title: 'TX Restore Post' }],
+            },
+          },
+        });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const restored = await tx.user.restore({
+            where: { id: 'u1' },
+            include: { posts: true },
+          });
+
+          expect(restored).not.toBeNull();
+          expect(restored.posts).toBeDefined();
+          expect(restored.posts).toHaveLength(1);
+        });
+      });
+
+      it('tx restoreCascade with include returns relations', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'tx-rc@test.com',
+            posts: {
+              create: [{ id: 'p1', title: 'TX RC Post' }],
+            },
+          },
+        });
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const result = await tx.user.restoreCascade({
+            where: { id: 'u1' },
+            include: { posts: true },
+          });
+
+          expect(result.record).not.toBeNull();
+          expect(result.record.posts).toBeDefined();
+          expect(result.record.posts).toHaveLength(1);
+        });
+      });
+
+      it('tx softDelete with select returns only selected fields', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'tx-sel@test.com' },
+        });
+
+        await safePrisma.$transaction(async (tx: any) => {
+          const result = await tx.user.softDelete({
+            where: { id: 'u1' },
+            select: { id: true, email: true },
+          });
+
+          expect(result.record).not.toBeNull();
+          expect(result.record.id).toBe('u1');
+          expect(result.record).not.toHaveProperty('deleted_at');
+        });
+      });
+    });
+
+    describe('without projection (backward compatibility)', () => {
+      it('softDelete without projection still returns full record', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'nopr@test.com', name: 'No Proj' },
+        });
+
+        const result = await safePrisma.user.softDelete({
+          where: { id: 'u1' },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('u1');
+        expect(result.record).toHaveProperty('deleted_at');
+        expect(result.record).toHaveProperty('name');
+        expect(result.record).not.toHaveProperty('posts');
+      });
+
+      it('restore without projection still returns full record', async () => {
+        await prisma.user.create({
+          data: { id: 'u1', email: 'nopr-r@test.com', name: 'No Proj R', deleted_at: new Date() },
+        });
+
+        const restored = await safePrisma.user.restore({
+          where: { id: 'u1' },
+        });
+
+        expect(restored).not.toBeNull();
+        expect(restored.id).toBe('u1');
+        expect(restored).toHaveProperty('email');
+        expect(restored).toHaveProperty('name');
+        expect(restored).not.toHaveProperty('posts');
+      });
+
+      it('restoreCascade without projection still returns full record', async () => {
+        await prisma.user.create({
+          data: {
+            id: 'u1',
+            email: 'nopr-rc@test.com',
+            posts: { create: [{ id: 'p1', title: 'NP' }] },
+          },
+        });
+        await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+        const result = await safePrisma.user.restoreCascade({
+          where: { id: 'u1' },
+        });
+
+        expect(result.record).not.toBeNull();
+        expect(result.record.id).toBe('u1');
+        expect(result.record).toHaveProperty('email');
+        expect(result.record).not.toHaveProperty('posts');
+      });
+    });
+  });
+
   describe('Simple model fast path (leaf models without unique mangling)', () => {
     it('softDeleteMany on Comment returns correct count and empty cascaded', async () => {
       // Comment is a leaf model (no cascade children, no unique string fields)

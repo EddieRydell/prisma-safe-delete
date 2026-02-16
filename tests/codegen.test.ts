@@ -141,12 +141,26 @@ describe('emitTypes', () => {
     const schema = createTestSchema();
     const output = emitTypes(schema, TEST_CLIENT_PATH);
 
-    expect(output).toContain('softDelete: (args: Prisma.UserDeleteArgs');
-    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}> | null; cascaded: CascadeResult }>');
+    expect(output).toContain('softDelete: <T extends Prisma.UserDeleteArgs>(args: T');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<T> | null; cascaded: CascadeResult }>');
     expect(output).toContain('softDeleteMany: (args: Prisma.UserDeleteManyArgs');
     expect(output).toContain('Promise<{ count: number; cascaded: CascadeResult }>');
-    expect(output).toContain('restoreCascade: (args: Prisma.UserDeleteArgs)');
-    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<{}> | null; cascaded: CascadeResult }>');
+    expect(output).toContain('restoreCascade: <T extends Prisma.UserDeleteArgs>(args: T)');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<T> | null; cascaded: CascadeResult }>');
+  });
+
+  it('generates generic restore type', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('restore: <T extends Prisma.UserDeleteArgs>(args: T) => Promise<Prisma.UserGetPayload<T> | null>');
+  });
+
+  it('generates __dangerousHardDelete using native Prisma delete type', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain("__dangerousHardDelete: PrismaClient['user']['delete']");
   });
 
   it('generates required deletedBy for models with deleted_by field', () => {
