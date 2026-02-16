@@ -1056,10 +1056,11 @@ async function cascadeToChildren(
 async function restoreRecord(
   prisma: PrismaClient,
   modelName: string,
-  where: Record<string, unknown>
+  where: Record<string, unknown>,
+  projection: Record<string, unknown> = {}
 ): Promise<Record<string, unknown> | null> {
   return prisma.$transaction(async (tx) => {
-    return restoreRecordInTx(tx, modelName, where);
+    return restoreRecordInTx(tx, modelName, where, projection);
   });
 }
 
@@ -1069,11 +1070,12 @@ async function restoreRecord(
 async function restoreRecordInTx(
   tx: Prisma.TransactionClient,
   modelName: string,
-  where: Record<string, unknown>
+  where: Record<string, unknown>,
+  projection: Record<string, unknown> = {}
 ): Promise<Record<string, unknown> | null> {
   const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
   const delegate = tx[lowerModelName as keyof typeof tx] as any;
-  return restoreRecordWithDelegate(delegate, modelName, where);
+  return restoreRecordWithDelegate(delegate, modelName, where, projection);
 }
 
 /**
@@ -1082,7 +1084,8 @@ async function restoreRecordInTx(
 async function restoreRecordWithDelegate(
   delegate: any,
   modelName: string,
-  where: Record<string, unknown>
+  where: Record<string, unknown>,
+  projection: Record<string, unknown> = {}
 ): Promise<Record<string, unknown> | null> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) {
@@ -1141,6 +1144,7 @@ async function restoreRecordWithDelegate(
   return delegate.update({
     where: createPkWhereFromValues(modelName, pkVal),
     data: updateData,
+    ...projection,
   });
 }
 
@@ -1273,10 +1277,11 @@ async function restoreManyWithDelegate(
 async function restoreWithCascade(
   prisma: PrismaClient,
   modelName: string,
-  where: Record<string, unknown>
+  where: Record<string, unknown>,
+  projection: Record<string, unknown> = {}
 ): Promise<{ record: Record<string, unknown> | null; cascaded: Record<string, number> }> {
   return prisma.$transaction(async (tx) => {
-    return restoreWithCascadeInTx(tx, modelName, where);
+    return restoreWithCascadeInTx(tx, modelName, where, projection);
   });
 }
 
@@ -1286,7 +1291,8 @@ async function restoreWithCascade(
 async function restoreWithCascadeInTx(
   tx: Prisma.TransactionClient,
   modelName: string,
-  where: Record<string, unknown>
+  where: Record<string, unknown>,
+  projection: Record<string, unknown> = {}
 ): Promise<{ record: Record<string, unknown> | null; cascaded: Record<string, number> }> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) {
@@ -1350,6 +1356,7 @@ async function restoreWithCascadeInTx(
   const restoredRecord = await delegate.update({
     where: createPkWhereFromValues(modelName, pkVal),
     data: updateData,
+    ...projection,
   });
 
   return { record: restoredRecord, cascaded };
@@ -1669,13 +1676,15 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     const restoreMethods = `
     // Restore methods
     restore: (async (args: any) => {
-      return restoreRecord(prisma, '${name}', args.where);
+      const { where, ...projection } = args;
+      return restoreRecord(prisma, '${name}', where, projection);
     }) as Safe${name}Delegate['restore'],
     restoreMany: (async (args: any) => {
       return restoreManyRecords(prisma, '${name}', args.where);
     }) as Safe${name}Delegate['restoreMany'],
     restoreCascade: (async (args: any) => {
-      const { record, cascaded } = await restoreWithCascade(prisma, '${name}', args.where);
+      const { where, ...projection } = args;
+      const { record, cascaded } = await restoreWithCascade(prisma, '${name}', where, projection);
       return { record, cascaded };
     }) as Safe${name}Delegate['restoreCascade'],`;
 
@@ -1710,14 +1719,15 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     // Soft delete methods (fast path - no cascade children, no unique mangling)
     softDelete: (async (args: any) => {
       const { deletedBy, ...rest } = args;
-      const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
+      const { where, ...projection } = rest;
+      const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
       const now = new Date();
       const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };${deletedByUpdate}
       await original.updateMany({
         where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
         data: updateData,
       });
-      const record = await original.findFirst({ where: decomposedWhere });
+      const record = await original.findFirst({ where: decomposedWhere, ...projection });
       return { record, cascaded: {} };
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
@@ -1747,10 +1757,11 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     // ensure they pass deletedBy for models with deleted_by fields.
     softDelete: (async (args: any) => {
       const { deletedBy, ...rest } = args;
-      const { cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
+      const { where, ...projection } = rest;
+      const { cascaded } = await softDeleteWithCascade(prisma, '${name}', where, deletedBy);
       // Decompose compound key for findFirst
-      const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
-      const record = await original.findFirst({ where: decomposedWhere });
+      const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
+      const record = await original.findFirst({ where: decomposedWhere, ...projection });
       return { record, cascaded };
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
@@ -1932,7 +1943,8 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         // Fast path: use updateMany directly
         lines.push(`      softDelete: (async (args: any) => {`);
         lines.push(`        const { deletedBy, ...rest } = args;`);
-        lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
+        lines.push(`        const { where, ...projection } = rest;`);
+        lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
         lines.push(`        const now = new Date();`);
         lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };`);
         if (model.deletedByField !== null) {
@@ -1945,7 +1957,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`          where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },`);
         lines.push(`          data: updateData,`);
         lines.push(`        });`);
-        lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere });`);
+        lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });`);
         lines.push(`        return { record, cascaded: {} };`);
         lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
         lines.push(`      softDeleteMany: (async (args: any) => {`);
@@ -1974,9 +1986,10 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         // Complex path: use softDeleteWithCascadeInTx
         lines.push(`      softDelete: (async (args: any) => {`);
         lines.push(`        const { deletedBy, ...rest } = args;`);
-        lines.push(`        const { cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
-        lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
-        lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere });`);
+        lines.push(`        const { where, ...projection } = rest;`);
+        lines.push(`        const { cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', where, deletedBy);`);
+        lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
+        lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });`);
         lines.push(`        return { record, cascaded };`);
         lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
         lines.push(`      softDeleteMany: (async (args: any) => {`);
@@ -1992,13 +2005,15 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
 
       // Restore methods
       lines.push(`      restore: (async (args: any) => {`);
-      lines.push(`        return restoreRecordInTx(tx, '${model.name}', args.where);`);
+      lines.push(`        const { where, ...projection } = args;`);
+      lines.push(`        return restoreRecordInTx(tx, '${model.name}', where, projection);`);
       lines.push(`      }) as Safe${model.name}Delegate['restore'],`);
       lines.push(`      restoreMany: (async (args: any) => {`);
       lines.push(`        return restoreManyInTx(tx, '${model.name}', args.where);`);
       lines.push(`      }) as Safe${model.name}Delegate['restoreMany'],`);
       lines.push(`      restoreCascade: (async (args: any) => {`);
-      lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', args.where);`);
+      lines.push(`        const { where, ...projection } = args;`);
+      lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection);`);
       lines.push(`        return { record, cascaded };`);
       lines.push(`      }) as Safe${model.name}Delegate['restoreCascade'],`);
       // Hard delete methods (intentionally scary names)
