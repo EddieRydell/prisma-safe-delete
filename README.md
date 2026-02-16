@@ -161,6 +161,18 @@ For full details on each strategy, migration guides, and generator warnings, see
 
 Soft-delete cascades follow `onDelete: Cascade` relations. All cascaded records share the same `deleted_at` timestamp, and the entire operation is transactional.
 
+To disable cascading entirely, set `cascade = "false"`. With soft deletes the parent row still exists in the database, so foreign key constraints are never violated — cascading is a policy choice, not a data integrity requirement.
+
+```prisma
+generator softDelete {
+  provider = "prisma-safe-delete"
+  output   = "./generated/soft-delete"
+  cascade  = "false"  // default: "true"
+}
+```
+
+When cascade is disabled, all models use the fast `updateMany` path (no per-record transactions), and `softDelete` / `softDeleteMany` always return `cascaded: {}`.
+
 For cascade rules and performance characteristics, see [docs/cascade-behavior.md](docs/cascade-behavior.md).
 
 ## Soft Delete Detection

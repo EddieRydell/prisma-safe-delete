@@ -705,21 +705,20 @@ describe('E2E: Real database tests', () => {
   });
 
   describe('Edge cases', () => {
-    it('softDelete on non-existent record does not throw', async () => {
-      // Should not throw
-      await safePrisma.user.softDelete({ where: { id: 'non-existent' } });
+    it('softDelete on non-existent record throws P2025', async () => {
+      await expect(
+        safePrisma.user.softDelete({ where: { id: 'non-existent' } }),
+      ).rejects.toThrow(expect.objectContaining({ code: 'P2025' }));
     });
 
-    it('softDelete on already-deleted record is idempotent', async () => {
+    it('softDelete on already-deleted record throws P2025', async () => {
       await prisma.user.create({
         data: { id: 'user-1', email: 'test@test.com', deleted_at: new Date() },
       });
 
-      // Should not throw or change the record
-      await safePrisma.user.softDelete({ where: { id: 'user-1' } });
-
-      const user = await prisma.user.findUnique({ where: { id: 'user-1' } });
-      expect(user.deleted_at).not.toBeNull();
+      await expect(
+        safePrisma.user.softDelete({ where: { id: 'user-1' } }),
+      ).rejects.toThrow(expect.objectContaining({ code: 'P2025' }));
     });
 
     it('softDeleteMany returns zero for empty result', async () => {
@@ -2059,7 +2058,7 @@ describe('E2E: Real database tests', () => {
       expect(raw.email).toContain('__deleted_');
     });
 
-    it('mangling is idempotent (soft delete already-deleted record)', async () => {
+    it('soft delete already-deleted record throws P2025', async () => {
       await prisma.customer.create({
         data: {
           id: 'cust-1',
@@ -2071,14 +2070,10 @@ describe('E2E: Real database tests', () => {
       // Soft delete first time
       await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
 
-      const afterFirst = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
-      const mangledEmail = afterFirst.email;
-
-      // Soft delete again - should be no-op since already deleted
-      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
-
-      const afterSecond = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
-      expect(afterSecond.email).toBe(mangledEmail); // No double-mangling
+      // Soft delete again — record is already deleted, so P2025
+      await expect(
+        safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' }),
+      ).rejects.toThrow(expect.objectContaining({ code: 'P2025' }));
     });
 
     it('mangles field whose value naturally ends with the suffix pattern', async () => {
@@ -3454,15 +3449,11 @@ describe('E2E: Real database tests', () => {
       expect(cascaded).toEqual({});
     });
 
-    it('fast-path softDelete on non-existent record returns null-ish record and empty cascaded', async () => {
+    it('fast-path softDelete on non-existent record throws P2025', async () => {
       // Comment is a fast-path model (no children, no unique strings)
-      const { record, cascaded } = await safePrisma.comment.softDelete({
-        where: { id: 'nonexistent' },
-      });
-
-      // Fast path does updateMany then findFirst — findFirst returns null for nonexistent
-      expect(record).toBeNull();
-      expect(cascaded).toEqual({});
+      await expect(
+        safePrisma.comment.softDelete({ where: { id: 'nonexistent' } }),
+      ).rejects.toThrow(expect.objectContaining({ code: 'P2025' }));
     });
 
     it('fast-path softDeleteMany with no matches returns zero count and empty cascaded', async () => {

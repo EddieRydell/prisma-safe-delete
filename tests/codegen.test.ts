@@ -142,7 +142,7 @@ describe('emitTypes', () => {
     const output = emitTypes(schema, TEST_CLIENT_PATH);
 
     expect(output).toContain('softDelete: <T extends Prisma.UserDeleteArgs>(args: T');
-    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<T> | null; cascaded: CascadeResult }>');
+    expect(output).toContain('Promise<{ record: Prisma.UserGetPayload<T>; cascaded: CascadeResult }>');
     expect(output).toContain('softDeleteMany: (args: Prisma.UserDeleteManyArgs');
     expect(output).toContain('Promise<{ count: number; cascaded: CascadeResult }>');
     expect(output).toContain('restoreCascade: <T extends Prisma.UserDeleteArgs>(args: T)');
@@ -262,9 +262,18 @@ describe('emitRuntime', () => {
     const output = emitRuntime(schema, TEST_CLIENT_PATH);
 
     expect(output).toContain('// @ts-nocheck');
-    expect(output).toContain(`import type { PrismaClient, Prisma } from '${TEST_CLIENT_PATH}'`);
+    expect(output).toContain(`import { type PrismaClient, Prisma } from '${TEST_CLIENT_PATH}'`);
     expect(output).toContain("import { CASCADE_GRAPH");
     expect(output).toContain("import type { SafePrismaClient");
+  });
+
+  it('emits throwIfNotFound helper that throws P2025', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('function throwIfNotFound(count: number, modelName: string): void');
+    expect(output).toContain("code: 'P2025'");
+    expect(output).toContain('Prisma.PrismaClientKnownRequestError');
   });
 
   it('defaults to mangle uniqueStrategy', () => {
@@ -1008,6 +1017,73 @@ describe('emitRuntime - bug fix regression tests', () => {
     const p2002Matches = output.match(/\.code === 'P2002'/g);
     expect(p2002Matches).not.toBeNull();
     expect(p2002Matches!.length).toBe(4);
+  });
+});
+
+describe('emitRuntime - cascade: false (empty cascade graph)', () => {
+  it('model with children uses fast path when cascade graph is empty and strategy is none', () => {
+    const schema = createTestSchema();
+    const emptyCascadeGraph = {};
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph: emptyCascadeGraph });
+
+    // With strategy='none' AND no children in graph → fast path (updateMany)
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).not.toContain('softDeleteWithCascade');
+    expect(userDelegate![0]).toContain('original.updateMany');
+  });
+
+  it('model with children still uses complex path when cascade is disabled but mangle needs it', () => {
+    const schema = createTestSchema(); // User has unique string field (email)
+    const emptyCascadeGraph = {};
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph: emptyCascadeGraph });
+
+    // User has unique string fields (email) → still needs complex path for mangling
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('softDeleteWithCascade');
+  });
+
+  it('model with children uses fast path when cascade graph is empty and strategy is sentinel', () => {
+    const schema = createSentinelSchema();
+    const emptyCascadeGraph = {};
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph: emptyCascadeGraph });
+
+    // With strategy='sentinel' AND no children in graph → fast path
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).not.toContain('softDeleteWithCascade');
+    expect(userDelegate![0]).toContain('original.updateMany');
+  });
+
+  it('all models use fast path when cascade is disabled with none strategy', () => {
+    const schema = createTestSchema();
+    const emptyCascadeGraph = {};
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph: emptyCascadeGraph });
+
+    // Both User and Post should use fast path
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    expect(postDelegate).not.toBeNull();
+    expect(userDelegate![0]).not.toContain('softDeleteWithCascade');
+    expect(postDelegate![0]).not.toContain('softDeleteWithCascade');
+  });
+
+  it('transaction wrapper uses fast path for all models when cascade is disabled', () => {
+    const schema = createTestSchema();
+    const emptyCascadeGraph = {};
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph: emptyCascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // User (normally complex) should now use updateMany in tx
+    const userSection = /user: \{[\s\S]*?\},\n\s{4}\w/.exec(txContent);
+    expect(userSection).not.toBeNull();
+    expect(userSection![0]).toContain('tx.user.updateMany');
+    expect(userSection![0]).not.toContain('softDeleteWithCascadeInTx');
   });
 });
 

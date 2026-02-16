@@ -510,6 +510,7 @@ generatorHandler({
       : rawStrategy === 'sentinel' ? 'sentinel'
       : 'mangle'; // Default to 'mangle'
 
+    const cascade = options.generator.config['cascade'] !== 'false';
     const strictUniqueChecks = options.generator.config['strictUniqueChecks'] === 'true';
     const deletedAtFieldName = options.generator.config['deletedAtField'] as string | undefined;
     const deletedByFieldName = options.generator.config['deletedByField'] as string | undefined;
@@ -555,8 +556,8 @@ generatorHandler({
       );
     }
 
-    // Build the cascade graph
-    const cascadeGraph = buildCascadeGraph(schema);
+    // Build the cascade graph (empty when cascade is disabled)
+    const cascadeGraph = cascade ? buildCascadeGraph(schema) : {};
 
     // Generate all output files
     const typesContent = emitTypes(schema, clientImportPath);
