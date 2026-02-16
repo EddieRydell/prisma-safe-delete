@@ -741,7 +741,7 @@ function injectIntoRelations(
             countSelect[relName] = true;
           }
         }
-        result[key] = { select: countSelect };
+        result[key] = Object.keys(countSelect).length > 0 ? { select: countSelect } : true;
       } else if (value && typeof value === 'object') {
         const countObj = value as Record<string, unknown>;
         if (countObj.select && typeof countObj.select === 'object') {
