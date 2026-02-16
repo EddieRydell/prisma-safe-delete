@@ -161,11 +161,22 @@ model Project {
 
 // Non-soft-deletable child in cascade path
 model Asset {
-  id             String       @id @default(cuid())
+  id             String         @id @default(cuid())
   url            String
   organizationId String
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  comments       AssetComment[]
   // Note: No deleted_at - this is intentionally not soft-deletable
+}
+
+// Soft-deletable grandchild through non-soft-deletable intermediary (Asset)
+// Creates chain: Organization(soft) -> Asset(non-soft) -> AssetComment(soft)
+model AssetComment {
+  id         String    @id @default(cuid())
+  content    String
+  assetId    String
+  asset      Asset     @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
 }
 
 // Model with unique string constraint for testing mangling

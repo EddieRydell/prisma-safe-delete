@@ -943,6 +943,74 @@ describe('emitRuntime - cascade N+1 optimization', () => {
   });
 });
 
+describe('emitRuntime - bug fix regression tests', () => {
+  it('#43: mangleUniqueFields does not have endsWith idempotency check', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // The idempotency check was removed because softDeleteWithCascade already
+    // filters by ACTIVE_DELETED_AT_VALUE, so double-mangling can't happen via
+    // normal paths. The check was harmful because field values that naturally
+    // end with the suffix pattern would skip mangling.
+    const mangleFn = /function mangleUniqueFields[\s\S]*?^}/m.exec(output);
+    expect(mangleFn).not.toBeNull();
+    expect(mangleFn![0]).not.toContain('endsWith(suffix)');
+    expect(mangleFn![0]).not.toContain('already mangled');
+  });
+
+  it('#42: restoreCascadeChildren does not bail out on non-soft-deletable children', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // The old code had: if (!child.isSoftDeletable || !child.deletedAtField) continue;
+    // This skipped non-soft-deletable intermediary nodes entirely, preventing
+    // traversal to their soft-deletable grandchildren.
+    const restoreCascadeFn = /async function restoreCascadeChildren[\s\S]*?^}/m.exec(output);
+    expect(restoreCascadeFn).not.toBeNull();
+    expect(restoreCascadeFn![0]).not.toContain('if (!child.isSoftDeletable || !child.deletedAtField) continue');
+    // It should still gate restore operations behind the check
+    expect(restoreCascadeFn![0]).toContain('if (child.isSoftDeletable && child.deletedAtField)');
+  });
+
+  it('#44: _count: true expands to select with filters instead of pass-through', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // The old code passed _count: true through unchanged.
+    // Now it should expand to _count: { select: { ... } } with soft-delete filters.
+    expect(output).toContain('getListRelationsForModel(parentModel)');
+    expect(output).not.toContain('Simple _count: true - pass through');
+  });
+
+  it('#44: getListRelationsForModel helper is emitted', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    expect(output).toContain('function getListRelationsForModel(modelName: string): string[]');
+  });
+
+  it('#45: restore updates have P2002 error handling', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // All 4 restore functions should have P2002 catch blocks
+    expect(output).toContain("(e as Record<string, unknown>).code === 'P2002'");
+    expect(output).toContain('unique constraint violation on');
+    expect(output).toContain('An active record with the same unique value was created concurrently.');
+
+    // Should appear in restoreRecordWithDelegate, restoreManyWithDelegate,
+    // restoreWithCascadeInTx, and restoreCascadeChildren (4 locations)
+    const p2002Matches = output.match(/\.code === 'P2002'/g);
+    expect(p2002Matches).not.toBeNull();
+    expect(p2002Matches!.length).toBe(4);
+  });
+});
+
 describe('emitRuntime - upsert filter injection', () => {
   it('mangle upsert calls injectFilters', () => {
     const schema = createTestSchema();

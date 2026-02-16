@@ -195,6 +195,22 @@ CREATE UNIQUE INDEX user_email_active ON User(email) WHERE deleted_at IS NULL;
 
 This approach works for all field types and avoids the max-length issues of mangling.
 
+## Strategy Caveats
+
+### Sentinel and date range queries
+
+With the sentinel strategy, active records have `deleted_at = 9999-12-31T00:00:00Z`. This means:
+
+- Raw SQL queries using `deleted_at > someDate` will match all active records
+- External tools querying the database directly will see the sentinel value
+- Date-based analytics on `deleted_at` must account for the sentinel
+
+This only affects raw queries and direct database access. All wrapped operations handle the sentinel correctly.
+
+### Mangle and string length
+
+Mangling appends `__deleted_{pk}` to unique string fields. If the mangled value exceeds 255 characters (the default `VARCHAR` limit), the soft-delete operation will throw an error. For long string fields, consider using `none` or `sentinel` strategy instead.
+
 ## Strategy Comparison
 
 | Feature | `mangle` (default) | `none` | `sentinel` |

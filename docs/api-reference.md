@@ -109,6 +109,28 @@ console.log(cascaded);  // Aggregated cascade counts across all matched records
 
 The `cascaded` field is a `Record<string, number>` mapping model names to the number of records that were cascade-deleted. It's empty (`{}`) when there are no cascade children.
 
+**Audit trail**: The `cascaded` return value is ephemeral — it is not persisted anywhere. If your application requires an audit trail of cascade operations (e.g., for SOC 2 compliance), you must log or persist the return value yourself. Use an interactive transaction to make the audit log atomic with the soft-delete:
+
+```typescript
+await safePrisma.$transaction(async (tx) => {
+  const { record, cascaded } = await tx.user.softDelete({
+    where: { id: 'user-1' },
+    deletedBy: currentUserId,
+  });
+
+  // Persist the cascade audit trail in the same transaction
+  await tx.auditLog.create({
+    data: {
+      action: 'SOFT_DELETE',
+      modelName: 'User',
+      recordId: record?.id,
+      cascaded: JSON.stringify(cascaded),
+      performedBy: currentUserId,
+    },
+  });
+});
+```
+
 ## Soft Delete Preview
 
 Preview what would be cascade-deleted without making any changes:
@@ -377,3 +399,5 @@ await safePrisma.$transaction(async (tx) => {
   });
 });
 ```
+
+**Important**: Only interactive transactions (`$transaction(async (tx) => { ... })`) receive the soft-delete wrapper. Sequential transactions (`$transaction([promise1, promise2])`) pass through to raw Prisma with no soft-delete filtering. Always use the interactive form when soft-delete behavior is needed.
