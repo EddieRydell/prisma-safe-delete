@@ -171,7 +171,7 @@ generator softDelete {
 }
 ```
 
-When cascade is disabled, all models use the fast `updateMany` path (no per-record transactions), and `softDelete` / `softDeleteMany` always return `cascaded: {}`.
+When cascade is disabled, `softDelete` / `softDeleteMany` only affect the targeted model and always return `cascaded: {}`. Models that don't need unique field mangling (i.e., `uniqueStrategy = "none"` or `"sentinel"`) also get the fast `updateMany` path instead of per-record transactions.
 
 For cascade rules and performance characteristics, see [docs/cascade-behavior.md](docs/cascade-behavior.md).
 

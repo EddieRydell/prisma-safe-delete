@@ -7,6 +7,7 @@ import {
   emitCascadeGraph,
   emitIndex,
 } from '../src/codegen/index.js';
+import { buildToOneRelationWarningLines } from '../src/generator.js';
 import { createMockField, createMockModel, createMockDMMF } from './helpers/mock-dmmf.js';
 
 function createTestSchema() {
@@ -401,8 +402,10 @@ describe('emitRuntime', () => {
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    // Both User and Post delegates should inject filters on update/updateMany
-    expect(output).toContain("update: ((args: any) => original.update(injectFilters(args, 'User'))) as PrismaClient['user']['update']");
+    // update should use post-processing with injectFilters
+    expect(output).toContain("const filtered = injectFilters(pp, 'User')");
+    expect(output).toContain("postProcessRead(original.update(filtered), 'User'");
+    // updateMany should still be a simple pass-through (returns count, not records)
     expect(output).toContain("updateMany: ((args: any) => original.updateMany(injectFilters(args, 'User'))) as PrismaClient['user']['updateMany']");
   });
 
@@ -745,18 +748,18 @@ describe('emitRuntime - sentinel strategy', () => {
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
 
-    // Model delegate should inject sentinel into create
-    expect(output).toContain("ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['user']['create']");
-    expect(output).toContain("ACTIVE_DELETED_AT_VALUE }))");
+    // Model delegate should inject sentinel into create with post-processing
+    expect(output).toContain("ACTIVE_DELETED_AT_VALUE");
+    expect(output).toContain("postProcessRead(original.create(withSentinel)");
   });
 
-  it('non-sentinel create methods are pass-through', () => {
+  it('non-sentinel create methods use post-processing', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    // Create should be pass-through for mangle
-    expect(output).toContain("create: ((args: any) => original.create(args))");
+    // Create should use post-processing for to-one relation nullification
+    expect(output).toContain("postProcessRead(original.create(pp)");
   });
 
   it('sentinel findUnique calls transformSentinelFindUniqueWhere', () => {
@@ -798,19 +801,20 @@ describe('emitRuntime - sentinel strategy', () => {
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
 
-    // Model delegate upsert should inject sentinel into create data, call injectFilters, and transform where
+    // Model delegate upsert should inject sentinel into create data, call injectFilters, transform where, and post-process
     expect(output).toContain("ACTIVE_DELETED_AT_VALUE");
     expect(output).toContain("filtered.where = transformSentinelFindUniqueWhere(filtered.where");
-    expect(output).toContain("return original.upsert(filtered)");
+    expect(output).toContain("postProcessRead(original.upsert(filtered)");
   });
 
-  it('non-sentinel upsert applies injectFilters', () => {
+  it('non-sentinel upsert applies injectFilters and post-processing', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    // Upsert should call injectFilters for mangle strategy
-    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters(args,");
+    // Upsert should call injectFilters and post-process for mangle strategy
+    expect(output).toContain("injectFilters(pp, 'User')");
+    expect(output).toContain("postProcessRead(original.upsert(filtered)");
   });
 });
 
@@ -1088,44 +1092,48 @@ describe('emitRuntime - cascade: false (empty cascade graph)', () => {
 });
 
 describe('emitRuntime - upsert filter injection', () => {
-  it('mangle upsert calls injectFilters', () => {
+  it('mangle upsert calls injectFilters and post-processes', () => {
     const schema = createTestSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters(args, 'User')))");
+    expect(output).toContain("injectFilters(pp, 'User')");
+    expect(output).toContain("postProcessRead(original.upsert(filtered)");
   });
 
-  it('none upsert calls injectFilters', () => {
+  it('none upsert calls injectFilters and post-processes', () => {
     const schema = createTestSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'none', cascadeGraph });
 
-    expect(output).toContain("upsert: ((args: any) => original.upsert(injectFilters(args, 'User')))");
+    expect(output).toContain("injectFilters(pp, 'User')");
+    expect(output).toContain("postProcessRead(original.upsert(filtered)");
   });
 
-  it('transaction wrapper upsert calls injectFilters for mangle', () => {
+  it('transaction wrapper upsert calls injectFilters and post-processes for mangle', () => {
     const schema = createTestSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
     const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
     expect(txWrapper).not.toBeNull();
-    expect(txWrapper![0]).toContain("upsert: ((args: any) => tx.user.upsert(injectFilters(args, 'User')))");
+    const txContent = String(txWrapper?.[0]);
+    expect(txContent).toContain("injectFilters(pp, 'User')");
+    expect(txContent).toContain("postProcessRead(tx.user.upsert(filtered)");
   });
 
-  it('transaction wrapper sentinel upsert applies transformSentinelFindUniqueWhere', () => {
+  it('transaction wrapper sentinel upsert applies transformSentinelFindUniqueWhere and post-processes', () => {
     const schema = createSentinelSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'sentinel', cascadeGraph });
 
     const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
     expect(txWrapper).not.toBeNull();
-    const txContent = txWrapper![0];
-    // Sentinel tx upsert should call injectFilters, inject sentinel value, and transform where
+    const txContent = String(txWrapper?.[0]);
+    // Sentinel tx upsert should call injectFilters, inject sentinel value, transform where, and post-process
     expect(txContent).toContain('ACTIVE_DELETED_AT_VALUE');
     expect(txContent).toContain('transformSentinelFindUniqueWhere(filtered.where');
-    expect(txContent).toContain('return tx.user.upsert(filtered)');
+    expect(txContent).toContain('postProcessRead(tx.user.upsert(filtered)');
   });
 });
 
@@ -1141,5 +1149,182 @@ describe('emitIndex', () => {
     expect(output).toContain("export { CASCADE_GRAPH, MODEL_NAMES }");
     expect(output).toContain("export { wrapPrismaClient }");
     expect(output).toContain("export { onlyDeleted, excludeDeleted, includingDeleted }");
+  });
+});
+
+describe('emitRuntime - to-one post-processing', () => {
+  it('emits TO_ONE_SOFT_DELETABLE_RELATIONS metadata', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // Post has a to-one relation 'author' -> User (soft-deletable)
+    expect(output).toContain('TO_ONE_SOFT_DELETABLE_RELATIONS');
+    expect(output).toContain('Post: ["author"]');
+  });
+
+  it('emits post-processing helper functions', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('function isRecordDeleted(');
+    expect(output).toContain('function nullifyDeletedToOneRelations(');
+    expect(output).toContain('function injectDeletedAtIntoToOneSelects');
+    expect(output).toContain('function stripInjectedFields(');
+    expect(output).toContain('function postProcessRead<T>(');
+  });
+
+  it('wraps read methods with postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // findMany should use postProcessRead
+    expect(output).toContain("postProcessRead(original.findMany(filtered), 'User'");
+    expect(output).toContain("postProcessRead(original.findFirst(filtered), 'User'");
+    expect(output).toContain("postProcessRead(original.findFirstOrThrow(filtered), 'User'");
+    expect(output).toContain("postProcessRead(original.findUnique(filtered), 'User'");
+    expect(output).toContain("postProcessRead(original.findUniqueOrThrow(filtered), 'User'");
+  });
+
+  it('does not wrap count/aggregate/groupBy with postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // count/aggregate/groupBy should NOT use postProcessRead
+    expect(output).not.toContain("postProcessRead(original.count(");
+    expect(output).not.toContain("postProcessRead(original.aggregate(");
+    expect(output).not.toContain("postProcessRead(original.groupBy(");
+  });
+
+  it('includingDeleted does not use postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // includingDeleted sub-object passes directly through
+    expect(output).toContain('includingDeleted: {\n      findMany: ((args?: any) => original.findMany(args))');
+  });
+
+  it('$includingDeleted client does not use postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // $includingDeleted uses include-deleted mode but no postProcessRead
+    expect(output).toContain("injectFilters(args[0], 'User', 'include-deleted')");
+    // The include-deleted lines shouldn't have postProcessRead
+    const includingDeletedSection = output.split('$includingDeleted')[1] ?? '';
+    // In the $includingDeleted section of wrapTransactionClient, there should be no postProcessRead
+    const sectionEnd = includingDeletedSection.indexOf('$queryRaw');
+    const section = includingDeletedSection.slice(0, sectionEnd);
+    expect(section).not.toContain('postProcessRead');
+  });
+
+  it('$onlyDeleted uses postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // $onlyDeleted should use postProcessRead
+    expect(output).toContain("injectFilters(pp, 'User', 'only-deleted')");
+  });
+
+  it('transaction wrapper uses postProcessRead for normal reads', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // Transaction wrapper reads should use postProcessRead
+    expect(output).toContain("postProcessRead(tx.user.findMany(filtered), 'User'");
+    expect(output).toContain("postProcessRead(tx.user.findFirst(filtered), 'User'");
+  });
+
+  it('wraps write methods (create, update, upsert, createManyAndReturn, updateManyAndReturn) with postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // Write methods that return records with relations should use postProcessRead
+    expect(output).toContain("postProcessRead(original.create(pp)");
+    expect(output).toContain("postProcessRead(original.update(filtered)");
+    expect(output).toContain("postProcessRead(original.upsert(filtered)");
+    expect(output).toContain("postProcessRead(original.createManyAndReturn(pp)");
+    expect(output).toContain("postProcessRead(original.updateManyAndReturn(filtered)");
+  });
+
+  it('does not wrap createMany or updateMany with postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    // createMany and updateMany return {count} only, no relations to post-process
+    expect(output).not.toContain("postProcessRead(original.createMany(");
+    expect(output).not.toContain("postProcessRead(original.updateMany(");
+  });
+
+  it('transaction wrapper wraps write methods with postProcessRead', () => {
+    const schema = createTestSchema();
+    const output = emitRuntime(schema, TEST_CLIENT_PATH);
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = String(txWrapper?.[0]);
+
+    expect(txContent).toContain("postProcessRead(tx.user.create(pp)");
+    expect(txContent).toContain("postProcessRead(tx.user.update(filtered)");
+    expect(txContent).toContain("postProcessRead(tx.user.upsert(filtered)");
+    expect(txContent).toContain("postProcessRead(tx.user.createManyAndReturn(");
+    expect(txContent).toContain("postProcessRead(tx.user.updateManyAndReturn(filtered)");
+  });
+});
+
+describe('buildToOneRelationWarningLines', () => {
+  it('warns about required to-one relations to soft-deletable models', () => {
+    const schema = createTestSchema();
+    const lines = buildToOneRelationWarningLines(schema, false);
+
+    // Post.author is required and points to User (soft-deletable)
+    expect(lines.join('\n')).toContain('Post.author -> User');
+  });
+
+  it('returns empty for models without required to-one soft-deletable relations', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+    const lines = buildToOneRelationWarningLines(schema, false);
+
+    expect(lines).toEqual([]);
+  });
+
+  it('does not warn about optional to-one relations', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+      createMockModel({
+        name: 'Post',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'authorId', type: 'String', isRequired: false }),
+          createMockField({
+            name: 'author',
+            type: 'User',
+            kind: 'object',
+            isRequired: false,
+            relationName: 'UserPosts',
+            relationFromFields: ['authorId'],
+            relationToFields: ['id'],
+          }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+    const lines = buildToOneRelationWarningLines(schema, false);
+
+    expect(lines).toEqual([]);
   });
 });

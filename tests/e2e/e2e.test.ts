@@ -4593,4 +4593,237 @@ describe('E2E: Real database tests', () => {
       });
     });
   });
+
+  describe('To-one relation nullification (#50)', () => {
+    it('nullifies soft-deleted to-one relation (Post.author)', async () => {
+      // Create user and post
+      const user = await prisma.user.create({ data: { email: 'author@test.com', name: 'Author' } });
+      await prisma.post.create({ data: { title: 'Test Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade so post stays active)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Query post with include: { author: true } — author should be null
+      const posts = await safePrisma.post.findMany({
+        include: { author: true },
+      });
+      expect(posts).toHaveLength(1);
+      expect(posts[0].author).toBeNull();
+    });
+
+    it('nullifies soft-deleted optional to-one relation (User.profile)', async () => {
+      const user = await prisma.user.create({ data: { email: 'profuser@test.com', name: 'User' } });
+      const profile = await prisma.profile.create({ data: { bio: 'Hello', userId: user.id } });
+
+      // Soft-delete the profile directly
+      await prisma.profile.update({ where: { id: profile.id }, data: { deleted_at: new Date() } });
+
+      // Query user with include: { profile: true } — profile should be null
+      const foundUser = await safePrisma.user.findUnique({
+        where: { id: user.id },
+        include: { profile: true },
+      });
+      expect(foundUser).not.toBeNull();
+      expect(foundUser.profile).toBeNull();
+    });
+
+    it('returns active to-one relation normally', async () => {
+      const user = await prisma.user.create({ data: { email: 'active@test.com', name: 'Active' } });
+      await prisma.post.create({ data: { title: 'Active Post', authorId: user.id } });
+
+      // Query post with include — author should be present
+      const posts = await safePrisma.post.findMany({
+        include: { author: true },
+      });
+      expect(posts).toHaveLength(1);
+      expect(posts[0].author).not.toBeNull();
+      expect(posts[0].author.email).toBe('active@test.com');
+    });
+
+    it('nullifies with select clause and strips injected deleted_at', async () => {
+      const user = await prisma.user.create({ data: { email: 'sel@test.com', name: 'Sel' } });
+      await prisma.post.create({ data: { title: 'Sel Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Use include with select — deleted_at should not leak
+      const posts = await safePrisma.post.findMany({
+        include: { author: { select: { name: true } } },
+      });
+      expect(posts).toHaveLength(1);
+      expect(posts[0].author).toBeNull();
+    });
+
+    it('returns selected fields normally when author is active', async () => {
+      const user = await prisma.user.create({ data: { email: 'selact@test.com', name: 'SelActive' } });
+      await prisma.post.create({ data: { title: 'SelActive Post', authorId: user.id } });
+
+      const posts = await safePrisma.post.findMany({
+        include: { author: { select: { name: true } } },
+      });
+      expect(posts).toHaveLength(1);
+      expect(posts[0].author).not.toBeNull();
+      expect(posts[0].author.name).toBe('SelActive');
+    });
+
+    it('$includingDeleted shows soft-deleted to-one relations', async () => {
+      const user = await prisma.user.create({ data: { email: 'incl@test.com', name: 'Incl' } });
+      await prisma.post.create({ data: { title: 'Incl Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // $includingDeleted should return the soft-deleted author
+      const posts = await safePrisma.$includingDeleted.post.findMany({
+        include: { author: true },
+      });
+      expect(posts).toHaveLength(1);
+      expect(posts[0].author).not.toBeNull();
+      expect(posts[0].author.email).toBe('incl@test.com');
+    });
+
+    it('model.includingDeleted shows soft-deleted to-one relations', async () => {
+      const user = await prisma.user.create({ data: { email: 'mincl@test.com', name: 'MIncl' } });
+      await prisma.post.create({ data: { title: 'MIncl Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // model.includingDeleted should return the soft-deleted author
+      const posts = await safePrisma.post.includingDeleted.findMany({
+        include: { author: true },
+      });
+      expect(posts).toHaveLength(1);
+      expect(posts[0].author).not.toBeNull();
+      expect(posts[0].author.email).toBe('mincl@test.com');
+    });
+
+    it('nullifies inside $transaction', async () => {
+      const user = await prisma.user.create({ data: { email: 'tx@test.com', name: 'TxUser' } });
+      await prisma.post.create({ data: { title: 'Tx Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      const result = await safePrisma.$transaction(async (tx: any) => {
+        return tx.post.findMany({ include: { author: true } });
+      });
+      expect(result).toHaveLength(1);
+      expect(result[0].author).toBeNull();
+    });
+
+    it('recurses into nested to-one relations', async () => {
+      // Create: User -> Post -> Comment, where Post.author -> User
+      const user = await prisma.user.create({ data: { email: 'nested@test.com', name: 'Nested' } });
+      const post = await prisma.post.create({ data: { title: 'Nested Post', authorId: user.id } });
+      await prisma.comment.create({ data: { content: 'Hello', postId: post.id } });
+
+      // Soft-delete the user directly (bypass cascade so post & comment stay active)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Query comments with nested include of post.author
+      const comments = await safePrisma.comment.findMany({
+        include: { post: { include: { author: true } } },
+      });
+      expect(comments).toHaveLength(1);
+      expect(comments[0].post).not.toBeNull();
+      expect(comments[0].post.author).toBeNull();
+    });
+  });
+
+  describe('Write method to-one nullification (#50)', () => {
+    it('nullifies soft-deleted to-one on create return', async () => {
+      const user = await prisma.user.create({ data: { email: 'wcreate@test.com', name: 'WCreate' } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Create a post pointing to deleted author, include author in result
+      const post = await safePrisma.post.create({
+        data: { title: 'Write Create Post', authorId: user.id },
+        include: { author: true },
+      });
+      expect(post.author).toBeNull();
+    });
+
+    it('nullifies soft-deleted to-one on update return', async () => {
+      const user = await prisma.user.create({ data: { email: 'wupdate@test.com', name: 'WUpdate' } });
+      const post = await prisma.post.create({ data: { title: 'Write Update Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Update the post and include author in result
+      const updated = await safePrisma.post.update({
+        where: { id: post.id },
+        data: { title: 'Updated Title' },
+        include: { author: true },
+      });
+      expect(updated.title).toBe('Updated Title');
+      expect(updated.author).toBeNull();
+    });
+
+    it('nullifies soft-deleted to-one on upsert return', async () => {
+      const user = await prisma.user.create({ data: { email: 'wupsert@test.com', name: 'WUpsert' } });
+      const post = await prisma.post.create({ data: { title: 'Write Upsert Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Upsert the post and include author in result
+      const upserted = await safePrisma.post.upsert({
+        where: { id: post.id },
+        update: { title: 'Upserted Title' },
+        create: { title: 'Upserted Title', authorId: user.id },
+        include: { author: true },
+      });
+      expect(upserted.title).toBe('Upserted Title');
+      expect(upserted.author).toBeNull();
+    });
+
+    it('returns active to-one normally on write returns', async () => {
+      const user = await prisma.user.create({ data: { email: 'wactive@test.com', name: 'WActive' } });
+
+      // Create with active author — should be returned normally
+      const post = await safePrisma.post.create({
+        data: { title: 'Write Active Post', authorId: user.id },
+        include: { author: true },
+      });
+      expect(post.author).not.toBeNull();
+      expect(post.author.email).toBe('wactive@test.com');
+    });
+
+    it('nullifies soft-deleted to-one on write inside $transaction', async () => {
+      const user = await prisma.user.create({ data: { email: 'wtx@test.com', name: 'WTx' } });
+      const post = await prisma.post.create({ data: { title: 'Write Tx Post', authorId: user.id } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      const updated = await safePrisma.$transaction(async (tx: any) => {
+        return tx.post.update({
+          where: { id: post.id },
+          data: { title: 'Tx Updated' },
+          include: { author: true },
+        });
+      });
+      expect(updated.title).toBe('Tx Updated');
+      expect(updated.author).toBeNull();
+    });
+
+    it('strips injected deleted_at from write return with select', async () => {
+      const user = await prisma.user.create({ data: { email: 'wsel@test.com', name: 'WSel' } });
+
+      // Soft-delete the author directly (bypass cascade)
+      await prisma.user.update({ where: { id: user.id }, data: { deleted_at: new Date() } });
+
+      // Create with select on author — deleted_at should not leak
+      const post = await safePrisma.post.create({
+        data: { title: 'Write Sel Post', authorId: user.id },
+        include: { author: { select: { name: true } } },
+      });
+      expect(post.author).toBeNull();
+    });
+  });
 });

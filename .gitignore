@@ -23,3 +23,6 @@ tests/e2e-sentinel/*.db-journal
 tests/e2e-none/generated/
 tests/e2e-none/*.db
 tests/e2e-none/*.db-journal
+tests/e2e-no-cascade/generated/
+tests/e2e-no-cascade/*.db
+tests/e2e-no-cascade/*.db-journal

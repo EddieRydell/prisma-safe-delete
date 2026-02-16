@@ -32,6 +32,7 @@ jobs:
           cd tests/e2e && npx prisma generate
           cd ../e2e-sentinel && npx prisma generate
           cd ../e2e-none && npx prisma generate
+          cd ../e2e-no-cascade && npx prisma generate
           cd ../integration && npx prisma generate
 
       - name: Type Check

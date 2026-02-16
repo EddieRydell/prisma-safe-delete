@@ -102,6 +102,25 @@ export function emitRuntime(
   lines.push('};');
   lines.push('');
 
+  // Emit to-one relations to soft-deletable models (for post-processing)
+  lines.push('/** To-one relations pointing to soft-deletable models, per parent model */');
+  lines.push('const TO_ONE_SOFT_DELETABLE_RELATIONS: Record<string, string[]> = {');
+  for (const model of schema.models) {
+    const toOneFields: string[] = [];
+    for (const relation of model.relations) {
+      if (relation.isList) continue;
+      const target = schema.modelMap.get(relation.type);
+      if (target?.isSoftDeletable === true) {
+        toOneFields.push(relation.name);
+      }
+    }
+    if (toOneFields.length > 0) {
+      lines.push(`  ${model.name}: ${JSON.stringify(toOneFields)},`);
+    }
+  }
+  lines.push('};');
+  lines.push('');
+
   // Emit unique string fields metadata (for mangling on soft delete)
   lines.push('/**');
   lines.push(' * String fields with unique constraints that need mangling on soft delete.');
@@ -169,6 +188,10 @@ export function emitRuntime(
     lines.push(emitSentinelFindUniqueHelper());
     lines.push('');
   }
+
+  // Emit to-one post-processing functions
+  lines.push(emitToOnePostProcessing());
+  lines.push('');
 
   // Emit injectFilters function
   lines.push(emitInjectFiltersFunction());
@@ -547,6 +570,283 @@ function transformSentinelFindUniqueWhere(
   }
 
   return result;
+}`.trim();
+}
+
+function emitToOnePostProcessing(): string {
+  return `
+/**
+ * Checks if a record is soft-deleted by examining its deleted_at field.
+ * Handles both null-based (mangle/none) and sentinel strategies.
+ */
+function isRecordDeleted(record: Record<string, unknown>, deletedAtField: string): boolean {
+  const value = record[deletedAtField];
+  if (ACTIVE_DELETED_AT_VALUE === null) {
+    // mangle/none strategy: active records have null deleted_at
+    return value !== null && value !== undefined;
+  }
+  // sentinel strategy: active records have the sentinel date
+  const sentinel = ACTIVE_DELETED_AT_VALUE as Date;
+  if (value instanceof Date) {
+    return value.getTime() !== sentinel.getTime();
+  }
+  // Handle string dates from DB
+  if (typeof value === 'string') {
+    return new Date(value).getTime() !== sentinel.getTime();
+  }
+  return false;
+}
+
+/**
+ * Gets to-one relation field names for a model that point to soft-deletable targets.
+ */
+function getToOneSoftDeletableRelations(modelName: string): string[] {
+  return TO_ONE_SOFT_DELETABLE_RELATIONS[modelName] ?? [];
+}
+
+/**
+ * Recursively nullifies to-one relations pointing to soft-deleted records.
+ * Walks the result tree and sets deleted to-one relations to null.
+ */
+function nullifyDeletedToOneRelations(
+  result: unknown,
+  modelName: string,
+  args: Record<string, unknown> | undefined
+): unknown {
+  if (result === null || result === undefined) return result;
+
+  if (Array.isArray(result)) {
+    return result.map(item => nullifyDeletedToOneRelations(item, modelName, args));
+  }
+
+  if (typeof result !== 'object') return result;
+
+  const record = result as Record<string, unknown>;
+  const toOneRelations = getToOneSoftDeletableRelations(modelName);
+  const includeOrSelect = (args?.include ?? args?.select) as Record<string, unknown> | undefined;
+
+  const processed: Record<string, unknown> = { ...record };
+
+  for (const field of toOneRelations) {
+    if (!(field in processed)) continue;
+    const related = processed[field];
+    if (related === null || related === undefined) continue;
+    if (typeof related !== 'object') continue;
+
+    const relatedRecord = related as Record<string, unknown>;
+    const targetModel = getRelationModel(modelName, field);
+    if (!targetModel) continue;
+
+    const deletedAtField = getDeletedAtField(targetModel);
+    if (!deletedAtField) continue;
+
+    // Check if this related record is deleted
+    if (deletedAtField in relatedRecord && isRecordDeleted(relatedRecord, deletedAtField)) {
+      processed[field] = null;
+      continue;
+    }
+
+    // Recurse into live related records
+    const nestedArgs = includeOrSelect?.[field];
+    const nestedArgsObj = (nestedArgs && typeof nestedArgs === 'object') ? nestedArgs as Record<string, unknown> : undefined;
+    processed[field] = nullifyDeletedToOneRelations(relatedRecord, targetModel, nestedArgsObj);
+  }
+
+  // Also recurse into to-many relations (they may have nested to-one relations)
+  if (includeOrSelect) {
+    for (const [field, spec] of Object.entries(includeOrSelect)) {
+      if (toOneRelations.includes(field)) continue; // Already handled above
+      if (!(field in processed)) continue;
+      const value = processed[field];
+      if (!value || typeof value !== 'object') continue;
+
+      const targetModel = getRelationModel(modelName, field);
+      if (!targetModel) continue;
+
+      const nestedArgs = (spec && typeof spec === 'object') ? spec as Record<string, unknown> : undefined;
+      processed[field] = nullifyDeletedToOneRelations(value, targetModel, nestedArgs);
+    }
+  }
+
+  return processed;
+}
+
+/**
+ * Pre-processes args to ensure deleted_at is available in select clauses
+ * for to-one relations to soft-deletable models (so post-processing can check it).
+ * Returns the modified args and a set of paths where deleted_at was injected.
+ */
+function injectDeletedAtIntoToOneSelects<T extends Record<string, unknown> | undefined>(
+  args: T,
+  modelName: string
+): { args: T; injectedPaths: string[] } {
+  if (!args) return { args, injectedPaths: [] };
+
+  const injectedPaths: string[] = [];
+  const processed = injectDeletedAtRecursive(args, modelName, '', injectedPaths);
+  return { args: processed as T, injectedPaths };
+}
+
+function injectDeletedAtRecursive(
+  args: Record<string, unknown>,
+  modelName: string,
+  pathPrefix: string,
+  injectedPaths: string[]
+): Record<string, unknown> {
+  const result = { ...args };
+  const toOneRelations = getToOneSoftDeletableRelations(modelName);
+
+  // Process include
+  if (result.include && typeof result.include === 'object') {
+    const include = { ...(result.include as Record<string, unknown>) };
+    for (const field of toOneRelations) {
+      if (!(field in include)) continue;
+      const spec = include[field];
+      const targetModel = getRelationModel(modelName, field);
+      if (!targetModel) continue;
+      const deletedAtField = getDeletedAtField(targetModel);
+      if (!deletedAtField) continue;
+
+      const fieldPath = pathPrefix ? pathPrefix + '.' + field : field;
+
+      if (spec && typeof spec === 'object') {
+        const nested = spec as Record<string, unknown>;
+        if (nested.select && typeof nested.select === 'object') {
+          // select present — ensure deleted_at is included
+          const select = { ...(nested.select as Record<string, unknown>) };
+          if (!(deletedAtField in select)) {
+            select[deletedAtField] = true;
+            injectedPaths.push(fieldPath + '.' + deletedAtField);
+          }
+          include[field] = injectDeletedAtRecursive(
+            { ...nested, select },
+            targetModel,
+            fieldPath,
+            injectedPaths
+          );
+        } else {
+          // No select — deleted_at will be fetched by default
+          include[field] = injectDeletedAtRecursive(nested, targetModel, fieldPath, injectedPaths);
+        }
+      }
+      // If spec === true, all fields are fetched, no injection needed
+    }
+
+    // Also recurse into non-to-one relations (to-many) that might have nested to-one
+    for (const [field, spec] of Object.entries(include)) {
+      if (toOneRelations.includes(field)) continue;
+      if (!spec || typeof spec !== 'object') continue;
+      const targetModel = getRelationModel(modelName, field);
+      if (!targetModel) continue;
+      const fieldPath = pathPrefix ? pathPrefix + '.' + field : field;
+      include[field] = injectDeletedAtRecursive(spec as Record<string, unknown>, targetModel, fieldPath, injectedPaths);
+    }
+
+    result.include = include;
+  }
+
+  // Process select (for relations within select)
+  if (result.select && typeof result.select === 'object') {
+    const select = { ...(result.select as Record<string, unknown>) };
+    for (const field of toOneRelations) {
+      if (!(field in select)) continue;
+      const spec = select[field];
+      const targetModel = getRelationModel(modelName, field);
+      if (!targetModel) continue;
+      const deletedAtField = getDeletedAtField(targetModel);
+      if (!deletedAtField) continue;
+
+      const fieldPath = pathPrefix ? pathPrefix + '.' + field : field;
+
+      if (spec && typeof spec === 'object') {
+        const nested = spec as Record<string, unknown>;
+        if (nested.select && typeof nested.select === 'object') {
+          const innerSelect = { ...(nested.select as Record<string, unknown>) };
+          if (!(deletedAtField in innerSelect)) {
+            innerSelect[deletedAtField] = true;
+            injectedPaths.push(fieldPath + '.' + deletedAtField);
+          }
+          select[field] = injectDeletedAtRecursive(
+            { ...nested, select: innerSelect },
+            targetModel,
+            fieldPath,
+            injectedPaths
+          );
+        } else {
+          select[field] = injectDeletedAtRecursive(nested, targetModel, fieldPath, injectedPaths);
+        }
+      }
+    }
+
+    // Recurse into non-to-one relations
+    for (const [field, spec] of Object.entries(select)) {
+      if (toOneRelations.includes(field)) continue;
+      if (!spec || typeof spec !== 'object') continue;
+      const targetModel = getRelationModel(modelName, field);
+      if (!targetModel) continue;
+      const fieldPath = pathPrefix ? pathPrefix + '.' + field : field;
+      select[field] = injectDeletedAtRecursive(spec as Record<string, unknown>, targetModel, fieldPath, injectedPaths);
+    }
+
+    result.select = select;
+  }
+
+  return result;
+}
+
+/**
+ * Removes deleted_at fields that were injected into selects for post-processing.
+ */
+function stripInjectedFields(
+  result: unknown,
+  injectedPaths: string[]
+): unknown {
+  if (injectedPaths.length === 0) return result;
+  return stripInjectedRecursive(result, injectedPaths, '');
+}
+
+function stripInjectedRecursive(
+  result: unknown,
+  injectedPaths: string[],
+  currentPath: string
+): unknown {
+  if (result === null || result === undefined) return result;
+
+  if (Array.isArray(result)) {
+    return result.map(item => stripInjectedRecursive(item, injectedPaths, currentPath));
+  }
+
+  if (typeof result !== 'object') return result;
+
+  const record = { ...(result as Record<string, unknown>) };
+
+  for (const key of Object.keys(record)) {
+    const fieldPath = currentPath ? currentPath + '.' + key : key;
+
+    if (injectedPaths.includes(fieldPath)) {
+      delete record[key];
+    } else if (record[key] && typeof record[key] === 'object') {
+      record[key] = stripInjectedRecursive(record[key], injectedPaths, fieldPath);
+    }
+  }
+
+  return record;
+}
+
+/**
+ * Post-processes read results: nullifies deleted to-one relations and strips injected fields.
+ */
+function postProcessRead<T>(
+  promise: Promise<T>,
+  modelName: string,
+  args: Record<string, unknown> | undefined,
+  injectedPaths: string[]
+): Promise<T> {
+  return promise.then(result => {
+    if (result === null || result === undefined) return result;
+    const nullified = nullifyDeletedToOneRelations(result, modelName, args);
+    return stripInjectedFields(nullified, injectedPaths) as T;
+  });
 }`.trim();
 }
 
@@ -1695,67 +1995,113 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     const findUniqueMethods = options.uniqueStrategy === 'sentinel'
       ? `
     findUnique: ((...args: any[]) => {
-      const filtered = injectFilters(args[0], '${name}');
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
       if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');
-      return original.findUnique(filtered);
+      return postProcessRead(original.findUnique(filtered), '${name}', filtered, injectedPaths) as any;
     }) as PrismaClient['${lowerName}']['findUnique'],
     findUniqueOrThrow: ((...args: any[]) => {
-      const filtered = injectFilters(args[0], '${name}');
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
       if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');
-      return original.findUniqueOrThrow(filtered);
+      return postProcessRead(original.findUniqueOrThrow(filtered), '${name}', filtered, injectedPaths) as any;
     }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`
       : `
-    findUnique: ((...args: any[]) => original.findUnique(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findUnique'],
-    findUniqueOrThrow: ((...args: any[]) => original.findUniqueOrThrow(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`;
+    findUnique: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.findUnique(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['findUnique'],
+    findUniqueOrThrow: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.findUniqueOrThrow(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`;
 
     const readMethods = `
-    // Wrapped methods with filter injection
-    findMany: ((...args: any[]) => original.findMany(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findMany'],
-    findFirst: ((...args: any[]) => original.findFirst(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findFirst'],
-    findFirstOrThrow: ((...args: any[]) => original.findFirstOrThrow(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],${findUniqueMethods}
+    // Wrapped methods with filter injection and to-one post-processing
+    findMany: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.findMany(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['findMany'],
+    findFirst: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.findFirst(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['findFirst'],
+    findFirstOrThrow: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.findFirstOrThrow(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['findFirstOrThrow'],${findUniqueMethods}
     count: ((...args: any[]) => original.count(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['count'],
     aggregate: ((...args: any[]) => original.aggregate(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['aggregate'],
     groupBy: ((...args: any[]) => original.groupBy(injectFilters(args[0], '${name}'))) as PrismaClient['${lowerName}']['groupBy'],`;
 
     const createMethods = options.uniqueStrategy === 'sentinel'
       ? `
-    // Create methods - inject sentinel value for deleted_at
-    create: ((args: any) => original.create({ ...args, data: { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['create'],
+    // Create methods - inject sentinel value for deleted_at, post-process to-one relations
+    create: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const withSentinel = { ...pp, data: { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };
+      return postProcessRead(original.create(withSentinel), '${name}', withSentinel, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['create'],
     createMany: ((args: any) => {
       const data = Array.isArray(args.data)
         ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))
         : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };
       return original.createMany({ ...args, data });
     }) as PrismaClient['${lowerName}']['createMany'],
-    createManyAndReturn: ((args: any) => {
-      const data = Array.isArray(args.data)
-        ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))
-        : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };
-      return original.createManyAndReturn({ ...args, data });
+    createManyAndReturn: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const data = Array.isArray(pp?.data)
+        ? pp.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))
+        : { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };
+      return postProcessRead(original.createManyAndReturn({ ...pp, data }), '${name}', pp, injectedPaths) as any;
     }) as PrismaClient['${lowerName}']['createManyAndReturn'],`
       : `
-    // Pass-through methods (no filter needed for creates)
-    create: ((args: any) => original.create(args)) as PrismaClient['${lowerName}']['create'],
+    // Create methods with to-one post-processing
+    create: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      return postProcessRead(original.create(pp), '${name}', pp, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['create'],
     createMany: ((args: any) => original.createMany(args)) as PrismaClient['${lowerName}']['createMany'],
-    createManyAndReturn: ((args: any) => original.createManyAndReturn(args)) as PrismaClient['${lowerName}']['createManyAndReturn'],`;
+    createManyAndReturn: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      return postProcessRead(original.createManyAndReturn(pp), '${name}', pp, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['createManyAndReturn'],`;
 
     const upsertMethod = options.uniqueStrategy === 'sentinel'
       ? `
-    upsert: ((args: any) => {
+    upsert: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
       const filtered = injectFilters({
-        ...args,
-        create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }
+        ...pp,
+        create: { ...pp?.create, ['${deletedAtField}']: pp?.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }
       }, '${name}');
       if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');
-      return original.upsert(filtered);
+      return postProcessRead(original.upsert(filtered), '${name}', filtered, injectedPaths) as any;
     }) as PrismaClient['${lowerName}']['upsert'],`
       : `
-    upsert: ((args: any) => original.upsert(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['upsert'],`;
+    upsert: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.upsert(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['upsert'],`;
 
     const writeMethods = `${createMethods}
-    update: ((args: any) => original.update(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['update'],
+    update: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.update(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['update'],
     updateMany: ((args: any) => original.updateMany(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['updateMany'],
-    updateManyAndReturn: ((args: any) => original.updateManyAndReturn(injectFilters(args, '${name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],${upsertMethod}
+    updateManyAndReturn: ((...args: any[]) => {
+      const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${name}');
+      const filtered = injectFilters(pp, '${name}');
+      return postProcessRead(original.updateManyAndReturn(filtered), '${name}', filtered, injectedPaths) as any;
+    }) as PrismaClient['${lowerName}']['updateManyAndReturn'],${upsertMethod}
     fields: original.fields,`;
 
     const restoreMethods = `
@@ -1936,11 +2282,31 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
     if (model.isSoftDeletable && model.deletedAtField !== null) {
       const lowerName = toLowerFirst(model.name);
       lines.push(`    ${lowerName}: {`);
-      lines.push(`      findMany: ((...args: any[]) => prisma.${lowerName}.findMany(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findMany'],`);
-      lines.push(`      findFirst: ((...args: any[]) => prisma.${lowerName}.findFirst(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirst'],`);
-      lines.push(`      findFirstOrThrow: ((...args: any[]) => prisma.${lowerName}.findFirstOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
-      lines.push(`      findUnique: ((...args: any[]) => prisma.${lowerName}.findUnique(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUnique'],`);
-      lines.push(`      findUniqueOrThrow: ((...args: any[]) => prisma.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
+      lines.push(`      findMany: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`        return postProcessRead(prisma.${lowerName}.findMany(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findMany'],`);
+      lines.push(`      findFirst: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`        return postProcessRead(prisma.${lowerName}.findFirst(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findFirst'],`);
+      lines.push(`      findFirstOrThrow: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`        return postProcessRead(prisma.${lowerName}.findFirstOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
+      lines.push(`      findUnique: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`        return postProcessRead(prisma.${lowerName}.findUnique(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findUnique'],`);
+      lines.push(`      findUniqueOrThrow: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`        return postProcessRead(prisma.${lowerName}.findUniqueOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       lines.push(`      count: ((...args: any[]) => prisma.${lowerName}.count(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['count'],`);
       lines.push(`      aggregate: ((...args: any[]) => prisma.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`      groupBy: ((...args: any[]) => prisma.${lowerName}.groupBy(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['groupBy'],`);
@@ -1967,62 +2333,108 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       const simple = isSimpleModel(model, options);
       const deletedAtField = model.deletedAtField;
       lines.push(`    ${lowerName}: {`);
-      // Read operations with filter injection
-      lines.push(`      findMany: ((...args: any[]) => tx.${lowerName}.findMany(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findMany'],`);
-      lines.push(`      findFirst: ((...args: any[]) => tx.${lowerName}.findFirst(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findFirst'],`);
-      lines.push(`      findFirstOrThrow: ((...args: any[]) => tx.${lowerName}.findFirstOrThrow(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
+      // Read operations with filter injection and to-one post-processing
+      lines.push(`      findMany: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+      lines.push(`        return postProcessRead(tx.${lowerName}.findMany(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findMany'],`);
+      lines.push(`      findFirst: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+      lines.push(`        return postProcessRead(tx.${lowerName}.findFirst(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findFirst'],`);
+      lines.push(`      findFirstOrThrow: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+      lines.push(`        return postProcessRead(tx.${lowerName}.findFirstOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
       if (options.uniqueStrategy === 'sentinel') {
         lines.push(`      findUnique: ((...args: any[]) => {`);
-        lines.push(`        const filtered = injectFilters(args[0], '${model.name}');`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
         lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
-        lines.push(`        return tx.${lowerName}.findUnique(filtered);`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.findUnique(filtered), '${model.name}', filtered, injectedPaths) as any;`);
         lines.push(`      }) as PrismaClient['${lowerName}']['findUnique'],`);
         lines.push(`      findUniqueOrThrow: ((...args: any[]) => {`);
-        lines.push(`        const filtered = injectFilters(args[0], '${model.name}');`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
         lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
-        lines.push(`        return tx.${lowerName}.findUniqueOrThrow(filtered);`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.findUniqueOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
         lines.push(`      }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       } else {
-        lines.push(`      findUnique: ((...args: any[]) => tx.${lowerName}.findUnique(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findUnique'],`);
-        lines.push(`      findUniqueOrThrow: ((...args: any[]) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
+        lines.push(`      findUnique: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.findUnique(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['findUnique'],`);
+        lines.push(`      findUniqueOrThrow: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.findUniqueOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       }
       lines.push(`      count: ((...args: any[]) => tx.${lowerName}.count(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['count'],`);
       lines.push(`      aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`      groupBy: ((...args: any[]) => tx.${lowerName}.groupBy(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['groupBy'],`);
-      // Write operations
+      // Write operations with to-one post-processing
       if (options.uniqueStrategy === 'sentinel') {
-        lines.push(`      create: ((args: any) => tx.${lowerName}.create({ ...args, data: { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } })) as PrismaClient['${lowerName}']['create'],`);
+        lines.push(`      create: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const withSentinel = { ...pp, data: { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.create(withSentinel), '${model.name}', withSentinel, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['create'],`);
         lines.push(`      createMany: ((args: any) => {`);
         lines.push(`        const data = Array.isArray(args.data)`);
         lines.push(`          ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
         lines.push(`          : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
         lines.push(`        return tx.${lowerName}.createMany({ ...args, data });`);
         lines.push(`      }) as PrismaClient['${lowerName}']['createMany'],`);
-        lines.push(`      createManyAndReturn: ((args: any) => {`);
-        lines.push(`        const data = Array.isArray(args.data)`);
-        lines.push(`          ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
-        lines.push(`          : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
-        lines.push(`        return tx.${lowerName}.createManyAndReturn({ ...args, data });`);
+        lines.push(`      createManyAndReturn: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const data = Array.isArray(pp?.data)`);
+        lines.push(`          ? pp.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+        lines.push(`          : { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.createManyAndReturn({ ...pp, data }), '${model.name}', pp, injectedPaths) as any;`);
         lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
       } else {
-        lines.push(`      create: ((args: any) => tx.${lowerName}.create(args)) as PrismaClient['${lowerName}']['create'],`);
+        lines.push(`      create: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.create(pp), '${model.name}', pp, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['create'],`);
         lines.push(`      createMany: ((args: any) => tx.${lowerName}.createMany(args)) as PrismaClient['${lowerName}']['createMany'],`);
-        lines.push(`      createManyAndReturn: ((args: any) => tx.${lowerName}.createManyAndReturn(args)) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
+        lines.push(`      createManyAndReturn: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.createManyAndReturn(pp), '${model.name}', pp, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
       }
-      lines.push(`      update: ((args: any) => tx.${lowerName}.update(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['update'],`);
+      lines.push(`      update: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+      lines.push(`        return postProcessRead(tx.${lowerName}.update(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['update'],`);
       lines.push(`      updateMany: ((args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateMany'],`);
-      lines.push(`      updateManyAndReturn: ((args: any) => tx.${lowerName}.updateManyAndReturn(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
+      lines.push(`      updateManyAndReturn: ((...args: any[]) => {`);
+      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+      lines.push(`        return postProcessRead(tx.${lowerName}.updateManyAndReturn(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`      }) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
       if (options.uniqueStrategy === 'sentinel') {
-        lines.push(`      upsert: ((args: any) => {`);
+        lines.push(`      upsert: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
         lines.push(`        const filtered = injectFilters({`);
-        lines.push(`          ...args,`);
-        lines.push(`          create: { ...args.create, ['${deletedAtField}']: args.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
+        lines.push(`          ...pp,`);
+        lines.push(`          create: { ...pp?.create, ['${deletedAtField}']: pp?.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
         lines.push(`        }, '${model.name}');`);
         lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
-        lines.push(`        return tx.${lowerName}.upsert(filtered);`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
         lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
       } else {
-        lines.push(`      upsert: ((args: any) => tx.${lowerName}.upsert(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['upsert'],`);
+        lines.push(`      upsert: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
       }
       lines.push(`      fields: tx.${lowerName}.fields,`);
 
@@ -2133,11 +2545,31 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
     if (model.isSoftDeletable && model.deletedAtField !== null) {
       const lowerName = toLowerFirst(model.name);
       lines.push(`      ${lowerName}: {`);
-      lines.push(`        findMany: ((...args: any[]) => tx.${lowerName}.findMany(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findMany'],`);
-      lines.push(`        findFirst: ((...args: any[]) => tx.${lowerName}.findFirst(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirst'],`);
-      lines.push(`        findFirstOrThrow: ((...args: any[]) => tx.${lowerName}.findFirstOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
-      lines.push(`        findUnique: ((...args: any[]) => tx.${lowerName}.findUnique(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUnique'],`);
-      lines.push(`        findUniqueOrThrow: ((...args: any[]) => tx.${lowerName}.findUniqueOrThrow(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
+      lines.push(`        findMany: ((...args: any[]) => {`);
+      lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`          return postProcessRead(tx.${lowerName}.findMany(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        }) as PrismaClient['${lowerName}']['findMany'],`);
+      lines.push(`        findFirst: ((...args: any[]) => {`);
+      lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`          return postProcessRead(tx.${lowerName}.findFirst(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        }) as PrismaClient['${lowerName}']['findFirst'],`);
+      lines.push(`        findFirstOrThrow: ((...args: any[]) => {`);
+      lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`          return postProcessRead(tx.${lowerName}.findFirstOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        }) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
+      lines.push(`        findUnique: ((...args: any[]) => {`);
+      lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`          return postProcessRead(tx.${lowerName}.findUnique(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        }) as PrismaClient['${lowerName}']['findUnique'],`);
+      lines.push(`        findUniqueOrThrow: ((...args: any[]) => {`);
+      lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+      lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
+      lines.push(`          return postProcessRead(tx.${lowerName}.findUniqueOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       lines.push(`        count: ((...args: any[]) => tx.${lowerName}.count(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['count'],`);
       lines.push(`        aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`        groupBy: ((...args: any[]) => tx.${lowerName}.groupBy(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['groupBy'],`);
