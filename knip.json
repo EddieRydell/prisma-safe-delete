@@ -6,7 +6,8 @@
     "tests/e2e/generated/**",
     "tests/e2e-sentinel/generated/**",
     "tests/e2e-none/generated/**",
+    "tests/e2e-no-cascade/generated/**",
     "tests/**/prisma.config.ts"
   ],
-  "ignoreDependencies": ["dotenv", "@prisma/client"]
+  "ignoreDependencies": ["dotenv", "@prisma/client", "conventional-changelog-conventionalcommits"]
 }
