@@ -88,6 +88,7 @@ describe('E2E: Real database tests', () => {
     await prisma.productVariant.deleteMany();
     await prisma.product.deleteMany();
     await prisma.category.deleteMany();
+    await prisma.assetComment.deleteMany();
     await prisma.asset.deleteMany();
     await prisma.team.deleteMany();
     await prisma.project.deleteMany();
@@ -1399,6 +1400,52 @@ describe('E2E: Real database tests', () => {
 
       expect(user._count.posts).toBe(1);
     });
+
+    it('_count: true in include filters out deleted relations', async () => {
+      await prisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'test@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Active 1' },
+              { id: 'p2', title: 'Active 2' },
+              { id: 'p3', title: 'Deleted', deleted_at: new Date() },
+            ],
+          },
+        },
+      });
+
+      const user = await safePrisma.user.findUnique({
+        where: { id: 'u1' },
+        include: { _count: true },
+      });
+
+      // _count: true should expand to count all list relations with soft-delete filters
+      expect(user._count.posts).toBe(2);
+    });
+
+    it('_count: true in select filters out deleted relations', async () => {
+      await prisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'test@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Active' },
+              { id: 'p2', title: 'Deleted', deleted_at: new Date() },
+            ],
+          },
+        },
+      });
+
+      const user = await safePrisma.user.findUnique({
+        where: { id: 'u1' },
+        select: { email: true, _count: true },
+      });
+
+      expect(user._count.posts).toBe(1);
+    });
   });
 
   describe('Relation filters (some/every/none)', () => {
@@ -2034,6 +2081,33 @@ describe('E2E: Real database tests', () => {
       expect(afterSecond.email).toBe(mangledEmail); // No double-mangling
     });
 
+    it('mangles field whose value naturally ends with the suffix pattern', async () => {
+      // This tests that a field value like "user__deleted_cust-1" (which ends with
+      // the suffix that would be appended) still gets mangled correctly.
+      // The old code had an endsWith(suffix) idempotency check that would skip
+      // such values, causing data corruption.
+      await prisma.customer.create({
+        data: {
+          id: 'cust-1',
+          email: 'tricky__deleted_cust-1',
+          username: 'normal',
+        },
+      });
+
+      await safePrisma.customer.softDelete({ where: { id: 'cust-1' }, deletedBy: 'test' });
+
+      const raw = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
+      // Should be double-suffixed: the original value + the mangle suffix
+      expect(raw.email).toBe('tricky__deleted_cust-1__deleted_cust-1');
+      expect(raw.username).toBe('normal__deleted_cust-1');
+
+      // Restore and verify original values come back
+      await safePrisma.customer.restore({ where: { id: 'cust-1' } });
+      const restored = await prisma.customer.findUnique({ where: { id: 'cust-1' } });
+      expect(restored.email).toBe('tricky__deleted_cust-1');
+      expect(restored.username).toBe('normal');
+    });
+
     it('handles compound unique constraints', async () => {
       await prisma.workspace.create({
         data: {
@@ -2594,6 +2668,56 @@ describe('E2E: Real database tests', () => {
         // Verify all restored
         const categories = await safePrisma.category.findMany();
         expect(categories).toHaveLength(3);
+      });
+    });
+
+    describe('Cascade restore through non-soft-deletable intermediary', () => {
+      it('restoreCascade traverses through non-soft-deletable model to restore grandchildren', async () => {
+        // Organization(soft) -> Asset(non-soft) -> AssetComment(soft)
+        await prisma.organization.create({
+          data: {
+            id: 'org1',
+            name: 'Test Org',
+            assets: {
+              create: {
+                id: 'asset1',
+                url: 'https://example.com/file.png',
+                comments: {
+                  create: { id: 'ac1', content: 'Nice asset' },
+                },
+              },
+            },
+          },
+        });
+
+        // Soft delete organization — AssetComment should cascade-delete, Asset stays as-is
+        await safePrisma.organization.softDelete({ where: { id: 'org1' } });
+
+        // Verify organization is soft-deleted
+        const org = await prisma.organization.findUnique({ where: { id: 'org1' } });
+        expect(org.deleted_at).not.toBeNull();
+
+        // Verify AssetComment is soft-deleted (cascaded through non-soft-deletable Asset)
+        const comment = await prisma.assetComment.findUnique({ where: { id: 'ac1' } });
+        expect(comment.deleted_at).not.toBeNull();
+
+        // Asset still exists (not soft-deletable, no deleted_at)
+        const asset = await prisma.asset.findUnique({ where: { id: 'asset1' } });
+        expect(asset).not.toBeNull();
+
+        // Restore organization with cascade
+        const { cascaded } = await safePrisma.organization.restoreCascade({ where: { id: 'org1' } });
+
+        // Verify organization is restored
+        const restoredOrg = await prisma.organization.findUnique({ where: { id: 'org1' } });
+        expect(restoredOrg.deleted_at).toBeNull();
+
+        // Verify AssetComment is restored (traversed through non-soft-deletable Asset)
+        const restoredComment = await prisma.assetComment.findUnique({ where: { id: 'ac1' } });
+        expect(restoredComment.deleted_at).toBeNull();
+
+        // Verify cascade info includes assetComment
+        expect(cascaded.AssetComment).toBe(1);
       });
     });
 

@@ -329,6 +329,20 @@ function isListRelation(parentModel: string, fieldName: string): boolean {
 }
 
 /**
+ * Gets all list (to-many) relation field names for a model
+ */
+function getListRelationsForModel(modelName: string): string[] {
+  const prefix = modelName + '.';
+  const relations: string[] = [];
+  for (const key of Object.keys(RELATION_IS_LIST)) {
+    if (key.startsWith(prefix) && RELATION_IS_LIST[key]) {
+      relations.push(key.slice(prefix.length));
+    }
+  }
+  return relations;
+}
+
+/**
  * Decomposes a compound key where clause into individual fields.
  * Converts { tenantId_userId: { tenantId: 'x', userId: 'y' } } into { tenantId: 'x', userId: 'y' }
  */
@@ -412,11 +426,6 @@ function mangleUniqueFields(
     }
 
     const strValue = String(currentValue);
-
-    // Skip if already mangled (idempotent)
-    if (strValue.endsWith(suffix)) {
-      continue;
-    }
 
     const mangledValue = strValue + suffix;
 
@@ -716,8 +725,23 @@ function injectIntoRelations(
     // Handle _count specially
     if (key === '_count') {
       if (value === true) {
-        // Simple _count: true - pass through
-        result[key] = value;
+        // Expand _count: true to _count: { select: { ...allListRelations } } with filters
+        const listRelations = getListRelationsForModel(parentModel);
+        const countSelect: Record<string, unknown> = {};
+        for (const relName of listRelations) {
+          const relationModel = getRelationModel(parentModel, relName);
+          if (relationModel) {
+            const deletedAtField = getDeletedAtField(relationModel);
+            if (deletedAtField && mode !== 'include-deleted') {
+              countSelect[relName] = { where: getModeFilter(mode, deletedAtField) };
+            } else {
+              countSelect[relName] = true;
+            }
+          } else {
+            countSelect[relName] = true;
+          }
+        }
+        result[key] = { select: countSelect };
       } else if (value && typeof value === 'object') {
         const countObj = value as Record<string, unknown>;
         if (countObj.select && typeof countObj.select === 'object') {
@@ -1141,11 +1165,23 @@ async function restoreRecordWithDelegate(
     updateData[deletedByField] = null;
   }
 
-  return delegate.update({
-    where: createPkWhereFromValues(modelName, pkVal),
-    data: updateData,
-    ...projection,
-  });
+  try {
+    return await delegate.update({
+      where: createPkWhereFromValues(modelName, pkVal),
+      data: updateData,
+      ...projection,
+    });
+  } catch (e: unknown) {
+    if (e && typeof e === 'object' && 'code' in e && (e as Record<string, unknown>).code === 'P2002') {
+      const meta = (e as Record<string, unknown>).meta as Record<string, unknown> | undefined;
+      const fields = meta?.target ? String(meta.target) : 'unknown';
+      throw new Error(
+        \`Cannot restore \${modelName}: unique constraint violation on (\${fields}). \` +
+        \`An active record with the same unique value was created concurrently.\`
+      );
+    }
+    throw e;
+  }
 }
 
 /**
@@ -1238,10 +1274,22 @@ async function restoreManyWithDelegate(
         updateData[deletedByField] = null;
       }
 
-      await delegate.update({
-        where: createPkWhereFromValues(modelName, pkVal),
-        data: updateData,
-      });
+      try {
+        await delegate.update({
+          where: createPkWhereFromValues(modelName, pkVal),
+          data: updateData,
+        });
+      } catch (e: unknown) {
+        if (e && typeof e === 'object' && 'code' in e && (e as Record<string, unknown>).code === 'P2002') {
+          const meta = (e as Record<string, unknown>).meta as Record<string, unknown> | undefined;
+          const fields = meta?.target ? String(meta.target) : 'unknown';
+          throw new Error(
+            \`Cannot restore \${modelName}: unique constraint violation on (\${fields}). \` +
+            \`An active record with the same unique value was created concurrently.\`
+          );
+        }
+        throw e;
+      }
 
       restoredCount++;
     }
@@ -1353,11 +1401,24 @@ async function restoreWithCascadeInTx(
     updateData[deletedByField] = null;
   }
 
-  const restoredRecord = await delegate.update({
-    where: createPkWhereFromValues(modelName, pkVal),
-    data: updateData,
-    ...projection,
-  });
+  let restoredRecord;
+  try {
+    restoredRecord = await delegate.update({
+      where: createPkWhereFromValues(modelName, pkVal),
+      data: updateData,
+      ...projection,
+    });
+  } catch (e: unknown) {
+    if (e && typeof e === 'object' && 'code' in e && (e as Record<string, unknown>).code === 'P2002') {
+      const meta = (e as Record<string, unknown>).meta as Record<string, unknown> | undefined;
+      const fields = meta?.target ? String(meta.target) : 'unknown';
+      throw new Error(
+        \`Cannot restore \${modelName}: unique constraint violation on (\${fields}). \` +
+        \`An active record with the same unique value was created concurrently.\`
+      );
+    }
+    throw e;
+  }
 
   return { record: restoredRecord, cascaded };
 }
@@ -1376,8 +1437,6 @@ async function restoreCascadeChildren(
   const cascaded: Record<string, number> = {};
 
   for (const child of children) {
-    if (!child.isSoftDeletable || !child.deletedAtField) continue;
-
     const lowerChildModel = child.model.charAt(0).toLowerCase() + child.model.slice(1);
     const childDelegate = tx[lowerChildModel as keyof typeof tx] as any;
 
@@ -1396,11 +1455,11 @@ async function restoreCascadeChildren(
       return condition;
     });
 
-    // Find children with matching deleted_at timestamp
+    // Find children — filter by deletedAt only for soft-deletable children
     const childRecords = await childDelegate.findMany({
       where: {
         OR: childWhereConditions,
-        [child.deletedAtField]: deletedAt, // Must match exact timestamp
+        ...(child.isSoftDeletable && child.deletedAtField ? { [child.deletedAtField]: deletedAt } : {}),
       },
     });
 
@@ -1411,7 +1470,7 @@ async function restoreCascadeChildren(
       extractPrimaryKey(child.model, r)
     );
 
-    // Recurse to grandchildren first
+    // Recurse to grandchildren first (for ALL children, including non-soft-deletable)
     const grandchildCascaded = await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt);
 
     // Merge grandchild results
@@ -1419,67 +1478,81 @@ async function restoreCascadeChildren(
       cascaded[model] = (cascaded[model] ?? 0) + count;
     }
 
-    // Now restore the children
-    const childNeedsUnmangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
+    // Only restore soft-deletable children
+    if (child.isSoftDeletable && child.deletedAtField) {
+      const childNeedsUnmangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
 
-    if (childNeedsUnmangling) {
-      // Per-record restore: unmangle unique fields individually
-      for (const childRecord of childRecords) {
-        const childPkVal = extractPrimaryKey(child.model, childRecord);
-        const unmangledFields = unmangleUniqueFields(child.model, childRecord);
+      if (childNeedsUnmangling) {
+        // Per-record restore: unmangle unique fields individually
+        for (const childRecord of childRecords) {
+          const childPkVal = extractPrimaryKey(child.model, childRecord);
+          const unmangledFields = unmangleUniqueFields(child.model, childRecord);
 
-        // Check for conflicts
-        if (Object.keys(unmangledFields).length > 0) {
-          for (const [field, value] of Object.entries(unmangledFields)) {
-            const existing = await childDelegate.findFirst({
-              where: {
-                [field]: value,
-                [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-              },
-            });
+          // Check for conflicts
+          if (Object.keys(unmangledFields).length > 0) {
+            for (const [field, value] of Object.entries(unmangledFields)) {
+              const existing = await childDelegate.findFirst({
+                where: {
+                  [field]: value,
+                  [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+                },
+              });
 
-            if (existing) {
-              throw new Error(
-                \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
-                \`already exists in an active record.\`
-              );
+              if (existing) {
+                throw new Error(
+                  \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
+                  \`already exists in an active record.\`
+                );
+              }
             }
           }
-        }
 
-        const updateData: Record<string, unknown> = {
-          ...unmangledFields,
+          const updateData: Record<string, unknown> = {
+            ...unmangledFields,
+            [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+          };
+
+          if (child.deletedByField) {
+            updateData[child.deletedByField] = null;
+          }
+
+          try {
+            await childDelegate.update({
+              where: createPkWhereFromValues(child.model, childPkVal),
+              data: updateData,
+            });
+          } catch (e: unknown) {
+            if (e && typeof e === 'object' && 'code' in e && (e as Record<string, unknown>).code === 'P2002') {
+              const meta = (e as Record<string, unknown>).meta as Record<string, unknown> | undefined;
+              const fields = meta?.target ? String(meta.target) : 'unknown';
+              throw new Error(
+                \`Cannot restore \${child.model}: unique constraint violation on (\${fields}). \` +
+                \`An active record with the same unique value was created concurrently.\`
+              );
+            }
+            throw e;
+          }
+        }
+      } else {
+        // Bulk restore: no unmangling needed
+        const bulkUpdateData: Record<string, unknown> = {
           [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
         };
 
         if (child.deletedByField) {
-          updateData[child.deletedByField] = null;
+          bulkUpdateData[child.deletedByField] = null;
         }
 
-        await childDelegate.update({
-          where: createPkWhereFromValues(child.model, childPkVal),
-          data: updateData,
+        const childPkConditions = childPkValues;
+        await childDelegate.updateMany({
+          where: { OR: childPkConditions, [child.deletedAtField]: deletedAt },
+          data: bulkUpdateData,
         });
       }
-    } else {
-      // Bulk restore: no unmangling needed
-      const bulkUpdateData: Record<string, unknown> = {
-        [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-      };
 
-      if (child.deletedByField) {
-        bulkUpdateData[child.deletedByField] = null;
-      }
-
-      const childPkConditions = childPkValues;
-      await childDelegate.updateMany({
-        where: { OR: childPkConditions, [child.deletedAtField]: deletedAt },
-        data: bulkUpdateData,
-      });
+      // Track the count for this child model
+      cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
     }
-
-    // Track the count for this child model
-    cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
   }
 
   return cascaded;
