@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cascade = "false"` generator option to disable cascade graph building; all models use the fast path and return `cascaded: {}` (#52)
+- Generator warning for required to-one relations pointing to soft-deletable models (runtime nullification may return `null` despite the Prisma type)
+
+### Changed
+- **Breaking**: `softDelete` now throws `PrismaClientKnownRequestError` with code `P2025` when the target record doesn't exist or is already deleted, matching Prisma's native `delete` behavior (#49)
+- **Breaking**: `softDelete` return type's `record` field is now non-nullable (`T` instead of `T | null`)
+
 ### Fixed
+- Soft-deleted records visible through to-one relation `include`/`select` — query results are now post-processed to nullify deleted to-one relations, with `deleted_at` injected into selects and stripped from results (#50)
+- To-one nullification also applies to write method returns (`create`, `update`, `upsert`, `createManyAndReturn`, `updateManyAndReturn`) (#50)
 - `_count: true` now correctly filters out soft-deleted records by expanding to per-relation count queries with `deleted_at` filters
 - `restoreCascade` now traverses through non-soft-deletable intermediary models to restore soft-deletable grandchildren (e.g., `Organization(soft) -> Asset(non-soft) -> AssetComment(soft)`)
 - `restore`, `restoreMany`, and `restoreCascade` now throw a clear error message on unique constraint violations (P2002) instead of exposing raw Prisma errors

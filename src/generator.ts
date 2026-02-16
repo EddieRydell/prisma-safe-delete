@@ -460,6 +460,68 @@ export function buildSentinelWarningLines(
 
 
 /**
+ * Info about a required to-one relation to a soft-deletable model.
+ */
+export interface ToOneRelationWarningInfo {
+  sourceModel: string;
+  relationField: string;
+  targetModel: string;
+  isRequired: boolean;
+}
+
+/**
+ * Builds warning lines for required to-one relations pointing to soft-deletable models.
+ * At runtime, these relations may return null when the target is soft-deleted,
+ * even though Prisma's types say they're non-nullable.
+ * Exported for testing.
+ */
+export function buildToOneRelationWarningLines(
+  schema: ParsedSchema,
+  useColors = true,
+): string[] {
+  const warnings: ToOneRelationWarningInfo[] = [];
+
+  for (const model of schema.models) {
+    for (const relation of model.relations) {
+      if (relation.isList) continue;
+      const target = schema.modelMap.get(relation.type);
+      if (target?.isSoftDeletable !== true) continue;
+      if (relation.isRequired) {
+        warnings.push({
+          sourceModel: model.name,
+          relationField: relation.name,
+          targetModel: relation.type,
+          isRequired: true,
+        });
+      }
+    }
+  }
+
+  if (warnings.length === 0) return [];
+
+  const y = useColors ? YELLOW : '';
+  const cn = useColors ? CYAN : '';
+  const r = useColors ? RESET : '';
+  const b = useColors ? BOLD : '';
+
+  const lines: string[] = [
+    '',
+    `${y}${b}ℹ️  prisma-safe-delete: Required to-one relations to soft-deletable models${r}`,
+    `${y}   At runtime, these relations will return null when the target is soft-deleted,${r}`,
+    `${y}   even though Prisma types say they are non-nullable. Consider making them optional.${r}`,
+    '',
+  ];
+
+  for (const w of warnings) {
+    lines.push(`${cn}     ${w.sourceModel}.${w.relationField} -> ${w.targetModel}${r}`);
+  }
+
+  lines.push('');
+
+  return lines;
+}
+
+/**
  * Computes the relative import path from our output directory to the Prisma client.
  * Returns a path like '../client/client.js' for ESM compatibility with NodeNext module resolution.
  */
@@ -510,6 +572,12 @@ generatorHandler({
       : rawStrategy === 'sentinel' ? 'sentinel'
       : 'mangle'; // Default to 'mangle'
 
+    const rawCascade = options.generator.config['cascade'] as string | undefined;
+    if (rawCascade !== undefined && rawCascade !== 'true' && rawCascade !== 'false') {
+      // eslint-disable-next-line no-console
+      console.warn(`prisma-safe-delete: Unknown cascade value "${rawCascade}". Expected "true" or "false". Defaulting to "true".`);
+    }
+    const cascade = rawCascade !== 'false';
     const strictUniqueChecks = options.generator.config['strictUniqueChecks'] === 'true';
     const deletedAtFieldName = options.generator.config['deletedAtField'] as string | undefined;
     const deletedByFieldName = options.generator.config['deletedByField'] as string | undefined;
@@ -555,8 +623,15 @@ generatorHandler({
       );
     }
 
-    // Build the cascade graph
-    const cascadeGraph = buildCascadeGraph(schema);
+    // Emit to-one relation warnings (info-level, not blocking)
+    const toOneWarnings = buildToOneRelationWarningLines(schema);
+    if (toOneWarnings.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log(toOneWarnings.join('\n'));
+    }
+
+    // Build the cascade graph (empty when cascade is disabled)
+    const cascadeGraph = cascade ? buildCascadeGraph(schema) : {};
 
     // Generate all output files
     const typesContent = emitTypes(schema, clientImportPath);

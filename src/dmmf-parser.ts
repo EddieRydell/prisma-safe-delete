@@ -24,6 +24,7 @@ export interface ParsedRelation {
   references: string[];
   onDelete: string | null;
   isList: boolean;
+  isRequired: boolean;
 }
 
 /**
@@ -188,6 +189,7 @@ function parseRelation(field: DMMFField): ParsedRelation | null {
     references: toFields !== undefined ? [...toFields] : [],
     onDelete: field.relationOnDelete ?? null,
     isList: field.isList,
+    isRequired: field.isRequired,
   };
 }
 

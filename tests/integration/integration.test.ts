@@ -276,10 +276,8 @@ async function test() {
   // Must be able to access .record and .cascaded
   const record = result.record;
   const cascaded: CascadeResult = result.cascaded;
-  // record is nullable (null when not found)
-  if (record) {
-    const email: string = record.email;
-  }
+  // record is non-nullable (throws P2025 when not found)
+  const email: string = record.email;
   const count: number = cascaded['Post'] ?? 0;
 }
 `);
@@ -934,5 +932,151 @@ model User {
     });
     // If we get here, prisma generate succeeded — correct
     expect(true).toBe(true);
+  }, 60000);
+});
+
+describe('Integration: cascade option', () => {
+  const tmpDirs: string[] = [];
+
+  afterAll(() => {
+    for (const dir of tmpDirs) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup errors (Windows file locks release after process exits)
+      }
+    }
+  });
+
+  it('cascade = "false" produces empty cascade graph and all models use fast path', () => {
+    const tmpDir = path.join(integrationDir, 'tmp-cascade-false');
+    tmpDirs.push(tmpDir);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const schemaContent = `
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider       = "node ${path.join(integrationDir, '..', '..', 'dist', 'bin.js').split(path.sep).join('/')}"
+  output         = "./generated/soft-cascade"
+  uniqueStrategy = "none"
+  cascade        = "false"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  posts      Post[]
+  deleted_at DateTime?
+}
+
+model Post {
+  id         String    @id @default(cuid())
+  title      String
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+}
+`;
+
+    fs.writeFileSync(path.join(tmpDir, 'schema.prisma'), schemaContent, 'utf-8');
+
+    execSync('npx prisma generate', {
+      cwd: tmpDir,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+    });
+
+    const cascadeGraphContent = fs.readFileSync(
+      path.join(tmpDir, 'generated', 'soft-cascade', 'cascade-graph.ts'),
+      'utf-8',
+    );
+    const runtimeContent = fs.readFileSync(
+      path.join(tmpDir, 'generated', 'soft-cascade', 'runtime.ts'),
+      'utf-8',
+    );
+
+    // Cascade graph should be empty (no entries)
+    expect(cascadeGraphContent).toContain('CASCADE_GRAPH');
+    expect(cascadeGraphContent).not.toContain('"User"');
+    expect(cascadeGraphContent).not.toContain('"Post"');
+
+    // User would normally have cascade children, but with cascade=false
+    // and uniqueStrategy=none, it should use fast path (updateMany, not softDeleteWithCascade)
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(runtimeContent);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).not.toContain('softDeleteWithCascade');
+    expect(userDelegate![0]).toContain('original.updateMany');
+  }, 60000);
+
+  it('cascade defaults to true (omitted option produces normal cascade graph)', () => {
+    const tmpDir = path.join(integrationDir, 'tmp-cascade-default');
+    tmpDirs.push(tmpDir);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const schemaContent = `
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+generator softCascade {
+  provider       = "node ${path.join(integrationDir, '..', '..', 'dist', 'bin.js').split(path.sep).join('/')}"
+  output         = "./generated/soft-cascade"
+  uniqueStrategy = "none"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id         String    @id @default(cuid())
+  email      String    @unique
+  posts      Post[]
+  deleted_at DateTime?
+}
+
+model Post {
+  id         String    @id @default(cuid())
+  title      String
+  authorId   String
+  author     User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  deleted_at DateTime?
+}
+`;
+
+    fs.writeFileSync(path.join(tmpDir, 'schema.prisma'), schemaContent, 'utf-8');
+
+    execSync('npx prisma generate', {
+      cwd: tmpDir,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+    });
+
+    const cascadeGraphContent = fs.readFileSync(
+      path.join(tmpDir, 'generated', 'soft-cascade', 'cascade-graph.ts'),
+      'utf-8',
+    );
+    const runtimeContent = fs.readFileSync(
+      path.join(tmpDir, 'generated', 'soft-cascade', 'runtime.ts'),
+      'utf-8',
+    );
+
+    // Cascade graph should contain User -> Post relationship
+    expect(cascadeGraphContent).toContain('"User"');
+    expect(cascadeGraphContent).toContain('"Post"');
+
+    // User should use complex path (softDeleteWithCascade) because it has children
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(runtimeContent);
+    expect(userDelegate).not.toBeNull();
+    expect(userDelegate![0]).toContain('softDeleteWithCascade');
   }, 60000);
 });
