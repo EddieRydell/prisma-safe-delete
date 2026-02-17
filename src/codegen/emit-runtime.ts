@@ -2226,7 +2226,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
     // to extract actorId and write audit events
     let auditedWriteMethods = '';
     if (model.isAuditable && hasAudit) {
-      auditedWriteMethods = emitAuditedWriteMethods(model, lowerName, options);
+      auditedWriteMethods = emitAuditedWriteMethods(model, options);
     }
 
     const wrapOptsParam = hasAudit ? 'wrapOptions?: WrapOptions' : '';
@@ -2499,7 +2499,7 @@ function emitNonAuditedSoftDeletablePassthrough(
  * Emits audited write methods for a soft-deletable + audited model (main delegate).
  * Uses shared _audited* helpers via emitAuditedMethodCallSite.
  */
-function emitAuditedWriteMethods(model: ParsedModel, _lowerName: string, options: EmitRuntimeOptions): string {
+function emitAuditedWriteMethods(model: ParsedModel, options: EmitRuntimeOptions): string {
   const lines: string[] = [];
   const context = {
     wrapInTransaction: true,
@@ -2705,65 +2705,65 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           emitAuditedMethodCallSite(lines, desc, model, options, txAuditContext);
         }
       } else {
-      // Non-audited: standard write operations with to-one post-processing
-      if (options.uniqueStrategy === 'sentinel') {
-        lines.push(`      create: ((...args: any[]) => {`);
-        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-        lines.push(`        const withSentinel = { ...pp, data: { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };`);
-        lines.push(`        return postProcessRead(tx.${lowerName}.create(withSentinel), '${model.name}', withSentinel, injectedPaths) as any;`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['create'],`);
-        lines.push(`      createMany: ((args: any) => {`);
-        lines.push(`        const data = Array.isArray(args.data)`);
-        lines.push(`          ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
-        lines.push(`          : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
-        lines.push(`        return tx.${lowerName}.createMany({ ...args, data });`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['createMany'],`);
-        lines.push(`      createManyAndReturn: ((...args: any[]) => {`);
-        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-        lines.push(`        const data = Array.isArray(pp?.data)`);
-        lines.push(`          ? pp.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
-        lines.push(`          : { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
-        lines.push(`        return postProcessRead(tx.${lowerName}.createManyAndReturn({ ...pp, data }), '${model.name}', pp, injectedPaths) as any;`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
-      } else {
-        lines.push(`      create: ((...args: any[]) => {`);
-        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-        lines.push(`        return postProcessRead(tx.${lowerName}.create(pp), '${model.name}', pp, injectedPaths) as any;`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['create'],`);
-        lines.push(`      createMany: ((args: any) => tx.${lowerName}.createMany(args)) as PrismaClient['${lowerName}']['createMany'],`);
-        lines.push(`      createManyAndReturn: ((...args: any[]) => {`);
-        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-        lines.push(`        return postProcessRead(tx.${lowerName}.createManyAndReturn(pp), '${model.name}', pp, injectedPaths) as any;`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
-      }
-      lines.push(`      update: ((...args: any[]) => {`);
-      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
-      lines.push(`        return postProcessRead(tx.${lowerName}.update(filtered), '${model.name}', filtered, injectedPaths) as any;`);
-      lines.push(`      }) as PrismaClient['${lowerName}']['update'],`);
-      lines.push(`      updateMany: ((args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateMany'],`);
-      lines.push(`      updateManyAndReturn: ((...args: any[]) => {`);
-      lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-      lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
-      lines.push(`        return postProcessRead(tx.${lowerName}.updateManyAndReturn(filtered), '${model.name}', filtered, injectedPaths) as any;`);
-      lines.push(`      }) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
-      if (options.uniqueStrategy === 'sentinel') {
-        lines.push(`      upsert: ((...args: any[]) => {`);
-        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
-        lines.push(`        const filtered = injectFilters({`);
-        lines.push(`          ...pp,`);
-        lines.push(`          create: { ...pp?.create, ['${deletedAtField}']: pp?.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
-        lines.push(`        }, '${model.name}');`);
-        lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
-        lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
-      } else {
-        lines.push(`      upsert: ((...args: any[]) => {`);
+        // Non-audited: standard write operations with to-one post-processing
+        if (options.uniqueStrategy === 'sentinel') {
+          lines.push(`      create: ((...args: any[]) => {`);
+          lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+          lines.push(`        const withSentinel = { ...pp, data: { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };`);
+          lines.push(`        return postProcessRead(tx.${lowerName}.create(withSentinel), '${model.name}', withSentinel, injectedPaths) as any;`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['create'],`);
+          lines.push(`      createMany: ((args: any) => {`);
+          lines.push(`        const data = Array.isArray(args.data)`);
+          lines.push(`          ? args.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+          lines.push(`          : { ...args.data, ['${deletedAtField}']: args.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+          lines.push(`        return tx.${lowerName}.createMany({ ...args, data });`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['createMany'],`);
+          lines.push(`      createManyAndReturn: ((...args: any[]) => {`);
+          lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+          lines.push(`        const data = Array.isArray(pp?.data)`);
+          lines.push(`          ? pp.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+          lines.push(`          : { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+          lines.push(`        return postProcessRead(tx.${lowerName}.createManyAndReturn({ ...pp, data }), '${model.name}', pp, injectedPaths) as any;`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
+        } else {
+          lines.push(`      create: ((...args: any[]) => {`);
+          lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+          lines.push(`        return postProcessRead(tx.${lowerName}.create(pp), '${model.name}', pp, injectedPaths) as any;`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['create'],`);
+          lines.push(`      createMany: ((args: any) => tx.${lowerName}.createMany(args)) as PrismaClient['${lowerName}']['createMany'],`);
+          lines.push(`      createManyAndReturn: ((...args: any[]) => {`);
+          lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+          lines.push(`        return postProcessRead(tx.${lowerName}.createManyAndReturn(pp), '${model.name}', pp, injectedPaths) as any;`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['createManyAndReturn'],`);
+        }
+        lines.push(`      update: ((...args: any[]) => {`);
         lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
         lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
-        lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
-        lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
-      }
+        lines.push(`        return postProcessRead(tx.${lowerName}.update(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['update'],`);
+        lines.push(`      updateMany: ((args: any) => tx.${lowerName}.updateMany(injectFilters(args, '${model.name}'))) as PrismaClient['${lowerName}']['updateMany'],`);
+        lines.push(`      updateManyAndReturn: ((...args: any[]) => {`);
+        lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+        lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+        lines.push(`        return postProcessRead(tx.${lowerName}.updateManyAndReturn(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+        lines.push(`      }) as PrismaClient['${lowerName}']['updateManyAndReturn'],`);
+        if (options.uniqueStrategy === 'sentinel') {
+          lines.push(`      upsert: ((...args: any[]) => {`);
+          lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+          lines.push(`        const filtered = injectFilters({`);
+          lines.push(`          ...pp,`);
+          lines.push(`          create: { ...pp?.create, ['${deletedAtField}']: pp?.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
+          lines.push(`        }, '${model.name}');`);
+          lines.push(`        if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${model.name}');`);
+          lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
+        } else {
+          lines.push(`      upsert: ((...args: any[]) => {`);
+          lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
+          lines.push(`        const filtered = injectFilters(pp, '${model.name}');`);
+          lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+          lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
+        }
       }
       lines.push(`      fields: tx.${lowerName}.fields,`);
 
@@ -2976,7 +2976,7 @@ function emitWrapperFunction(schema: ParsedSchema, hasAudit: boolean): string {
     if (hasAudit && (model.isSoftDeletable || model.isAuditable)) {
       lines.push(`    ${lowerName}: create${model.name}Delegate(prisma, wrapOptions),`);
     } else {
-      lines.push(`    ${lowerName}: create${model.name}Delegate(prisma${hasAudit ? ', wrapOptions' : ''}),`);
+      lines.push(`    ${lowerName}: create${model.name}Delegate(prisma),`);
     }
   }
 

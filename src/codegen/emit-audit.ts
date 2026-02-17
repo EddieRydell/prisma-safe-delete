@@ -149,9 +149,9 @@ async function _auditedCreateMany(
 ): Promise<{ count: number }> {
   const records = await delegate.createManyAndReturn(args);
   const ctx = await wrapOptions?.auditContext?.();
-  for (const record of records) {
-    await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'create', actorId, record, undefined, ctx);
-  }
+  await Promise.all(records.map((record: any) =>
+    writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'create', actorId, record, undefined, ctx),
+  ));
   return { count: records.length };
 }
 
@@ -168,9 +168,9 @@ async function _auditedCreateManyAndReturn(
 ): Promise<any[]> {
   const records = await delegate.createManyAndReturn(args);
   const ctx = await wrapOptions?.auditContext?.();
-  for (const record of records) {
-    await writeAuditEvent(tx, modelName, getEntityId(modelName, record as any), 'create', actorId, record, undefined, ctx);
-  }
+  await Promise.all(records.map((record: any) =>
+    writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'create', actorId, record, undefined, ctx),
+  ));
   return records;
 }
 
@@ -211,13 +211,13 @@ async function _auditedUpdateMany(
       where: { OR: pks.map((pk: any) => createPkWhereFromValues(modelName, pk)) },
     });
     const ctx = await wrapOptions?.auditContext?.();
-    for (const before of beforeRecords) {
+    await Promise.all(beforeRecords.map((before: any) => {
       const pk = extractPrimaryKey(modelName, before);
       const after = afterRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
       if (after) {
-        await writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
+        return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
       }
-    }
+    }));
   }
   return result;
 }
@@ -236,13 +236,13 @@ async function _auditedUpdateManyAndReturn(
   const beforeRecords = await delegate.findMany({ where: args.where });
   const results = await delegate.updateManyAndReturn(args);
   const ctx = await wrapOptions?.auditContext?.();
-  for (const after of results) {
-    const pk = extractPrimaryKey(modelName, after as any);
+  await Promise.all(results.map((after: any) => {
+    const pk = extractPrimaryKey(modelName, after);
     const before = beforeRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
     if (before) {
-      await writeAuditEvent(tx, modelName, getEntityId(modelName, after as any), 'update', actorId, { before, after }, undefined, ctx);
+      return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
     }
-  }
+  }));
   return results;
 }
 
@@ -299,9 +299,9 @@ async function _auditedDeleteMany(
   const records = await delegate.findMany({ where: args?.where });
   const result = await delegate.deleteMany(args);
   const ctx = await wrapOptions?.auditContext?.();
-  for (const record of records) {
-    await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx);
-  }
+  await Promise.all(records.map((record: any) =>
+    writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx),
+  ));
   return result;
 }`.trim();
 }

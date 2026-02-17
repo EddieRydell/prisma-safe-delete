@@ -460,7 +460,7 @@ model AuditEvent {
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `parent_event_id` | `String?` | Links child audit events to a parent (for cascade operations) |
+| `parent_event_id` | `String?` | Reserved for future use — linking child audit events to a parent (e.g., cascade operations). Currently not populated by the library. |
 
 You can add additional fields to the audit table (e.g., `ip_address`, `user_agent`). Extra fields are populated via `auditContext` (see below).
 
@@ -538,7 +538,12 @@ The `event_data` field captures different snapshots depending on the action:
 | `upsert` (created) | The full created record |
 | `upsert` (updated) | `{ before: <existing record>, after: <updated record> }` |
 
-For batch operations (`createMany`, `updateMany`, `deleteMany`), one audit event is written per affected record.
+For batch operations (`createMany`, `updateMany`, `deleteMany`), one audit event is written per affected record. Audit events for batch operations are written in parallel within the same transaction.
+
+**Limitations:**
+- `event_data` only contains scalar fields — relation data is not included in before/after snapshots. If you need relation data in audit events, query relations separately in your application code.
+- `createMany` is internally implemented using `createManyAndReturn` to capture record data for auditing. This means audited `createMany` requires database support for `RETURNING` (PostgreSQL, SQLite 3.35+). If your database does not support this, audited `createMany` will fail at runtime.
+- For large batch operations, audit event writes run in parallel but are still bounded by the transaction timeout. Consider batching very large operations.
 
 ### Audit + Soft Delete
 
@@ -555,7 +560,7 @@ model Project {
 ```
 
 When a model is both:
-- `softDelete` uses `actorId` instead of `deletedBy` for the identity parameter
+- `softDelete` uses `actorId` instead of `deletedBy` for the identity parameter. The `actorId` value is written to the `deleted_by` column (if present) and also recorded in the audit event.
 - All write methods (create, update, upsert, etc.) are wrapped with audit logging
 - Soft-delete filtering still applies to all reads and updates
 
