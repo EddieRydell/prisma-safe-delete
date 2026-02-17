@@ -97,6 +97,9 @@ describe('E2E: Real database tests', () => {
     await prisma.order.deleteMany();
     await prisma.customer.deleteMany();
     await prisma.workspace.deleteMany();
+    // Audit models
+    await prisma.auditEvent.deleteMany();
+    await prisma.webhook.deleteMany();
   });
 
   describe('Filter injection', () => {
@@ -4824,6 +4827,317 @@ describe('E2E: Real database tests', () => {
         include: { author: { select: { name: true } } },
       });
       expect(post.author).toBeNull();
+    });
+  });
+
+  describe('Audit logging', () => {
+    // Create a safePrisma with audit context for these tests
+    let auditSafePrisma: any;
+    beforeAll(() => {
+      auditSafePrisma = wrapPrismaClient(prisma, {
+        auditContext: () => ({ source: 'e2e-test' }),
+      });
+    });
+
+    it('writes audit event on create for audit-only model', async () => {
+      const webhook = await auditSafePrisma.webhook.create({
+        data: { url: 'https://example.com/hook' },
+        actorId: 'actor-1',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Webhook', entity_id: webhook.id },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('create');
+      expect(events[0].actor_id).toBe('actor-1');
+      expect(events[0].source).toBe('e2e-test');
+    });
+
+    it('writes audit event on delete for audit-only model', async () => {
+      await prisma.webhook.create({
+        data: { id: 'wh-del', url: 'https://example.com/del' },
+      });
+
+      await auditSafePrisma.webhook.delete({
+        where: { id: 'wh-del' },
+        actorId: 'actor-del',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Webhook', entity_id: 'wh-del', action: 'delete' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('actor-del');
+    });
+
+    it('does not audit non-configured actions on audit-only model', async () => {
+      // Webhook is @audit(create, delete) — update is NOT audited
+      await prisma.webhook.create({
+        data: { id: 'wh-up', url: 'https://example.com/up' },
+      });
+
+      // This should NOT create an audit event (update not in Webhook's audit actions)
+      // Webhook is not soft-deletable, so update goes through normally
+      // But Webhook.update still strips actorId
+      await auditSafePrisma.webhook.update({
+        where: { id: 'wh-up' },
+        data: { url: 'https://example.com/updated' },
+        actorId: 'actor-up',
+      });
+
+      const updateEvents = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Webhook', action: 'update' },
+      });
+      expect(updateEvents).toHaveLength(0);
+    });
+
+    it('writes audit event on softDelete for audited soft-deletable model', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-audit', name: 'Audit Org' },
+      });
+      const project = await prisma.project.create({
+        data: { id: 'proj-sd', name: 'Audit Project', organizationId: org.id },
+      });
+
+      await auditSafePrisma.project.softDelete({
+        where: { id: 'proj-sd' },
+        actorId: 'actor-sd',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: project.id, action: 'soft_delete' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('actor-sd');
+    });
+
+    it('writes audit event on softDeleteMany for audited soft-deletable model', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-sdm', name: 'SDM Org' },
+      });
+      await prisma.project.createMany({
+        data: [
+          { id: 'proj-sdm1', name: 'P1', organizationId: org.id },
+          { id: 'proj-sdm2', name: 'P2', organizationId: org.id },
+        ],
+      });
+
+      await auditSafePrisma.project.softDeleteMany({
+        where: { organizationId: org.id },
+        actorId: 'actor-sdm',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', action: 'soft_delete' },
+        orderBy: { entity_id: 'asc' },
+      });
+      expect(events).toHaveLength(2);
+      expect(events[0].actor_id).toBe('actor-sdm');
+      expect(events[1].actor_id).toBe('actor-sdm');
+    });
+
+    it('writes audit event on __dangerousHardDelete for audited soft-deletable model', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-hd', name: 'HD Org' },
+      });
+      const project = await prisma.project.create({
+        data: { id: 'proj-hd', name: 'HD Project', organizationId: org.id },
+      });
+
+      await auditSafePrisma.project.__dangerousHardDelete({
+        where: { id: 'proj-hd' },
+        actorId: 'actor-hd',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: project.id, action: 'hard_delete' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('actor-hd');
+    });
+
+    it('writes audit event on __dangerousHardDeleteMany for audited soft-deletable model', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-hdm', name: 'HDM Org' },
+      });
+      await prisma.project.createMany({
+        data: [
+          { id: 'proj-hdm1', name: 'HP1', organizationId: org.id },
+          { id: 'proj-hdm2', name: 'HP2', organizationId: org.id },
+        ],
+      });
+
+      await auditSafePrisma.project.__dangerousHardDeleteMany({
+        where: { organizationId: org.id },
+        actorId: 'actor-hdm',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', action: 'hard_delete' },
+      });
+      expect(events).toHaveLength(2);
+      for (const event of events) {
+        expect(event.actor_id).toBe('actor-hdm');
+      }
+    });
+
+    it('actorId is recorded in audit event', async () => {
+      await auditSafePrisma.webhook.create({
+        data: { id: 'wh-actor', url: 'https://example.com/actor' },
+        actorId: 'specific-actor-id',
+      });
+
+      const event = await prisma.auditEvent.findFirst({
+        where: { entity_id: 'wh-actor' },
+      });
+      expect(event).not.toBeNull();
+      expect(event.actor_id).toBe('specific-actor-id');
+    });
+
+    it('auditContext enriches events', async () => {
+      await auditSafePrisma.webhook.create({
+        data: { id: 'wh-ctx', url: 'https://example.com/ctx' },
+        actorId: 'actor-ctx',
+      });
+
+      const event = await prisma.auditEvent.findFirst({
+        where: { entity_id: 'wh-ctx' },
+      });
+      expect(event).not.toBeNull();
+      expect(event.source).toBe('e2e-test');
+    });
+
+    it('writes audit event on create for audited soft-deletable model', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-ac', name: 'AC Org' },
+      });
+
+      const project = await auditSafePrisma.project.create({
+        data: { id: 'proj-ac', name: 'Created Project', organizationId: org.id },
+        actorId: 'actor-create',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: project.id, action: 'create' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('actor-create');
+    });
+
+    it('writes audit event on update with before/after', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-au', name: 'AU Org' },
+      });
+      await prisma.project.create({
+        data: { id: 'proj-au', name: 'Original', organizationId: org.id },
+      });
+
+      await auditSafePrisma.project.update({
+        where: { id: 'proj-au' },
+        data: { name: 'Updated' },
+        actorId: 'actor-update',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-au', action: 'update' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('actor-update');
+      const eventData = events[0].event_data as { before: { name: string }; after: { name: string } };
+      expect(eventData.before.name).toBe('Original');
+      expect(eventData.after.name).toBe('Updated');
+    });
+
+    it('audit events are written in same transaction as operation', async () => {
+      // Verify that audit events are atomic with the operation
+      const org = await prisma.organization.create({
+        data: { id: 'org-tx', name: 'TX Org' },
+      });
+
+      await auditSafePrisma.$transaction(async (tx: any) => {
+        await tx.project.create({
+          data: { id: 'proj-tx', name: 'TX Project', organizationId: org.id },
+          actorId: 'tx-actor',
+        });
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-tx', action: 'create' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('tx-actor');
+    });
+
+    it('writes audit event on restore', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-restore', name: 'Restore Org' },
+      });
+      await auditSafePrisma.project.create({
+        data: { id: 'proj-restore', name: 'Restore Project', organizationId: org.id },
+      });
+
+      // Soft delete then restore
+      await auditSafePrisma.project.softDelete({ where: { id: 'proj-restore' } });
+      await auditSafePrisma.project.restore({
+        where: { id: 'proj-restore' },
+        actorId: 'restore-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-restore', action: 'restore' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('restore-actor');
+    });
+
+    it('writes audit event on restoreCascade', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-rc', name: 'RC Org' },
+      });
+      await auditSafePrisma.project.create({
+        data: { id: 'proj-rc', name: 'RC Project', organizationId: org.id },
+      });
+
+      // Soft delete then restore cascade
+      await auditSafePrisma.project.softDelete({ where: { id: 'proj-rc' } });
+      await auditSafePrisma.project.restoreCascade({
+        where: { id: 'proj-rc' },
+        actorId: 'rc-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-rc', action: 'restore' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('rc-actor');
+    });
+  });
+
+  describe('softDelete return postProcessing', () => {
+    it('softDelete nullifies independently deleted to-one relations in returned record', async () => {
+      // Create a user and a post
+      await prisma.user.create({
+        data: { id: 'user-pp', email: 'postproc@test.com', name: 'Post Process User' },
+      });
+      await prisma.post.create({
+        data: { id: 'post-pp', title: 'PP Post', authorId: 'user-pp' },
+      });
+
+      // Soft delete the user directly via raw prisma (bypass cascade so Post stays active)
+      await prisma.user.update({
+        where: { id: 'user-pp' },
+        data: { deleted_at: new Date() },
+      });
+
+      // Now soft delete the post with include of author
+      const result = await safePrisma.post.softDelete({
+        where: { id: 'post-pp' },
+        include: { author: true },
+      });
+
+      // The author relation should be nullified because the user is soft-deleted
+      expect(result.record.author).toBeNull();
     });
   });
 });

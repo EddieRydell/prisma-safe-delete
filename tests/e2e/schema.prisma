@@ -151,12 +151,14 @@ model Team {
   deleted_at     DateTime?
 }
 
+/// @audit
 model Project {
   id             String       @id @default(cuid())
   name           String
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   deleted_at     DateTime?
+  deleted_by     String?
 }
 
 // Non-soft-deletable child in cascade path
@@ -208,4 +210,25 @@ model Workspace {
   deleted_at DateTime?
 
   @@unique([orgSlug, slug])
+}
+
+// Audit-only model (no soft-delete) for testing audit on non-soft-deletable models
+/// @audit(create, delete)
+model Webhook {
+  id   String @id @default(cuid())
+  url  String
+}
+
+// Audit event storage table
+/// @audit-table
+model AuditEvent {
+  id              String   @id @default(cuid())
+  entity_type     String
+  entity_id       String
+  action          String
+  actor_id        String?
+  event_data      Json
+  created_at      DateTime @default(now())
+  parent_event_id String?
+  source          String?
 }

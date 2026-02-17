@@ -238,6 +238,7 @@ Models are automatically detected as soft-deletable if they have a DateTime fiel
 - **Nested writes**: `connect`, `connectOrCreate`, and nested `create`/`delete` within `data` bypass soft-delete logic.
 - **Sequential transactions**: `$transaction([...])` with a promise array bypasses soft-delete filtering. Use the interactive form `$transaction(async (tx) => { ... })` instead.
 - **No database-level enforcement**: The wrapper operates at the application layer only. Developers can bypass soft-delete via `$prisma`, `__dangerousHardDelete`, raw SQL, or by using PrismaClient directly. For strict enforcement, add database triggers or row-level security policies.
+- **Audit event atomicity**: Audit events are written within the same database transaction as the operation they log. If the transaction fails, the audit event is also rolled back. For compliance-critical deployments where audit events must survive operation failures, consider adding an external audit sink (e.g., write-ahead log, event stream, or async replication).
 
 ## Limitations and Caveats
 

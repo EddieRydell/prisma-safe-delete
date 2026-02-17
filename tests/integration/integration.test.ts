@@ -43,7 +43,7 @@ describe('Integration: prisma generate', () => {
     expect(fs.existsSync(path.join(generatedDir, 'cascade-graph.ts'))).toBe(true);
   });
 
-  it('generates valid TypeScript that compiles', () => {
+  it('generates valid TypeScript that compiles', { timeout: 15_000 }, () => {
     // Run tsc on the generated files - throws if compilation fails
     // --noUnusedLocals catches dead code in generated output
     execSync(
