@@ -3,6 +3,7 @@ import {
   parseDMMF,
   getSoftDeletableModels,
   getHardDeleteOnlyModels,
+  getAuditableModels,
   type ParsedModel,
 } from '../src/dmmf-parser.js';
 import { createMockField, createMockModel, createMockDMMF } from './helpers/mock-dmmf.js';
@@ -609,5 +610,171 @@ describe('uniqueConstraints - compoundKeyName', () => {
     expect(parsedModel.uniqueConstraints).toEqual([
       { fields: ['email'], includesDeletedAt: false },
     ]);
+  });
+});
+
+describe('@audit annotations', () => {
+  // Helper to create a model with documentation (/// comments in Prisma schema)
+  function modelWithDoc(name: string, doc: string, extraFields: ReturnType<typeof createMockField>[] = []) {
+    return createMockModel({
+      name,
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        ...extraFields,
+      ],
+      documentation: doc,
+    } as Parameters<typeof createMockModel>[0]);
+  }
+
+  it('@audit sets isAuditable: true with all actions', () => {
+    const dmmf = createMockDMMF([modelWithDoc('User', '@audit')]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(true);
+    expect(model.auditActions).toEqual(['create', 'update', 'delete']);
+    expect(model.isAuditTable).toBe(false);
+  });
+
+  it('@audit(create, delete) sets specific actions', () => {
+    const dmmf = createMockDMMF([modelWithDoc('User', '@audit(create, delete)')]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(true);
+    expect(model.auditActions).toEqual(['create', 'delete']);
+  });
+
+  it('@audit(update) sets single action', () => {
+    const dmmf = createMockDMMF([modelWithDoc('User', '@audit(update)')]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(true);
+    expect(model.auditActions).toEqual(['update']);
+  });
+
+  it('no @audit annotation sets isAuditable: false', () => {
+    const dmmf = createMockDMMF([
+      createMockModel({
+        name: 'User',
+        fields: [createMockField({ name: 'id', type: 'String', isId: true })],
+      }),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(false);
+    expect(model.auditActions).toEqual([]);
+    expect(model.isAuditTable).toBe(false);
+  });
+
+  it('@audit-table marks model as audit table', () => {
+    const dmmf = createMockDMMF([modelWithDoc('AuditEvent', '@audit-table')]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditTable).toBe(true);
+    expect(model.isAuditable).toBe(false);
+    expect(model.isSoftDeletable).toBe(false);
+  });
+
+  it('@audit-table model is not soft-deletable even with deleted_at field', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('AuditEvent', '@audit-table', [
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ]),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditTable).toBe(true);
+    expect(model.isSoftDeletable).toBe(false);
+    expect(model.deletedAtField).toBeNull();
+  });
+
+  it('parseDMMF sets auditTable when @audit-table model exists', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit'),
+      modelWithDoc('AuditEvent', '@audit-table'),
+    ]);
+    const result = parseDMMF(dmmf);
+
+    expect(result.auditTable).not.toBeNull();
+    expect(result.auditTable?.name).toBe('AuditEvent');
+  });
+
+  it('parseDMMF sets auditTable to null when no @audit-table exists', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit'),
+    ]);
+    const result = parseDMMF(dmmf);
+
+    expect(result.auditTable).toBeNull();
+  });
+
+  it('@audit works alongside soft-delete fields', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit', [
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        createMockField({ name: 'deleted_by', type: 'String', isRequired: false }),
+      ]),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(true);
+    expect(model.isSoftDeletable).toBe(true);
+    expect(model.deletedAtField).toBe('deleted_at');
+    expect(model.deletedByField).toBe('deleted_by');
+  });
+
+  it('getAuditableModels filters correctly', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit'),
+      createMockModel({
+        name: 'Post',
+        fields: [createMockField({ name: 'id', type: 'String', isId: true })],
+      }),
+      modelWithDoc('AuditEvent', '@audit-table'),
+    ]);
+    const schema = parseDMMF(dmmf);
+    const auditable = getAuditableModels(schema);
+
+    expect(auditable).toHaveLength(1);
+    expect(auditable[0]?.name).toBe('User');
+  });
+
+  it('@audit with multiline documentation', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', 'User model for the app\n@audit\nSome other docs'),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(true);
+    expect(model.auditActions).toEqual(['create', 'update', 'delete']);
+  });
+
+  it('ignores invalid actions in @audit()', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit(create, invalid, delete)'),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(true);
+    expect(model.auditActions).toEqual(['create', 'delete']);
+  });
+
+  it('@audit() with only invalid actions is not auditable', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit(invalid)'),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.isAuditable).toBe(false);
+    expect(model.auditActions).toEqual([]);
   });
 });

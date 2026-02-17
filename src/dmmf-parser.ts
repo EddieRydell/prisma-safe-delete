@@ -41,6 +41,13 @@ export interface UniqueConstraintInfo {
 }
 
 /**
+ * Valid audit actions that can be specified in @audit(action1, action2)
+ */
+export type AuditAction = 'create' | 'update' | 'delete';
+
+const VALID_AUDIT_ACTIONS: readonly AuditAction[] = ['create', 'update', 'delete'];
+
+/**
  * Represents a fully parsed Prisma model
  */
 export interface ParsedModel {
@@ -49,6 +56,9 @@ export interface ParsedModel {
   isSoftDeletable: boolean;
   deletedAtField: string | null;
   deletedByField: string | null;
+  isAuditable: boolean;
+  auditActions: AuditAction[];
+  isAuditTable: boolean;
   fields: ParsedField[];
   relations: ParsedRelation[];
   /** String fields with @unique or part of @@unique that need mangling on soft delete */
@@ -65,6 +75,8 @@ export interface ParsedModel {
 export interface ParsedSchema {
   models: ParsedModel[];
   modelMap: Map<string, ParsedModel>;
+  /** The model marked with @audit-table, if any */
+  auditTable: ParsedModel | null;
 }
 
 const DELETED_AT_FIELD_NAMES: readonly string[] = ['deleted_at', 'deletedAt'];
@@ -318,6 +330,44 @@ function extractUniqueConstraints(
 }
 
 /**
+ * Parses @audit and @audit-table annotations from model documentation.
+ * - `@audit` → auditable with all actions
+ * - `@audit(create, delete)` → auditable with specific actions
+ * - `@audit-table` → this model is the audit event table
+ */
+function parseAuditAnnotations(documentation: string | undefined): {
+  isAuditable: boolean;
+  auditActions: AuditAction[];
+  isAuditTable: boolean;
+} {
+  if (documentation === undefined) {
+    return { isAuditable: false, auditActions: [], isAuditTable: false };
+  }
+
+  const isAuditTable = /@audit-table\b/.test(documentation);
+
+  // Match @audit or @audit(actions) — but NOT @audit-table
+  const auditMatch = /@audit(?!\s*-table)(?:\(([^)]+)\))?/.exec(documentation);
+  if (auditMatch === null) {
+    return { isAuditable: false, auditActions: [], isAuditTable };
+  }
+
+  const actionStr = auditMatch[1];
+  if (actionStr === undefined) {
+    // @audit with no args → all actions
+    return { isAuditable: true, auditActions: [...VALID_AUDIT_ACTIONS], isAuditTable };
+  }
+
+  // Parse comma-separated actions
+  const actions = actionStr
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s): s is AuditAction => (VALID_AUDIT_ACTIONS as readonly string[]).includes(s));
+
+  return { isAuditable: actions.length > 0, auditActions: actions, isAuditTable };
+}
+
+/**
  * Parses a single DMMF model into our ParsedModel format
  */
 function parseModel(model: DMMFModel, options?: ParseDMMFOptions): ParsedModel {
@@ -362,12 +412,23 @@ function parseModel(model: DMMFModel, options?: ParseDMMFOptions): ParsedModel {
     }
   }
 
+  // Parse @audit and @audit-table annotations from model documentation (/// comments)
+  const doc = (model as unknown as { documentation?: string }).documentation;
+  const audit = parseAuditAnnotations(doc);
+
+  // @audit-table models are never themselves auditable or soft-deletable
+  const isSoftDeletable = audit.isAuditTable ? false : Boolean(deletedAtField);
+  const isAuditable = audit.isAuditTable ? false : audit.isAuditable;
+
   return {
     name: model.name,
     primaryKey: extractPrimaryKey(model),
-    isSoftDeletable: Boolean(deletedAtField),
-    deletedAtField,
-    deletedByField,
+    isSoftDeletable,
+    deletedAtField: isSoftDeletable ? deletedAtField : null,
+    deletedByField: isSoftDeletable ? deletedByField : null,
+    isAuditable,
+    auditActions: isAuditable ? audit.auditActions : [],
+    isAuditTable: audit.isAuditTable,
     fields,
     relations,
     uniqueStringFields: extractUniqueStringFields(model),
@@ -395,7 +456,11 @@ export function parseDMMF(dmmf: DMMF.Document, options?: ParseDMMFOptions): Pars
     modelMap.set(model.name, model);
   }
 
-  return { models, modelMap };
+  // Find the audit table model (at most one should be marked @audit-table)
+  const auditTables = models.filter((m) => m.isAuditTable);
+  const auditTable = auditTables.length === 1 ? (auditTables[0] ?? null) : null;
+
+  return { models, modelMap, auditTable };
 }
 
 /**
@@ -410,4 +475,11 @@ export function getSoftDeletableModels(schema: ParsedSchema): ParsedModel[] {
  */
 export function getHardDeleteOnlyModels(schema: ParsedSchema): ParsedModel[] {
   return schema.models.filter((model) => !model.isSoftDeletable);
+}
+
+/**
+ * Gets all auditable models from a parsed schema
+ */
+export function getAuditableModels(schema: ParsedSchema): ParsedModel[] {
+  return schema.models.filter((model) => model.isAuditable);
 }

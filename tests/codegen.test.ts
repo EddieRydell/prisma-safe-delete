@@ -6,6 +6,7 @@ import {
   emitRuntime,
   emitCascadeGraph,
   emitIndex,
+  resolveAuditTableConfig,
 } from '../src/codegen/index.js';
 import { buildToOneRelationWarningLines } from '../src/generator.js';
 import { createMockField, createMockModel, createMockDMMF } from './helpers/mock-dmmf.js';
@@ -1326,5 +1327,320 @@ describe('buildToOneRelationWarningLines', () => {
     const lines = buildToOneRelationWarningLines(schema, false);
 
     expect(lines).toEqual([]);
+  });
+});
+
+// --- Audit logging tests ---
+
+function createAuditSchema() {
+  const models = [
+    createMockModel({
+      name: 'User',
+      documentation: '/// @audit',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'email', type: 'String', isUnique: true }),
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        createMockField({ name: 'deleted_by', type: 'String', isRequired: false }),
+        createMockField({
+          name: 'posts',
+          type: 'Post',
+          kind: 'object',
+          isList: true,
+          relationName: 'UserPosts',
+        }),
+      ],
+    }),
+    createMockModel({
+      name: 'Post',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'title', type: 'String' }),
+        createMockField({ name: 'authorId', type: 'String' }),
+        createMockField({
+          name: 'author',
+          type: 'User',
+          kind: 'object',
+          relationName: 'UserPosts',
+          relationFromFields: ['authorId'],
+          relationToFields: ['id'],
+          relationOnDelete: 'Cascade',
+        }),
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ],
+    }),
+    createMockModel({
+      name: 'Product',
+      documentation: '/// @audit(create, delete)',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'name', type: 'String' }),
+      ],
+    }),
+    createMockModel({
+      name: 'AuditEvent',
+      documentation: '/// @audit-table',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'entity_type', type: 'String' }),
+        createMockField({ name: 'entity_id', type: 'String' }),
+        createMockField({ name: 'action', type: 'String' }),
+        createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
+        createMockField({ name: 'event_data', type: 'Json' }),
+        createMockField({ name: 'created_at', type: 'DateTime' }),
+        createMockField({ name: 'parent_event_id', type: 'String', isRequired: false }),
+      ],
+    }),
+  ];
+
+  return parseDMMF(createMockDMMF(models));
+}
+
+describe('emitTypes - audit', () => {
+  it('audited + soft-deletable model uses actorId instead of deletedBy', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // User is audited + soft-deletable: actorId replaces deletedBy
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*actorId\?: string \| null/);
+    // Extract just the SafeUserDelegate block and check it doesn't contain deletedBy
+    const userDelegateMatch = /export type SafeUserDelegate[\s\S]*?(?=export type Safe\w+Delegate|export interface)/.exec(output);
+    expect(userDelegateMatch).not.toBeNull();
+    expect(userDelegateMatch![0]).not.toContain('deletedBy');
+    expect(userDelegateMatch![0]).toContain('actorId');
+  });
+
+  it('audited + soft-deletable model has actorId on write methods', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // create, update, upsert should have actorId
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*create.*actorId/);
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*update.*actorId/);
+  });
+
+  it('audit-only model (no soft-delete) has actorId on mutations including delete', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // Product is audit-only (no deleted_at)
+    expect(output).toMatch(/SafeProductDelegate[\s\S]*create.*actorId/);
+    expect(output).toMatch(/SafeProductDelegate[\s\S]*delete.*actorId/);
+  });
+
+  it('non-audited soft-deletable model retains deletedBy', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // Post is not audited: should still have deletedBy
+    expect(output).toMatch(/SafePostDelegate[\s\S]*deletedBy\?/);
+  });
+
+  it('emits WrapOptions type when auditable models exist', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('export interface WrapOptions');
+    expect(output).toContain('auditContext');
+  });
+
+  it('does not emit WrapOptions when no auditable models', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).not.toContain('WrapOptions');
+  });
+});
+
+describe('emitRuntime - audit', () => {
+  it('emits audit helper functions when audit table exists', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('AUDITABLE_MODELS');
+    expect(output).toContain('writeAuditEvent');
+    expect(output).toContain('isAuditable');
+    expect(output).toContain('getEntityId');
+    expect(output).toContain('AUDIT_TABLE_NAME');
+    // Shared audit operation helpers should be emitted
+    expect(output).toContain('async function _auditedCreate');
+    expect(output).toContain('async function _auditedUpdate');
+    expect(output).toContain('async function _auditedUpdateMany');
+    expect(output).toContain('async function _auditedUpdateManyAndReturn');
+    expect(output).toContain('async function _auditedUpsert');
+    expect(output).toContain('async function _auditedDelete');
+    expect(output).toContain('async function _auditedDeleteMany');
+  });
+
+  it('does not emit audit helpers when no audit table', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+    });
+
+    expect(output).not.toContain('AUDITABLE_MODELS');
+    expect(output).not.toContain('writeAuditEvent');
+  });
+
+  it('audited + soft-deletable model uses actorId in softDelete', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // User delegate should reference actorId, not deletedBy
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    const userCode = userDelegate![0];
+    expect(userCode).toContain('actorId');
+    // softDelete should destructure actorId
+    expect(userCode).toContain('const { actorId,');
+  });
+
+  it('audited + soft-deletable model has audited write methods', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    const userCode = userDelegate![0];
+    // Write methods should call shared _audited* helpers
+    expect(userCode).toContain('_auditedCreate');
+    expect(userCode).toContain('_auditedUpdate');
+    expect(userCode).toContain('_auditedUpsert');
+    // Upsert still checks isAuditable at runtime (action determined at runtime)
+    expect(output).toContain('isAuditable');
+  });
+
+  it('audit-only model (no soft-delete) has full audited delegate', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // Product is audit-only (has create and delete actions)
+    const productDelegate = /function createProductDelegate[\s\S]*?^}/m.exec(output);
+    expect(productDelegate).not.toBeNull();
+    const productCode = productDelegate![0];
+    // Should use shared _audited* helpers
+    expect(productCode).toContain('_auditedCreate');
+    expect(productCode).toContain('actorId');
+    // Product has @audit(create, delete) - delete should use _auditedDelete
+    expect(productCode).toContain('_auditedDelete');
+    // Product does NOT have 'update' action, so update should be a passthrough
+    expect(productCode).not.toContain('_auditedUpdate');
+  });
+
+  it('non-audited model is unchanged', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // Post is not audited - should not have writeAuditEvent
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    const postCode = postDelegate![0];
+    expect(postCode).not.toContain('writeAuditEvent');
+    expect(postCode).not.toContain('actorId');
+  });
+
+  it('wrapPrismaClient accepts WrapOptions when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('wrapOptions?: WrapOptions');
+  });
+
+  it('transaction wrapper handles audit-only models', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // Product (audit-only) should use shared _audited* helpers in tx wrapper
+    expect(txContent).toContain('_auditedCreate');
+    expect(txContent).toContain('_auditedDelete');
+    // Product should still have actorId extraction
+    expect(txContent).toContain('actorId');
+  });
+
+  it('transaction wrapper has audited write methods for audited+soft-deletable models', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // User (audited + soft-deletable) in tx should use shared _audited* helpers
+    expect(txContent).toContain('_auditedCreate');
+    expect(txContent).toContain('_auditedUpdate');
+    // Should use actorId in softDelete
+    const userSection = /user: \{[\s\S]*?\},\n\s{4}\w/.exec(txContent);
+    expect(userSection).not.toBeNull();
+    expect(userSection![0]).toContain('actorId');
+  });
+});
+
+describe('emitIndex - audit', () => {
+  it('exports WrapOptions when auditable models exist', () => {
+    const schema = createAuditSchema();
+    const output = emitIndex(schema);
+
+    expect(output).toContain('WrapOptions');
+  });
+
+  it('does not export WrapOptions when no auditable models', () => {
+    const schema = createTestSchema();
+    const output = emitIndex(schema);
+
+    expect(output).not.toContain('WrapOptions');
   });
 });

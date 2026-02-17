@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Audit logging**: Mark models with `/// @audit` or `/// @audit(create, delete)` to automatically capture mutation events. Requires an `/// @audit-table` model in the schema to store events.
+  - Audit events capture before/after snapshots for updates, full records for creates/deletes
+  - `actorId` parameter on all mutation methods for audited models (optional `string | null`)
+  - `WrapOptions.auditContext` callback to inject request-scoped context (IP, user agent, trace IDs) into audit events
+  - Works with both soft-deletable and audit-only models
+  - All audit writes are atomic with the mutation (same transaction)
+  - Selective action auditing: `@audit(create, delete)` only audits specified actions
+  - `upsert` determines action (create vs update) at runtime and audits accordingly
+  - Batch operations (`createMany`, `updateMany`, `deleteMany`) write one audit event per affected record
+  - `parent_event_id` support for linking related audit events
 - `cascade = "false"` generator option to disable cascade graph building; all models use the fast path and return `cascaded: {}` (#52)
 - Generator warning for required to-one relations pointing to soft-deletable models (runtime nullification may return `null` despite the Prisma type)
 

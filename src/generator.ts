@@ -14,6 +14,8 @@ import {
   emitRuntime,
   emitCascadeGraph,
   emitIndex,
+  hasAuditableModels,
+  resolveAuditTableConfig,
 } from './codegen/index.js';
 
 /**
@@ -522,6 +524,73 @@ export function buildToOneRelationWarningLines(
 }
 
 /**
+ * Validates the audit table has the required columns when auditable models exist.
+ * Throws descriptive errors at generation time.
+ */
+function validateAuditSetup(schema: ParsedSchema): void {
+  const auditableModels = schema.models.filter((m) => m.isAuditable);
+  if (auditableModels.length === 0) return;
+
+  // Check for multiple @audit-table models
+  const auditTables = schema.models.filter((m) => m.isAuditTable);
+  if (auditTables.length > 1) {
+    const names = auditTables.map((m) => m.name).join(', ');
+    throw new Error(
+      `prisma-safe-delete: Multiple @audit-table models found: ${names}. Only one audit table is allowed.`,
+    );
+  }
+
+  // Must have an audit table
+  if (schema.auditTable === null) {
+    throw new Error(
+      'prisma-safe-delete: Models marked with @audit exist but no @audit-table model was found.\n' +
+        'Add /// @audit-table to your audit events model. Required columns:\n' +
+        '  entity_type String\n' +
+        '  entity_id   String\n' +
+        '  action      String\n' +
+        '  actor_id    String?\n' +
+        '  event_data  Json\n' +
+        '  created_at  DateTime',
+    );
+  }
+
+  // Validate required columns
+  const table = schema.auditTable;
+  const fieldMap = new Map(table.fields.map((f) => [f.name, f]));
+
+  const requiredColumns: { name: string; type: string; nullable: boolean }[] = [
+    { name: 'entity_type', type: 'String', nullable: false },
+    { name: 'entity_id', type: 'String', nullable: false },
+    { name: 'action', type: 'String', nullable: false },
+    { name: 'actor_id', type: 'String', nullable: true },
+    { name: 'event_data', type: 'Json', nullable: false },
+    { name: 'created_at', type: 'DateTime', nullable: false },
+  ];
+
+  const errors: string[] = [];
+  for (const col of requiredColumns) {
+    const field = fieldMap.get(col.name);
+    if (field === undefined) {
+      errors.push(`  Missing column: ${col.name} ${col.type}${col.nullable ? '?' : ''}`);
+    } else if (field.type !== col.type) {
+      errors.push(
+        `  Column ${col.name}: expected type ${col.type}, got ${field.type}`,
+      );
+    } else if (!col.nullable && !field.isRequired) {
+      errors.push(
+        `  Column ${col.name}: must be required (not nullable)`,
+      );
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(
+      `prisma-safe-delete: Audit table "${table.name}" has invalid columns:\n${errors.join('\n')}`,
+    );
+  }
+}
+
+/**
  * Computes the relative import path from our output directory to the Prisma client.
  * Returns a path like '../client/client.js' for ESM compatibility with NodeNext module resolution.
  */
@@ -630,13 +699,17 @@ generatorHandler({
       console.log(toOneWarnings.join('\n'));
     }
 
+    // Validate audit setup (throws on misconfiguration)
+    validateAuditSetup(schema);
+    const auditTable = hasAuditableModels(schema) ? resolveAuditTableConfig(schema) : null;
+
     // Build the cascade graph (empty when cascade is disabled)
     const cascadeGraph = cascade ? buildCascadeGraph(schema) : {};
 
     // Generate all output files
     const typesContent = emitTypes(schema, clientImportPath);
     const cascadeGraphContent = emitCascadeGraph(cascadeGraph);
-    const runtimeContent = emitRuntime(schema, clientImportPath, { uniqueStrategy, cascadeGraph });
+    const runtimeContent = emitRuntime(schema, clientImportPath, { uniqueStrategy, cascadeGraph, auditTable });
     const indexContent = emitIndex(schema);
 
     // Ensure output directory exists
