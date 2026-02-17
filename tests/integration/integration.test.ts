@@ -515,7 +515,7 @@ safePrisma.webhook.delete({ where: { id: '1' }, actorId: 'user-123' });
 import { wrapPrismaClient } from './soft-cascade/runtime.js';
 import type { WrapOptions } from './soft-cascade/types.js';
 declare const prisma: any;
-const opts: WrapOptions = { auditContext: async () => ({ ip: '127.0.0.1' }) };
+const opts: WrapOptions = { auditContext: async () => ({ source: 'test' }) };
 const safePrisma = wrapPrismaClient(prisma, opts);
 `);
   });

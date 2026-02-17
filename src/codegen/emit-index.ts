@@ -15,7 +15,7 @@ export function emitIndex(schema: ParsedSchema): string {
   const hasAuditableModels = schema.models.some((m) => m.isAuditable);
   const typeExports = ['SafePrismaClient', 'IncludingDeletedClient', 'OnlyDeletedClient', 'CascadeResult'];
   if (hasAuditableModels) {
-    typeExports.push('WrapOptions');
+    typeExports.push('WrapOptions', 'AuditContext');
   }
   lines.push(`export type { ${typeExports.join(', ')} } from './types.js';`);
 

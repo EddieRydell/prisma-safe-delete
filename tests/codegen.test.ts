@@ -1389,6 +1389,7 @@ function createAuditSchema() {
         createMockField({ name: 'event_data', type: 'Json' }),
         createMockField({ name: 'created_at', type: 'DateTime' }),
         createMockField({ name: 'parent_event_id', type: 'String', isRequired: false }),
+        createMockField({ name: 'source', type: 'String', isRequired: false }),
       ],
     }),
   ];
@@ -1449,6 +1450,64 @@ describe('emitTypes - audit', () => {
     const output = emitTypes(schema, TEST_CLIENT_PATH);
 
     expect(output).not.toContain('WrapOptions');
+  });
+
+  it('emits typed AuditContext interface with extra columns', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // AuditEvent has source String? as an extra column
+    expect(output).toContain('export interface AuditContext');
+    expect(output).toMatch(/source\?: string \| null/);
+  });
+
+  it('emits AuditContext as Record when no extra columns', () => {
+    // Create a schema with an audit table that has no extra columns
+    const models = [
+      createMockModel({
+        name: 'Item',
+        documentation: '/// @audit',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'name', type: 'String' }),
+        ],
+      }),
+      createMockModel({
+        name: 'AuditEvent',
+        documentation: '/// @audit-table',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'entity_type', type: 'String' }),
+          createMockField({ name: 'entity_id', type: 'String' }),
+          createMockField({ name: 'action', type: 'String' }),
+          createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
+          createMockField({ name: 'event_data', type: 'Json' }),
+          createMockField({ name: 'created_at', type: 'DateTime' }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toContain('export type AuditContext = Record<string, unknown>');
+  });
+
+  it('audited method signatures include auditContext', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // User is audited + soft-deletable: write methods should have auditContext
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*create.*auditContext/);
+    expect(output).toMatch(/SafeUserDelegate[\s\S]*softDelete.*auditContext/);
+    // Product is audit-only: should also have auditContext
+    expect(output).toMatch(/SafeProductDelegate[\s\S]*create.*auditContext/);
+  });
+
+  it('WrapOptions uses typed AuditContext', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toMatch(/auditContext\?.*AuditContext/);
   });
 });
 
@@ -1627,20 +1686,104 @@ describe('emitRuntime - audit', () => {
     expect(userSection).not.toBeNull();
     expect(userSection![0]).toContain('actorId');
   });
+
+  it('_audited* helpers accept callCtx parameter', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // All _audited* helpers should accept callCtx as last parameter
+    expect(output).toMatch(/_auditedCreate\([\s\S]*?callCtx\?: Record<string, unknown>/);
+    expect(output).toMatch(/_auditedUpdate\([\s\S]*?callCtx\?: Record<string, unknown>/);
+    expect(output).toMatch(/_auditedDelete\([\s\S]*?callCtx\?: Record<string, unknown>/);
+    expect(output).toMatch(/_auditedHardDelete\([\s\S]*?callCtx\?: Record<string, unknown>/);
+  });
+
+  it('audited method call sites pass callCtx to helpers', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    const userCode = userDelegate![0];
+    // create method should destructure auditContext as callCtx and pass it
+    expect(userCode).toContain('auditContext: callCtx');
+    expect(userCode).toMatch(/_auditedCreate\(.*callCtx\)/);
+  });
+
+  it('cascadeToChildren includes audit params when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // cascadeToChildren should accept audit-related parameters
+    expect(output).toMatch(/cascadeToChildren\([\s\S]*?auditParentEventIds/);
+    expect(output).toMatch(/cascadeToChildren\([\s\S]*?auditActorId/);
+    expect(output).toMatch(/cascadeToChildren\([\s\S]*?auditWrapOptions/);
+    expect(output).toMatch(/cascadeToChildren\([\s\S]*?auditCallCtx/);
+
+    // softDeleteWithCascadeInTx should accept audit parameters
+    expect(output).toMatch(/softDeleteWithCascadeInTx\([\s\S]*?auditActorId/);
+    expect(output).toMatch(/softDeleteWithCascadeInTx\([\s\S]*?auditCallCtx/);
+  });
+
+  it('emits _mergeAuditContext helper', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('async function _mergeAuditContext');
+  });
+
+  it('imports AuditContext type when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('AuditContext');
+  });
 });
 
 describe('emitIndex - audit', () => {
-  it('exports WrapOptions when auditable models exist', () => {
+  it('exports WrapOptions and AuditContext when auditable models exist', () => {
     const schema = createAuditSchema();
     const output = emitIndex(schema);
 
     expect(output).toContain('WrapOptions');
+    expect(output).toContain('AuditContext');
   });
 
-  it('does not export WrapOptions when no auditable models', () => {
+  it('does not export WrapOptions or AuditContext when no auditable models', () => {
     const schema = createTestSchema();
     const output = emitIndex(schema);
 
     expect(output).not.toContain('WrapOptions');
+    expect(output).not.toContain('AuditContext');
   });
 });

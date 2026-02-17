@@ -1,6 +1,16 @@
 import type { ParsedSchema } from '../dmmf-parser.js';
 
 /**
+ * Extra column on the audit table beyond the built-in columns.
+ * Used to generate a typed AuditContext interface.
+ */
+export interface AuditExtraColumn {
+  name: string;
+  prismaType: string; // 'String', 'DateTime', etc.
+  isRequired: boolean;
+}
+
+/**
  * Audit table configuration resolved at generation time.
  */
 export interface AuditTableConfig {
@@ -12,6 +22,34 @@ export interface AuditTableConfig {
   pkField: string | string[];
   /** Whether the audit table has a parent_event_id column */
   hasParentEventId: boolean;
+  /** Extra columns beyond the built-in audit columns */
+  extraColumns: AuditExtraColumn[];
+}
+
+/**
+ * Maps Prisma scalar types to TypeScript types for AuditContext interface generation.
+ */
+export function prismaTypeToTsType(prismaType: string): string {
+  switch (prismaType) {
+    case 'String':
+      return 'string';
+    case 'Int':
+    case 'Float':
+    case 'Decimal':
+      return 'number';
+    case 'BigInt':
+      return 'bigint';
+    case 'Boolean':
+      return 'boolean';
+    case 'DateTime':
+      return 'Date';
+    case 'Json':
+      return 'unknown';
+    case 'Bytes':
+      return 'Buffer';
+    default:
+      return 'unknown';
+  }
 }
 
 function toLowerFirst(s: string): string {
@@ -120,6 +158,19 @@ function getEntityId(modelName: string, record: Record<string, unknown>): string
 function emitAuditOperationHelpers(): string {
   return `
 /**
+ * Merges global auditContext callback result with per-call callCtx.
+ * Per-call values override global values.
+ */
+async function _mergeAuditContext(
+  wrapOptions: any,
+  callCtx?: Record<string, unknown>,
+): Promise<Record<string, unknown> | undefined> {
+  const globalCtx = await wrapOptions?.auditContext?.();
+  if (!globalCtx && !callCtx) return undefined;
+  return { ...globalCtx, ...callCtx };
+}
+
+/**
  * Audited create: create record, write audit event, return record.
  */
 async function _auditedCreate(
@@ -129,9 +180,10 @@ async function _auditedCreate(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const record = await delegate.create(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'create', actorId, record, undefined, ctx);
   return record;
 }
@@ -146,9 +198,10 @@ async function _auditedCreateMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<{ count: number }> {
   const records = await delegate.createManyAndReturn(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await Promise.all(records.map((record: any) =>
     writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'create', actorId, record, undefined, ctx),
   ));
@@ -165,9 +218,10 @@ async function _auditedCreateManyAndReturn(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any[]> {
   const records = await delegate.createManyAndReturn(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await Promise.all(records.map((record: any) =>
     writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'create', actorId, record, undefined, ctx),
   ));
@@ -184,10 +238,11 @@ async function _auditedUpdate(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const before = await delegate.findUniqueOrThrow({ where: args.where });
   const after = await delegate.update(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
   return after;
 }
@@ -202,6 +257,7 @@ async function _auditedUpdateMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const beforeRecords = await delegate.findMany({ where: args.where });
   const result = await delegate.updateMany(args);
@@ -210,7 +266,7 @@ async function _auditedUpdateMany(
     const afterRecords = await delegate.findMany({
       where: { OR: pks.map((pk: any) => createPkWhereFromValues(modelName, pk)) },
     });
-    const ctx = await wrapOptions?.auditContext?.();
+    const ctx = await _mergeAuditContext(wrapOptions, callCtx);
     await Promise.all(beforeRecords.map((before: any) => {
       const pk = extractPrimaryKey(modelName, before);
       const after = afterRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
@@ -233,10 +289,11 @@ async function _auditedUpdateManyAndReturn(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any[]> {
   const beforeRecords = await delegate.findMany({ where: args.where });
   const results = await delegate.updateManyAndReturn(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await Promise.all(results.map((after: any) => {
     const pk = extractPrimaryKey(modelName, after);
     const before = beforeRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
@@ -258,13 +315,14 @@ async function _auditedUpsert(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const existing = await delegate.findUnique({ where: args.where });
   const result = await delegate.upsert(args);
   const action = existing ? 'update' : 'create';
   const eventData = existing ? { before: existing, after: result } : result;
   if (isAuditable(modelName, action)) {
-    const ctx = await wrapOptions?.auditContext?.();
+    const ctx = await _mergeAuditContext(wrapOptions, callCtx);
     await writeAuditEvent(tx, modelName, getEntityId(modelName, result), action, actorId, eventData, undefined, ctx);
   }
   return result;
@@ -280,9 +338,10 @@ async function _auditedDelete(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const record = await delegate.delete(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx);
   return record;
 }
@@ -297,10 +356,11 @@ async function _auditedDeleteMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const records = await delegate.findMany({ where: args?.where });
   const result = await delegate.deleteMany(args);
-  const ctx = await wrapOptions?.auditContext?.();
+  const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await Promise.all(records.map((record: any) =>
     writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx),
   ));
@@ -319,10 +379,11 @@ async function _auditedHardDelete(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const record = await delegate.delete(args);
   if (isAuditable(modelName, 'delete')) {
-    const ctx = await wrapOptions?.auditContext?.();
+    const ctx = await _mergeAuditContext(wrapOptions, callCtx);
     await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'hard_delete', actorId, record, undefined, ctx);
   }
   return record;
@@ -339,11 +400,12 @@ async function _auditedHardDeleteMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
+  callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const records = await delegate.findMany({ where: args?.where });
   const result = await delegate.deleteMany(args);
   if (isAuditable(modelName, 'delete') && records.length > 0) {
-    const ctx = await wrapOptions?.auditContext?.();
+    const ctx = await _mergeAuditContext(wrapOptions, callCtx);
     await Promise.all(records.map((record: any) =>
       writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'hard_delete', actorId, record, undefined, ctx),
     ));
@@ -371,10 +433,30 @@ export function resolveAuditTableConfig(schema: ParsedSchema): AuditTableConfig 
     (f) => f.name === 'parent_event_id' && f.type === 'String' && !f.isRequired,
   );
 
+  // Built-in columns that are not "extra"
+  const builtInColumns = new Set([
+    'entity_type', 'entity_id', 'action', 'actor_id', 'event_data', 'created_at', 'parent_event_id',
+  ]);
+  // PK fields are also not extra
+  const pkFields = new Set(Array.isArray(model.primaryKey) ? model.primaryKey : [model.primaryKey]);
+
+  const extraColumns: AuditExtraColumn[] = [];
+  for (const field of model.fields) {
+    if (builtInColumns.has(field.name)) continue;
+    if (pkFields.has(field.name)) continue;
+    if (field.isRelation) continue;
+    extraColumns.push({
+      name: field.name,
+      prismaType: field.type,
+      isRequired: field.isRequired,
+    });
+  }
+
   return {
     modelName: model.name,
     lowerName: toLowerFirst(model.name),
     pkField: model.primaryKey,
     hasParentEventId,
+    extraColumns,
   };
 }
