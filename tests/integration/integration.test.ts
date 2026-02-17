@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDMMF } from '../../src/dmmf-parser.js';
 import { buildCascadeGraph } from '../../src/cascade-graph.js';
-import { emitRuntime, emitTypes, emitCascadeGraph, emitIndex } from '../../src/codegen/index.js';
+import { emitRuntime, emitTypes, emitCascadeGraph, emitIndex, resolveAuditTableConfig } from '../../src/codegen/index.js';
 import { createMockField, createMockModel, createMockDMMF } from '../helpers/mock-dmmf.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -431,6 +431,105 @@ async function test() {
     expect(content).toContain('createUserDelegate');
     expect(content).toContain('createPostDelegate');
     expect(content).toContain('createAuditLogDelegate');
+    // Audit models
+    expect(content).toContain('createProjectDelegate');
+    expect(content).toContain('createWebhookDelegate');
+  });
+
+  // --- Audit logging integration tests ---
+
+  it('generates audit helper functions in runtime', () => {
+    const runtimePath = path.join(generatedDir, 'runtime.ts');
+    const content = fs.readFileSync(runtimePath, 'utf-8');
+
+    expect(content).toContain('AUDITABLE_MODELS');
+    expect(content).toContain('writeAuditEvent');
+    expect(content).toContain('isAuditable');
+    expect(content).toContain('getEntityId');
+    expect(content).toContain('AUDIT_TABLE_NAME');
+  });
+
+  it('generates WrapOptions type in types', () => {
+    const typesPath = path.join(generatedDir, 'types.ts');
+    const content = fs.readFileSync(typesPath, 'utf-8');
+
+    expect(content).toContain('WrapOptions');
+    expect(content).toContain('auditContext');
+  });
+
+  it('audited + soft-deletable model has actorId on softDelete', () => {
+    const typesPath = path.join(generatedDir, 'types.ts');
+    const content = fs.readFileSync(typesPath, 'utf-8');
+
+    // Project is @audit + soft-deletable
+    expect(content).toMatch(/SafeProjectDelegate[\s\S]*actorId/);
+  });
+
+  it('audit-only model has actorId on delete', () => {
+    const typesPath = path.join(generatedDir, 'types.ts');
+    const content = fs.readFileSync(typesPath, 'utf-8');
+
+    // Webhook is @audit(create, delete) without soft-delete
+    expect(content).toMatch(/SafeWebhookDelegate[\s\S]*actorId/);
+  });
+
+  it('WrapOptions is exported from index', () => {
+    const indexPath = path.join(generatedDir, 'index.ts');
+    const content = fs.readFileSync(indexPath, 'utf-8');
+
+    expect(content).toContain('WrapOptions');
+  });
+
+  it('audited model uses actorId in softDelete type', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+// Project is audited+soft-deletable: uses actorId
+safePrisma.project.softDelete({ where: { id: '1' }, actorId: 'user-123' });
+safePrisma.project.softDeleteMany({ where: {}, actorId: 'user-123' });
+// actorId is optional
+safePrisma.project.softDelete({ where: { id: '1' } });
+`);
+  });
+
+  it('audited model has actorId on create/update', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.project.create({ data: { name: 'test' }, actorId: 'user-123' });
+safePrisma.project.update({ where: { id: '1' }, data: { name: 'updated' }, actorId: 'user-123' });
+`);
+  });
+
+  it('audit-only model has actorId on delete/create', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.webhook.create({ data: { url: 'http://example.com' }, actorId: 'user-123' });
+safePrisma.webhook.delete({ where: { id: '1' }, actorId: 'user-123' });
+`);
+  });
+
+  it('wrapPrismaClient accepts WrapOptions', () => {
+    expectNoTypeError(`
+import { wrapPrismaClient } from './soft-cascade/runtime.js';
+import type { WrapOptions } from './soft-cascade/types.js';
+declare const prisma: any;
+const opts: WrapOptions = { auditContext: async () => ({ ip: '127.0.0.1' }) };
+const safePrisma = wrapPrismaClient(prisma, opts);
+`);
+  });
+
+  it('transaction has actorId on audited model softDelete', () => {
+    expectNoTypeError(`
+import type { SafePrismaClient } from './soft-cascade/types.js';
+declare const safePrisma: SafePrismaClient;
+safePrisma.$transaction(async (tx) => {
+  await tx.project.softDelete({ where: { id: '1' }, actorId: 'user-123' });
+  await tx.project.create({ data: { name: 'test' }, actorId: 'user-123' });
+  await tx.webhook.delete({ where: { id: '1' }, actorId: 'user-123' });
+});
+`);
   });
 });
 
@@ -568,6 +667,10 @@ describe('Integration: Runtime behavior', () => {
           findMany: mockFindMany,
           updateMany: mockUpdateMany,
         },
+        project: {
+          findMany: mockFindMany,
+          updateMany: mockUpdateMany,
+        },
       });
     });
 
@@ -692,6 +795,66 @@ describe('Integration: Runtime behavior', () => {
         deleteMany: vi.fn(),
         fields: {},
       },
+      project: {
+        findMany: mockFindMany,
+        findFirst: mockFindFirst,
+        findFirstOrThrow: mockFindFirst,
+        findUnique: mockFindFirst,
+        findUniqueOrThrow: mockFindFirst,
+        count: vi.fn().mockResolvedValue(0),
+        aggregate: vi.fn().mockResolvedValue({}),
+        groupBy: vi.fn().mockResolvedValue([]),
+        create: mockCreate,
+        createMany: mockCreate,
+        createManyAndReturn: mockCreate,
+        update: mockUpdate,
+        updateMany: mockUpdateMany,
+        updateManyAndReturn: mockUpdate,
+        upsert: mockUpdate,
+        delete: vi.fn(),
+        deleteMany: vi.fn(),
+        fields: {},
+      },
+      webhook: {
+        findMany: mockFindMany,
+        findFirst: mockFindFirst,
+        findFirstOrThrow: mockFindFirst,
+        findUnique: mockFindFirst,
+        findUniqueOrThrow: mockFindFirst,
+        count: vi.fn().mockResolvedValue(0),
+        aggregate: vi.fn().mockResolvedValue({}),
+        groupBy: vi.fn().mockResolvedValue([]),
+        create: mockCreate,
+        createMany: mockCreate,
+        createManyAndReturn: mockCreate,
+        update: mockUpdate,
+        updateMany: mockUpdateMany,
+        updateManyAndReturn: mockUpdate,
+        upsert: mockUpdate,
+        delete: vi.fn(),
+        deleteMany: vi.fn(),
+        fields: {},
+      },
+      auditEvent: {
+        findMany: mockFindMany,
+        findFirst: mockFindFirst,
+        findFirstOrThrow: mockFindFirst,
+        findUnique: mockFindFirst,
+        findUniqueOrThrow: mockFindFirst,
+        count: vi.fn().mockResolvedValue(0),
+        aggregate: vi.fn().mockResolvedValue({}),
+        groupBy: vi.fn().mockResolvedValue([]),
+        create: mockCreate,
+        createMany: mockCreate,
+        createManyAndReturn: mockCreate,
+        update: mockUpdate,
+        updateMany: mockUpdateMany,
+        updateManyAndReturn: mockUpdate,
+        upsert: mockUpdate,
+        delete: vi.fn(),
+        deleteMany: vi.fn(),
+        fields: {},
+      },
       $connect: vi.fn(),
       $disconnect: vi.fn(),
       $on: vi.fn(),
@@ -747,6 +910,9 @@ describe('Integration: Runtime behavior', () => {
       comment: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
       customer: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
       auditLog: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
+      project: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
+      webhook: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
+      auditEvent: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
       $connect: vi.fn(),
       $disconnect: vi.fn(),
       $on: vi.fn(),
@@ -799,6 +965,9 @@ describe('Integration: Runtime behavior', () => {
       comment: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
       customer: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
       auditLog: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
+      project: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
+      webhook: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
+      auditEvent: { findMany: vi.fn(), findFirst: vi.fn(), findFirstOrThrow: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), count: vi.fn(), aggregate: vi.fn(), groupBy: vi.fn(), create: vi.fn(), createMany: vi.fn(), createManyAndReturn: vi.fn(), update: vi.fn(), updateMany: vi.fn(), updateManyAndReturn: vi.fn(), upsert: vi.fn(), delete: vi.fn(), deleteMany: vi.fn(), fields: {} },
       $connect: vi.fn(),
       $disconnect: vi.fn(),
       $on: vi.fn(),
@@ -1079,4 +1248,107 @@ model Post {
     expect(userDelegate).not.toBeNull();
     expect(userDelegate![0]).toContain('softDeleteWithCascade');
   }, 60000);
+});
+
+
+describe('Integration: audit codegen compilation', () => {
+  it('audit-generated code compiles with --noUnusedLocals', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        documentation: '/// @audit',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'email', type: 'String', isUnique: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+          createMockField({ name: 'deleted_by', type: 'String', isRequired: false }),
+          createMockField({
+            name: 'posts',
+            type: 'Post',
+            kind: 'object',
+            isList: true,
+            relationName: 'UserPosts',
+          }),
+        ],
+      }),
+      createMockModel({
+        name: 'Post',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'title', type: 'String' }),
+          createMockField({ name: 'authorId', type: 'String' }),
+          createMockField({
+            name: 'author',
+            type: 'User',
+            kind: 'object',
+            relationName: 'UserPosts',
+            relationFromFields: ['authorId'],
+            relationToFields: ['id'],
+            relationOnDelete: 'Cascade',
+          }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+      createMockModel({
+        name: 'Webhook',
+        documentation: '/// @audit(create, delete)',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'url', type: 'String' }),
+        ],
+      }),
+      createMockModel({
+        name: 'AuditEvent',
+        documentation: '/// @audit-table',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'entity_type', type: 'String' }),
+          createMockField({ name: 'entity_id', type: 'String' }),
+          createMockField({ name: 'action', type: 'String' }),
+          createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
+          createMockField({ name: 'event_data', type: 'Json' }),
+          createMockField({ name: 'created_at', type: 'DateTime' }),
+          createMockField({ name: 'parent_event_id', type: 'String', isRequired: false }),
+        ],
+      }),
+    ];
+
+    const schema = parseDMMF(createMockDMMF(models));
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+
+    const clientImportPath = '../client/client.js';
+    const runtimeContent = emitRuntime(schema, clientImportPath, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+    const typesContent = emitTypes(schema, clientImportPath);
+    const cascadeGraphContent = emitCascadeGraph(cascadeGraph);
+    const indexContent = emitIndex(schema);
+
+    const auditDir = path.join(integrationDir, 'generated', 'audit-test');
+    fs.mkdirSync(auditDir, { recursive: true });
+
+    const stripTsNocheck = (s: string) => s.replace(/^\/\/ @ts-nocheck\n/m, '');
+
+    try {
+      fs.writeFileSync(path.join(auditDir, 'runtime.ts'), stripTsNocheck(runtimeContent), 'utf-8');
+      fs.writeFileSync(path.join(auditDir, 'types.ts'), stripTsNocheck(typesContent), 'utf-8');
+      fs.writeFileSync(path.join(auditDir, 'cascade-graph.ts'), cascadeGraphContent, 'utf-8');
+      fs.writeFileSync(path.join(auditDir, 'index.ts'), stripTsNocheck(indexContent), 'utf-8');
+
+      execSync(
+        `npx tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --noUnusedLocals ${path.join(auditDir, 'index.ts')}`,
+        {
+          cwd: integrationDir,
+          stdio: 'pipe',
+          encoding: 'utf-8',
+        }
+      );
+      expect(true).toBe(true);
+    } finally {
+      fs.rmSync(auditDir, { recursive: true, force: true });
+    }
+  });
 });

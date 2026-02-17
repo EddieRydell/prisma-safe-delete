@@ -1,5 +1,6 @@
 import type { ParsedModel, ParsedSchema } from '../dmmf-parser.js';
 import type { CascadeGraph } from '../cascade-graph.js';
+import { emitAuditHelpers, type AuditTableConfig } from './emit-audit.js';
 
 /**
  * Strategy for handling unique constraints on soft delete.
@@ -9,6 +10,7 @@ type UniqueStrategy = 'mangle' | 'none' | 'sentinel';
 interface EmitRuntimeOptions {
   uniqueStrategy: UniqueStrategy;
   cascadeGraph: CascadeGraph;
+  auditTable?: AuditTableConfig | null;
 }
 
 /**
@@ -43,7 +45,9 @@ export function emitRuntime(
   lines.push(`import { type PrismaClient, Prisma } from '${clientImportPath}';`);
   lines.push("import { CASCADE_GRAPH } from './cascade-graph.js';");
   const delegateTypeImports = schema.models.map(m => `Safe${m.name}Delegate`).join(', ');
-  lines.push(`import type { SafePrismaClient, SafeTransactionClient, IncludingDeletedClient, OnlyDeletedClient, ${delegateTypeImports} } from './types.js';`);
+  const hasAuditModels = schema.models.some(m => m.isAuditable);
+  const wrapOptionsImport = hasAuditModels && options.auditTable !== undefined && options.auditTable !== null ? ', WrapOptions' : '';
+  lines.push(`import type { SafePrismaClient, SafeTransactionClient, IncludingDeletedClient, OnlyDeletedClient, ${delegateTypeImports}${wrapOptionsImport} } from './types.js';`);
   lines.push('');
 
   // Emit model metadata
@@ -197,13 +201,20 @@ export function emitRuntime(
   lines.push(emitInjectFiltersFunction());
   lines.push('');
 
+  // Emit audit helpers (if audit is configured)
+  const hasAudit = options.auditTable !== undefined && options.auditTable !== null && schema.models.some((m) => m.isAuditable);
+  if (hasAudit && options.auditTable !== undefined && options.auditTable !== null) {
+    lines.push(emitAuditHelpers(schema, options.auditTable));
+    lines.push('');
+  }
+
   // Emit soft delete cascade function
   lines.push(emitSoftDeleteCascadeFunction());
   lines.push('');
 
   // Emit model delegate wrappers
   for (const model of schema.models) {
-    lines.push(emitModelDelegate(model, options));
+    lines.push(emitModelDelegate(model, options, hasAudit));
     lines.push('');
   }
 
@@ -214,11 +225,11 @@ export function emitRuntime(
   lines.push('');
 
   // Emit transaction wrapper
-  lines.push(emitTransactionWrapper(schema, options));
+  lines.push(emitTransactionWrapper(schema, options, hasAudit));
   lines.push('');
 
   // Emit main wrapper function
-  lines.push(emitWrapperFunction(schema));
+  lines.push(emitWrapperFunction(schema, hasAudit));
   lines.push('');
 
   // Emit filter helper utilities (exported for user use)
@@ -1983,7 +1994,7 @@ async function previewCascadeChildren(
 }`.trim();
 }
 
-function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): string {
+function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasAudit: boolean): string {
   const name = model.name;
   const lowerName = toLowerFirst(name);
 
@@ -2137,19 +2148,23 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       groupBy: ((args?: any) => original.groupBy(args)) as PrismaClient['${lowerName}']['groupBy'],
     },`;
 
+    // For audited models, the user-facing parameter is actorId (which also sets deleted_by).
+    // For non-audited models, the parameter is deletedBy.
+    const identityField = model.isAuditable && hasAudit ? 'actorId' : 'deletedBy';
+
     let softDeleteMethods: string;
     let previewMethod: string;
 
     if (simple) {
       // Fast path: use updateMany directly (no transaction, no per-record updates)
       const deletedByUpdate = model.deletedByField !== null
-        ? `\n      const deletedByField = ${JSON.stringify(model.deletedByField)};\n      if (deletedByField && deletedBy) {\n        updateData[deletedByField] = deletedBy;\n      }`
+        ? `\n      const deletedByField = ${JSON.stringify(model.deletedByField)};\n      if (deletedByField && ${identityField}) {\n        updateData[deletedByField] = ${identityField};\n      }`
         : '';
 
       softDeleteMethods = `
     // Soft delete methods (fast path - no cascade children, no unique mangling)
     softDelete: (async (args: any) => {
-      const { deletedBy, ...rest } = args;
+      const { ${identityField}, ...rest } = args;
       const { where, ...projection } = rest;
       const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
       const now = new Date();
@@ -2163,7 +2178,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       return { record, cascaded: {} };
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
-      const { deletedBy, ...rest } = args;
+      const { ${identityField}, ...rest } = args;
       const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdate}
       const result = await original.updateMany({
         where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
@@ -2184,13 +2199,10 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       // Complex path: use softDeleteWithCascade (transaction, per-record updates)
       softDeleteMethods = `
     // Soft delete methods (with cascade support)
-    // NOTE: deletedBy requirement is enforced at COMPILE-TIME only via TypeScript types.
-    // There is no runtime validation - callers bypassing TypeScript (e.g., plain JS) must
-    // ensure they pass deletedBy for models with deleted_by fields.
     softDelete: (async (args: any) => {
-      const { deletedBy, ...rest } = args;
+      const { ${identityField}, ...rest } = args;
       const { where, ...projection } = rest;
-      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', where, deletedBy);
+      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', where, ${identityField});
       throwIfNotFound(count, '${name}');
       // Decompose compound key for findFirst
       const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
@@ -2198,8 +2210,8 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
       return { record, cascaded };
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
-      const { deletedBy, ...rest } = args;
-      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, deletedBy);
+      const { ${identityField}, ...rest } = args;
+      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, ${identityField});
       return { count, cascaded };
     }) as Safe${name}Delegate['softDeleteMany'],`;
 
@@ -2210,15 +2222,24 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions): str
     }) as Safe${name}Delegate['softDeletePreview'],`;
     }
 
+    // For audited + soft-deletable models, we need to wrap write methods
+    // to extract actorId and write audit events
+    let auditedWriteMethods = '';
+    if (model.isAuditable && hasAudit) {
+      auditedWriteMethods = emitAuditedWriteMethods(model, lowerName, options);
+    }
+
+    const wrapOptsParam = hasAudit ? 'wrapOptions?: WrapOptions' : '';
+
     return `
 /**
  * Creates a safe delegate for ${name} with soft-delete support
  */
-function create${name}Delegate(prisma: PrismaClient): Safe${name}Delegate {
+function create${name}Delegate(prisma: PrismaClient${wrapOptsParam ? ', ' + wrapOptsParam : ''}): Safe${name}Delegate {
   const original = prisma.${lowerName};
 
   return {${readMethods}
-${writeMethods}
+${model.isAuditable && hasAudit ? auditedWriteMethods : writeMethods}
 ${softDeleteMethods}
 ${previewMethod}
 ${restoreMethods}
@@ -2228,13 +2249,274 @@ ${includingDeletedMethods}
 }`.trim();
   }
 
+  // Audit-only model (no soft-delete)
+  if (model.isAuditable && hasAudit) {
+    return emitAuditOnlyDelegate(model, lowerName, options);
+  }
+
   return `
 /**
  * Creates a delegate for ${name} (no soft-delete)
  */
-function create${name}Delegate(prisma: PrismaClient): Safe${name}Delegate {
+function create${name}Delegate(prisma: PrismaClient${hasAudit ? ', wrapOptions?: WrapOptions' : ''}): Safe${name}Delegate {
   return prisma.${lowerName};
 }`.trim();
+}
+
+/**
+ * Method descriptors for audited methods. Maps Prisma method names to their audit action
+ * and helper function name.
+ */
+interface AuditMethodDescriptor {
+  method: string;
+  action: 'create' | 'update' | 'delete' | 'upsert';
+  helper: string;
+}
+
+const AUDIT_WRITE_METHODS: AuditMethodDescriptor[] = [
+  { method: 'create', action: 'create', helper: '_auditedCreate' },
+  { method: 'createMany', action: 'create', helper: '_auditedCreateMany' },
+  { method: 'createManyAndReturn', action: 'create', helper: '_auditedCreateManyAndReturn' },
+  { method: 'update', action: 'update', helper: '_auditedUpdate' },
+  { method: 'updateMany', action: 'update', helper: '_auditedUpdateMany' },
+  { method: 'updateManyAndReturn', action: 'update', helper: '_auditedUpdateManyAndReturn' },
+  { method: 'upsert', action: 'upsert', helper: '_auditedUpsert' },
+];
+
+const AUDIT_DELETE_METHODS: AuditMethodDescriptor[] = [
+  { method: 'delete', action: 'delete', helper: '_auditedDelete' },
+  { method: 'deleteMany', action: 'delete', helper: '_auditedDeleteMany' },
+];
+
+/**
+ * Generates a single audited method call site.
+ *
+ * context.wrapInTransaction: true for main delegate (wraps in prisma.$transaction)
+ * context.softDeletable: true adds injectDeletedAtIntoToOneSelects/injectFilters/postProcessRead
+ * context.indent: indentation prefix
+ */
+function emitAuditedMethodCallSite(
+  lines: string[],
+  desc: AuditMethodDescriptor,
+  model: ParsedModel,
+  options: EmitRuntimeOptions,
+  context: {
+    wrapInTransaction: boolean;
+    softDeletable: boolean;
+    indent: string;
+    delegateExpr: string; // e.g. 'prisma' or 'tx'
+  },
+): void {
+  const { method, action, helper } = desc;
+  const name = model.name;
+  const lowerName = toLowerFirst(name);
+  const ind = context.indent;
+  const isAuditableAction = action === 'upsert' || model.auditActions.includes(action);
+
+  // For non-auditable actions, emit a simple passthrough that strips actorId
+  if (!isAuditableAction) {
+    if (context.softDeletable) {
+      emitNonAuditedSoftDeletablePassthrough(lines, method, name, lowerName, options, context);
+    } else {
+      lines.push(`${ind}${method}: (async (args: any) => {`);
+      lines.push(`${ind}  const { actorId, ...rest } = args;`);
+      lines.push(`${ind}  return ${context.delegateExpr}.${lowerName}.${method}(rest);`);
+      lines.push(`${ind}}) as Safe${name}Delegate['${method}'],`);
+    }
+    return;
+  }
+
+  // For auditable actions, call the _audited* helper
+  const needsPostProcess = context.softDeletable && ['create', 'createManyAndReturn', 'update', 'updateManyAndReturn', 'upsert'].includes(method);
+  const needsInjectFilters = context.softDeletable && ['update', 'updateMany', 'updateManyAndReturn', 'upsert'].includes(method);
+  const needsInjectToOne = context.softDeletable && ['create', 'createManyAndReturn', 'update', 'updateManyAndReturn', 'upsert'].includes(method);
+  const deletedAtField = model.deletedAtField;
+
+  lines.push(`${ind}${method}: (async (args: any) => {`);
+  lines.push(`${ind}  const { actorId, ...rest } = args;`);
+
+  // Build the args to pass to the helper
+  let argsExpr = 'rest';
+  let ppInjected = false;
+
+  if (needsInjectToOne) {
+    lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
+    ppInjected = true;
+    argsExpr = 'pp';
+  }
+
+  if (needsInjectFilters) {
+    if (method === 'upsert' && options.uniqueStrategy === 'sentinel' && deletedAtField !== null) {
+      lines.push(`${ind}  const filtered = injectFilters({`);
+      lines.push(`${ind}    ...${argsExpr},`);
+      lines.push(`${ind}    create: { ...${argsExpr}?.create, ['${deletedAtField}']: ${argsExpr}?.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
+      lines.push(`${ind}  }, '${name}');`);
+      lines.push(`${ind}  if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');`);
+    } else {
+      lines.push(`${ind}  const filtered = injectFilters(${argsExpr}, '${name}');`);
+    }
+    argsExpr = 'filtered';
+  }
+
+  // Sentinel create handling
+  if (context.softDeletable && options.uniqueStrategy === 'sentinel' && deletedAtField !== null) {
+    if (method === 'create') {
+      lines.push(`${ind}  const withSentinel = { ...${argsExpr}, data: { ...${argsExpr}?.data, ['${deletedAtField}']: ${argsExpr}?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };`);
+      argsExpr = 'withSentinel';
+    } else if (method === 'createMany' || method === 'createManyAndReturn') {
+      lines.push(`${ind}  const data = Array.isArray(${argsExpr}${ppInjected ? '?' : ''}.data)`);
+      lines.push(`${ind}    ? ${argsExpr}.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+      lines.push(`${ind}    : { ...${argsExpr}${ppInjected ? '?' : ''}.data, ['${deletedAtField}']: ${argsExpr}${ppInjected ? '?' : ''}.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+      lines.push(`${ind}  const withSentinel = { ...${argsExpr}, data };`);
+      argsExpr = 'withSentinel';
+    }
+  }
+
+  // Build the helper call
+  const txExpr = context.wrapInTransaction ? 'tx' : context.delegateExpr;
+  const delegateAccess = `${txExpr}.${lowerName}`;
+  const helperCall = `${helper}(${txExpr}, ${delegateAccess}, ${argsExpr}, '${name}', actorId ?? null, wrapOptions)`;
+
+  if (context.wrapInTransaction) {
+    if (needsPostProcess) {
+      lines.push(`${ind}  return prisma.$transaction(async (tx: Prisma.TransactionClient) => {`);
+      lines.push(`${ind}    const result = await ${helperCall};`);
+      lines.push(`${ind}    return postProcessRead(Promise.resolve(result), '${name}', ${argsExpr}, ${ppInjected ? 'injectedPaths' : '[]'});`);
+      lines.push(`${ind}  });`);
+    } else {
+      lines.push(`${ind}  return prisma.$transaction(async (tx: Prisma.TransactionClient) => ${helperCall});`);
+    }
+  } else {
+    if (needsPostProcess) {
+      lines.push(`${ind}  const result = await ${helperCall};`);
+      lines.push(`${ind}  return postProcessRead(Promise.resolve(result), '${name}', ${argsExpr}, ${ppInjected ? 'injectedPaths' : '[]'});`);
+    } else {
+      lines.push(`${ind}  return ${helperCall};`);
+    }
+  }
+
+  lines.push(`${ind}}) as Safe${name}Delegate['${method}'],`);
+}
+
+/**
+ * Emits a non-audited passthrough for a soft-deletable model method.
+ * These are methods where the action is not in the model's auditActions,
+ * so they just strip actorId and do normal soft-delete processing.
+ */
+function emitNonAuditedSoftDeletablePassthrough(
+  lines: string[],
+  method: string,
+  name: string,
+  lowerName: string,
+  _options: EmitRuntimeOptions,
+  context: {
+    wrapInTransaction: boolean;
+    indent: string;
+    delegateExpr: string;
+  },
+): void {
+  const ind = context.indent;
+  const d = context.wrapInTransaction ? `prisma.${lowerName}` : `${context.delegateExpr}.${lowerName}`;
+  // Reproduce the standard soft-deletable write method, just strip actorId first
+  lines.push(`${ind}${method}: (async (args: any) => {`);
+  lines.push(`${ind}  const { actorId, ...rest } = args;`);
+
+  switch (method) {
+    case 'create': {
+      lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
+      lines.push(`${ind}  return postProcessRead(${d}.create(pp), '${name}', pp, injectedPaths) as any;`);
+      break;
+    }
+    case 'createMany': {
+      lines.push(`${ind}  return ${d}.createMany(rest);`);
+      break;
+    }
+    case 'createManyAndReturn': {
+      lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
+      lines.push(`${ind}  return postProcessRead(${d}.createManyAndReturn(pp), '${name}', pp, injectedPaths) as any;`);
+      break;
+    }
+    case 'update': {
+      lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
+      lines.push(`${ind}  const filtered = injectFilters(pp, '${name}');`);
+      lines.push(`${ind}  return postProcessRead(${d}.update(filtered), '${name}', filtered, injectedPaths) as any;`);
+      break;
+    }
+    case 'updateMany': {
+      lines.push(`${ind}  return ${d}.updateMany(injectFilters(rest, '${name}'));`);
+      break;
+    }
+    case 'updateManyAndReturn': {
+      lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
+      lines.push(`${ind}  const filtered = injectFilters(pp, '${name}');`);
+      lines.push(`${ind}  return postProcessRead(${d}.updateManyAndReturn(filtered), '${name}', filtered, injectedPaths) as any;`);
+      break;
+    }
+    case 'upsert': {
+      lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
+      lines.push(`${ind}  const filtered = injectFilters(pp, '${name}');`);
+      lines.push(`${ind}  return postProcessRead(${d}.upsert(filtered), '${name}', filtered, injectedPaths) as any;`);
+      break;
+    }
+  }
+
+  lines.push(`${ind}}) as Safe${name}Delegate['${method}'],`);
+}
+
+/**
+ * Emits audited write methods for a soft-deletable + audited model (main delegate).
+ * Uses shared _audited* helpers via emitAuditedMethodCallSite.
+ */
+function emitAuditedWriteMethods(model: ParsedModel, _lowerName: string, options: EmitRuntimeOptions): string {
+  const lines: string[] = [];
+  const context = {
+    wrapInTransaction: true,
+    softDeletable: true,
+    indent: '    ',
+    delegateExpr: 'prisma',
+  };
+
+  for (const desc of AUDIT_WRITE_METHODS) {
+    emitAuditedMethodCallSite(lines, desc, model, options, context);
+  }
+
+  lines.push(`    fields: original.fields,`);
+
+  return '\n' + lines.join('\n');
+}
+
+/**
+ * Emits a delegate for an audit-only model (no soft-delete).
+ * Uses shared _audited* helpers via emitAuditedMethodCallSite.
+ */
+function emitAuditOnlyDelegate(model: ParsedModel, lowerName: string, options: EmitRuntimeOptions): string {
+  const name = model.name;
+  const lines: string[] = [];
+  const allDescs = [...AUDIT_WRITE_METHODS, ...AUDIT_DELETE_METHODS];
+  const context = {
+    wrapInTransaction: true,
+    softDeletable: false,
+    indent: '    ',
+    delegateExpr: 'prisma',
+  };
+
+  lines.push(`/**`);
+  lines.push(` * Creates an audit-enabled delegate for ${name}`);
+  lines.push(` */`);
+  lines.push(`function create${name}Delegate(prisma: PrismaClient, wrapOptions?: WrapOptions): Safe${name}Delegate {`);
+  lines.push(`  const original = prisma.${lowerName};`);
+  lines.push(``);
+  lines.push(`  return {`);
+  lines.push(`    ...original,`);
+
+  for (const desc of allDescs) {
+    emitAuditedMethodCallSite(lines, desc, model, options, context);
+  }
+
+  lines.push(`  } as Safe${name}Delegate;`);
+  lines.push(`}`);
+
+  return lines.join('\n');
 }
 
 function emitIncludingDeletedClient(schema: ParsedSchema): string {
@@ -2319,12 +2601,13 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
   return lines.join('\n');
 }
 
-function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOptions): string {
+function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOptions, hasAudit: boolean): string {
   const lines: string[] = [];
   lines.push('/**');
   lines.push(' * Wraps a transaction client with soft-delete filtering and full API');
   lines.push(' */');
-  lines.push('function wrapTransactionClient(tx: Prisma.TransactionClient): SafeTransactionClient {');
+  const wrapOptsParam = hasAudit ? ', wrapOptions?: WrapOptions' : '';
+  lines.push(`function wrapTransactionClient(tx: Prisma.TransactionClient${wrapOptsParam}): SafeTransactionClient {`);
   lines.push('  return {');
 
   for (const model of schema.models) {
@@ -2378,6 +2661,19 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`      aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`      groupBy: ((...args: any[]) => tx.${lowerName}.groupBy(injectFilters(args[0], '${model.name}'))) as PrismaClient['${lowerName}']['groupBy'],`);
       // Write operations with to-one post-processing
+      if (model.isAuditable && hasAudit) {
+        // Audited soft-deletable model: use shared _audited* helpers with tx directly
+        const txAuditContext = {
+          wrapInTransaction: false,
+          softDeletable: true,
+          indent: '      ',
+          delegateExpr: 'tx',
+        };
+        for (const desc of AUDIT_WRITE_METHODS) {
+          emitAuditedMethodCallSite(lines, desc, model, options, txAuditContext);
+        }
+      } else {
+      // Non-audited: standard write operations with to-one post-processing
       if (options.uniqueStrategy === 'sentinel') {
         lines.push(`      create: ((...args: any[]) => {`);
         lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
@@ -2436,20 +2732,23 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`        return postProcessRead(tx.${lowerName}.upsert(filtered), '${model.name}', filtered, injectedPaths) as any;`);
         lines.push(`      }) as PrismaClient['${lowerName}']['upsert'],`);
       }
+      }
       lines.push(`      fields: tx.${lowerName}.fields,`);
 
+      // For audited models, use actorId instead of deletedBy
+      const identityField = model.isAuditable && hasAudit ? 'actorId' : 'deletedBy';
       if (simple) {
         // Fast path: use updateMany directly
         lines.push(`      softDelete: (async (args: any) => {`);
-        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const { ${identityField}, ...rest } = args;`);
         lines.push(`        const { where, ...projection } = rest;`);
         lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
         lines.push(`        const now = new Date();`);
         lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };`);
         if (model.deletedByField !== null) {
           lines.push(`        const deletedByField = ${JSON.stringify(model.deletedByField)};`);
-          lines.push(`        if (deletedByField && deletedBy) {`);
-          lines.push(`          updateData[deletedByField] = deletedBy;`);
+          lines.push(`        if (deletedByField && ${identityField}) {`);
+          lines.push(`          updateData[deletedByField] = ${identityField};`);
           lines.push(`        }`);
         }
         lines.push(`        const result = await tx.${lowerName}.updateMany({`);
@@ -2461,12 +2760,12 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`        return { record, cascaded: {} };`);
         lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
         lines.push(`      softDeleteMany: (async (args: any) => {`);
-        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const { ${identityField}, ...rest } = args;`);
         lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };`);
         if (model.deletedByField !== null) {
           lines.push(`        const deletedByField = ${JSON.stringify(model.deletedByField)};`);
-          lines.push(`        if (deletedByField && deletedBy) {`);
-          lines.push(`          updateData[deletedByField] = deletedBy;`);
+          lines.push(`        if (deletedByField && ${identityField}) {`);
+          lines.push(`          updateData[deletedByField] = ${identityField};`);
           lines.push(`        }`);
         }
         lines.push(`        const result = await tx.${lowerName}.updateMany({`);
@@ -2485,17 +2784,17 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       } else {
         // Complex path: use softDeleteWithCascadeInTx
         lines.push(`      softDelete: (async (args: any) => {`);
-        lines.push(`        const { deletedBy, ...rest } = args;`);
+        lines.push(`        const { ${identityField}, ...rest } = args;`);
         lines.push(`        const { where, ...projection } = rest;`);
-        lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', where, deletedBy);`);
+        lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', where, ${identityField});`);
         lines.push(`        throwIfNotFound(count, '${model.name}');`);
         lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
         lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });`);
         lines.push(`        return { record, cascaded };`);
         lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
         lines.push(`      softDeleteMany: (async (args: any) => {`);
-        lines.push(`        const { deletedBy, ...rest } = args;`);
-        lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, deletedBy);`);
+        lines.push(`        const { ${identityField}, ...rest } = args;`);
+        lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, ${identityField});`);
         lines.push(`        return { count, cascaded };`);
         lines.push(`      }) as Safe${model.name}Delegate['softDeleteMany'],`);
         // Preview (complex path - cascade preview)
@@ -2532,6 +2831,21 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`        groupBy: ((args?: any) => tx.${lowerName}.groupBy(args)) as PrismaClient['${lowerName}']['groupBy'],`);
       lines.push(`      },`);
       lines.push(`    },`);
+    } else if (model.isAuditable && hasAudit) {
+      // Audit-only model in transaction: use shared _audited* helpers with tx directly
+      lines.push(`    ${lowerName}: {`);
+      lines.push(`      ...tx.${lowerName},`);
+      const txAuditOnlyContext = {
+        wrapInTransaction: false,
+        softDeletable: false,
+        indent: '      ',
+        delegateExpr: 'tx',
+      };
+      const allTxDescs = [...AUDIT_WRITE_METHODS, ...AUDIT_DELETE_METHODS];
+      for (const desc of allTxDescs) {
+        emitAuditedMethodCallSite(lines, desc, model, options, txAuditOnlyContext);
+      }
+      lines.push(`    } as Safe${model.name}Delegate,`);
     } else {
       lines.push(`    ${lowerName}: tx.${lowerName},`);
     }
@@ -2612,17 +2926,26 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
   return lines.join('\n');
 }
 
-function emitWrapperFunction(schema: ParsedSchema): string {
+function emitWrapperFunction(schema: ParsedSchema, hasAudit: boolean): string {
   const lines: string[] = [];
   lines.push('/**');
   lines.push(' * Wraps a PrismaClient with soft-delete functionality');
   lines.push(' */');
-  lines.push('export function wrapPrismaClient(prisma: PrismaClient): SafePrismaClient {');
+
+  if (hasAudit) {
+    lines.push('export function wrapPrismaClient(prisma: PrismaClient, wrapOptions?: WrapOptions): SafePrismaClient {');
+  } else {
+    lines.push('export function wrapPrismaClient(prisma: PrismaClient): SafePrismaClient {');
+  }
   lines.push('  return {');
 
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    lines.push(`    ${lowerName}: create${model.name}Delegate(prisma),`);
+    if (hasAudit && (model.isSoftDeletable || model.isAuditable)) {
+      lines.push(`    ${lowerName}: create${model.name}Delegate(prisma, wrapOptions),`);
+    } else {
+      lines.push(`    ${lowerName}: create${model.name}Delegate(prisma${hasAudit ? ', wrapOptions' : ''}),`);
+    }
   }
 
   lines.push('');
@@ -2634,7 +2957,11 @@ function emitWrapperFunction(schema: ParsedSchema): string {
   lines.push('      if (typeof arg === "function") {');
   lines.push('        // Interactive transaction - wrap the callback to provide safe delegates');
   lines.push('        return prisma.$transaction((tx: Prisma.TransactionClient) => {');
-  lines.push('          const wrappedTx = wrapTransactionClient(tx);');
+  if (hasAudit) {
+    lines.push('          const wrappedTx = wrapTransactionClient(tx, wrapOptions);');
+  } else {
+    lines.push('          const wrappedTx = wrapTransactionClient(tx);');
+  }
   lines.push('          return arg(wrappedTx);');
   lines.push('        }, options);');
   lines.push('      }');

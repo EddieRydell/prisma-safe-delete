@@ -50,25 +50,56 @@ function emitModelTypes(model: ParsedModel): string[] {
   const lowerName = toLowerFirst(name);
 
   if (model.isSoftDeletable) {
-    // deletedBy is required if model has deleted_by field, optional otherwise.
-    // NOTE: This is COMPILE-TIME enforcement only via TypeScript. No runtime validation.
-    // Plain JavaScript callers must ensure they pass deletedBy appropriately.
-    const deletedByType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
+    // For audited models, actorId replaces deletedBy
+    // For non-audited models, deletedBy stays as-is
+    let softDeleteIdentityType: string;
+    if (model.isAuditable) {
+      softDeleteIdentityType = '{ actorId?: string | null }';
+    } else {
+      softDeleteIdentityType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
+    }
 
     // Emit includingDeleted delegate type first
     lines.push(...emitIncludingDeletedDelegateType(name, lowerName));
     lines.push('');
 
+    // Determine which write methods to omit from the base Prisma type for re-typing
+    const omittedMethods = ['delete', 'deleteMany'];
+    if (model.isAuditable) {
+      omittedMethods.push('create', 'createMany', 'createManyAndReturn', 'update', 'updateMany', 'updateManyAndReturn', 'upsert');
+    }
+    const omitStr = omittedMethods.map((m) => `'${m}'`).join(' | ');
+
     // Soft-deletable model gets modified delegate type
     lines.push(`/** Soft-delete enabled delegate for ${name} */`);
     lines.push(`export type Safe${name}Delegate = Omit<`);
     lines.push(`  PrismaClient['${lowerName}'],`);
-    lines.push(`  'delete' | 'deleteMany'`);
+    lines.push(`  ${omitStr}`);
     lines.push(`> & {`);
+
+    // If audited, re-type write methods with actorId
+    if (model.isAuditable) {
+      const actorIdParam = '{ actorId?: string | null }';
+      lines.push(`  /** Create a ${name} record (audited) */`);
+      lines.push(`  create: <T extends Prisma.${name}CreateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+      lines.push(`  /** Create multiple ${name} records (audited) */`);
+      lines.push(`  createMany: (args: Prisma.${name}CreateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+      lines.push(`  /** Create multiple ${name} records and return them (audited) */`);
+      lines.push(`  createManyAndReturn: <T extends Prisma.${name}CreateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
+      lines.push(`  /** Update a ${name} record (audited) */`);
+      lines.push(`  update: <T extends Prisma.${name}UpdateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+      lines.push(`  /** Update multiple ${name} records (audited) */`);
+      lines.push(`  updateMany: (args: Prisma.${name}UpdateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+      lines.push(`  /** Update multiple ${name} records and return them (audited) */`);
+      lines.push(`  updateManyAndReturn: <T extends Prisma.${name}UpdateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
+      lines.push(`  /** Upsert a ${name} record (audited - determines create vs update at runtime) */`);
+      lines.push(`  upsert: <T extends Prisma.${name}UpsertArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+    }
+
     lines.push(`  /** Soft delete a single ${name} record with cascade */`);
-    lines.push(`  softDelete: <T extends Prisma.${name}DeleteArgs>(args: T & ${deletedByType}) => Promise<{ record: Prisma.${name}GetPayload<T>; cascaded: CascadeResult }>;`);
+    lines.push(`  softDelete: <T extends Prisma.${name}DeleteArgs>(args: T & ${softDeleteIdentityType}) => Promise<{ record: Prisma.${name}GetPayload<T>; cascaded: CascadeResult }>;`);
     lines.push(`  /** Soft delete multiple ${name} records with cascade */`);
-    lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & ${deletedByType}) => Promise<{ count: number; cascaded: CascadeResult }>;`);
+    lines.push(`  softDeleteMany: (args: Prisma.${name}DeleteManyArgs & ${softDeleteIdentityType}) => Promise<{ count: number; cascaded: CascadeResult }>;`);
     lines.push(`  /** Preview what would be soft deleted (read-only, no writes) */`);
     lines.push(`  softDeletePreview: (args: Prisma.${name}DeleteManyArgs) => Promise<{ wouldDelete: CascadeResult }>;`);
     lines.push(`  /** Restore a soft-deleted ${name} record (unmangles unique fields) */`);
@@ -84,8 +115,38 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  /** Query including soft-deleted records */`);
     lines.push(`  includingDeleted: IncludingDeleted${name}Delegate;`);
     lines.push(`};`);
+  } else if (model.isAuditable) {
+    // Audited but NOT soft-deletable: intercept delete/deleteMany + add actorId to mutations
+    const actorIdParam = '{ actorId?: string | null }';
+    const omittedMethods = ['create', 'createMany', 'createManyAndReturn', 'update', 'updateMany', 'updateManyAndReturn', 'upsert', 'delete', 'deleteMany'];
+    const omitStr = omittedMethods.map((m) => `'${m}'`).join(' | ');
+
+    lines.push(`/** Audit-enabled delegate for ${name} */`);
+    lines.push(`export type Safe${name}Delegate = Omit<`);
+    lines.push(`  PrismaClient['${lowerName}'],`);
+    lines.push(`  ${omitStr}`);
+    lines.push(`> & {`);
+    lines.push(`  /** Create a ${name} record (audited) */`);
+    lines.push(`  create: <T extends Prisma.${name}CreateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+    lines.push(`  /** Create multiple ${name} records (audited) */`);
+    lines.push(`  createMany: (args: Prisma.${name}CreateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Create multiple ${name} records and return them (audited) */`);
+    lines.push(`  createManyAndReturn: <T extends Prisma.${name}CreateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
+    lines.push(`  /** Update a ${name} record (audited) */`);
+    lines.push(`  update: <T extends Prisma.${name}UpdateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+    lines.push(`  /** Update multiple ${name} records (audited) */`);
+    lines.push(`  updateMany: (args: Prisma.${name}UpdateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`  /** Update multiple ${name} records and return them (audited) */`);
+    lines.push(`  updateManyAndReturn: <T extends Prisma.${name}UpdateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
+    lines.push(`  /** Upsert a ${name} record (audited) */`);
+    lines.push(`  upsert: <T extends Prisma.${name}UpsertArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+    lines.push(`  /** Delete a single ${name} record (audited) */`);
+    lines.push(`  delete: <T extends Prisma.${name}DeleteArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+    lines.push(`  /** Delete multiple ${name} records (audited) */`);
+    lines.push(`  deleteMany: (args: Prisma.${name}DeleteManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+    lines.push(`};`);
   } else {
-    // Non-soft-deletable model keeps original type
+    // Non-soft-deletable, non-auditable model keeps original type
     lines.push(`/** Standard delegate for ${name} (no soft-delete) */`);
     lines.push(`export type Safe${name}Delegate = PrismaClient['${lowerName}'];`);
   }
@@ -96,12 +157,23 @@ function emitModelTypes(model: ParsedModel): string[] {
 function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   const lines: string[] = [];
 
+  // Emit WrapOptions type if there are auditable models
+  const hasAuditableModels = schema.models.some((m) => m.isAuditable);
+  if (hasAuditableModels) {
+    lines.push('/** Options for configuring the wrapped Prisma client */');
+    lines.push('export interface WrapOptions {');
+    lines.push('  /** Provide additional context fields for audit events */');
+    lines.push('  auditContext?: () => Record<string, unknown> | Promise<Record<string, unknown>>;');
+    lines.push('}');
+    lines.push('');
+  }
+
   // First emit the SafeTransactionClient type for typed transactions
   lines.push('/** Type-safe transaction client with soft-delete support */');
   lines.push('export interface SafeTransactionClient {');
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    if (model.isSoftDeletable) {
+    if (model.isSoftDeletable || model.isAuditable) {
       lines.push(`  ${lowerName}: Safe${model.name}Delegate;`);
     } else {
       lines.push(`  ${lowerName}: PrismaClient['${lowerName}'];`);

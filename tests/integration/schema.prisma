@@ -59,3 +59,29 @@ model Customer {
   deleted_at DateTime?
   deleted_by String?
 }
+
+/// @audit
+model Project {
+  id         String    @id @default(cuid())
+  name       String
+  deleted_at DateTime?
+  deleted_by String?
+}
+
+/// @audit(create, delete)
+model Webhook {
+  id   String @id @default(cuid())
+  url  String
+}
+
+/// @audit-table
+model AuditEvent {
+  id               String   @id @default(cuid())
+  entity_type      String
+  entity_id        String
+  action           String
+  actor_id         String?
+  event_data       Json
+  created_at       DateTime @default(now())
+  parent_event_id  String?
+}
