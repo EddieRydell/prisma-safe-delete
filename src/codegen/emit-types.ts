@@ -1,4 +1,5 @@
 import type { ParsedModel, ParsedSchema } from '../dmmf-parser.js';
+import { resolveAuditTableConfig, prismaTypeToTsType } from './emit-audit.js';
 
 /**
  * Generates the SafePrismaClient type definitions
@@ -20,6 +21,26 @@ export function emitTypes(schema: ParsedSchema, clientImportPath: string): strin
   lines.push('/** Result of cascade operations: maps model names to the number of affected records */');
   lines.push('export type CascadeResult = Record<string, number>;');
   lines.push('');
+
+  // Emit AuditContext type if there are auditable models
+  const hasAuditableModels = schema.models.some((m) => m.isAuditable);
+  if (hasAuditableModels) {
+    const auditConfig = resolveAuditTableConfig(schema);
+    if (auditConfig !== null && auditConfig.extraColumns.length > 0) {
+      lines.push('/** Typed context for audit events, derived from extra columns on the audit table */');
+      lines.push('export interface AuditContext {');
+      for (const col of auditConfig.extraColumns) {
+        const tsType = prismaTypeToTsType(col.prismaType);
+        // All fields are optional in AuditContext (even required columns) since the global callback can provide defaults
+        lines.push(`  ${col.name}?: ${tsType} | null;`);
+      }
+      lines.push('}');
+    } else {
+      lines.push('/** Context for audit events */');
+      lines.push('export type AuditContext = Record<string, unknown>;');
+    }
+    lines.push('');
+  }
 
   // Generate model-specific types
   for (const model of schema.models) {
@@ -54,7 +75,7 @@ function emitModelTypes(model: ParsedModel): string[] {
     // For non-audited models, deletedBy stays as-is
     let softDeleteIdentityType: string;
     if (model.isAuditable) {
-      softDeleteIdentityType = '{ actorId?: string | null }';
+      softDeleteIdentityType = '{ actorId?: string | null; auditContext?: AuditContext }';
     } else {
       softDeleteIdentityType = model.deletedByField !== null ? '{ deletedBy: string }' : '{ deletedBy?: string }';
     }
@@ -77,9 +98,9 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  ${omitStr}`);
     lines.push(`> & {`);
 
-    // If audited, re-type write methods with actorId
+    // If audited, re-type write methods with actorId + auditContext
     if (model.isAuditable) {
-      emitAuditedMutationTypes(lines, name, '{ actorId?: string | null }');
+      emitAuditedMutationTypes(lines, name, '{ actorId?: string | null; auditContext?: AuditContext }');
     }
 
     lines.push(`  /** Soft delete a single ${name} record with cascade */`);
@@ -90,27 +111,27 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  softDeletePreview: (args: Prisma.${name}DeleteManyArgs) => Promise<{ wouldDelete: CascadeResult }>;`);
     lines.push(`  /** Restore a soft-deleted ${name} record (unmangles unique fields) */`);
     if (model.isAuditable) {
-      lines.push(`  restore: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null }) => Promise<Prisma.${name}GetPayload<T> | null>;`);
+      lines.push(`  restore: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null; auditContext?: AuditContext }) => Promise<Prisma.${name}GetPayload<T> | null>;`);
     } else {
       lines.push(`  restore: <T extends Prisma.${name}DeleteArgs>(args: T) => Promise<Prisma.${name}GetPayload<T> | null>;`);
     }
     lines.push(`  /** Restore multiple soft-deleted ${name} records */`);
     if (model.isAuditable) {
-      lines.push(`  restoreMany: (args: Prisma.${name}DeleteManyArgs & { actorId?: string | null }) => Promise<Prisma.BatchPayload>;`);
+      lines.push(`  restoreMany: (args: Prisma.${name}DeleteManyArgs & { actorId?: string | null; auditContext?: AuditContext }) => Promise<Prisma.BatchPayload>;`);
     } else {
       lines.push(`  restoreMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
     }
     lines.push(`  /** Restore a soft-deleted ${name} record AND all cascade-deleted children (matched by deleted_at timestamp) */`);
     if (model.isAuditable) {
-      lines.push(`  restoreCascade: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null }) => Promise<{ record: Prisma.${name}GetPayload<T> | null; cascaded: CascadeResult }>;`);
+      lines.push(`  restoreCascade: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null; auditContext?: AuditContext }) => Promise<{ record: Prisma.${name}GetPayload<T> | null; cascaded: CascadeResult }>;`);
     } else {
       lines.push(`  restoreCascade: <T extends Prisma.${name}DeleteArgs>(args: T) => Promise<{ record: Prisma.${name}GetPayload<T> | null; cascaded: CascadeResult }>;`);
     }
     lines.push(`  /** Hard delete a single ${name} record (PERMANENT - bypasses soft delete) */`);
     if (model.isAuditable) {
-      lines.push(`  __dangerousHardDelete: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null }) => Promise<Prisma.${name}GetPayload<T>>;`);
+      lines.push(`  __dangerousHardDelete: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null; auditContext?: AuditContext }) => Promise<Prisma.${name}GetPayload<T>>;`);
       lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);
-      lines.push(`  __dangerousHardDeleteMany: (args: Prisma.${name}DeleteManyArgs & { actorId?: string | null }) => Promise<Prisma.BatchPayload>;`);
+      lines.push(`  __dangerousHardDeleteMany: (args: Prisma.${name}DeleteManyArgs & { actorId?: string | null; auditContext?: AuditContext }) => Promise<Prisma.BatchPayload>;`);
     } else {
       lines.push(`  __dangerousHardDelete: PrismaClient['${lowerName}']['delete'];`);
       lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);
@@ -121,7 +142,7 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`};`);
   } else if (model.isAuditable) {
     // Audited but NOT soft-deletable: intercept delete/deleteMany + add actorId to mutations
-    const actorIdParam = '{ actorId?: string | null }';
+    const actorIdParam = '{ actorId?: string | null; auditContext?: AuditContext }';
     const omittedMethods = ['create', 'createMany', 'createManyAndReturn', 'update', 'updateMany', 'updateManyAndReturn', 'upsert', 'delete', 'deleteMany'];
     const omitStr = omittedMethods.map((m) => `'${m}'`).join(' | ');
 
@@ -167,12 +188,12 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   const lines: string[] = [];
 
   // Emit WrapOptions type if there are auditable models
-  const hasAuditableModels = schema.models.some((m) => m.isAuditable);
-  if (hasAuditableModels) {
+  const hasAuditableModelsForWrap = schema.models.some((m) => m.isAuditable);
+  if (hasAuditableModelsForWrap) {
     lines.push('/** Options for configuring the wrapped Prisma client */');
     lines.push('export interface WrapOptions {');
-    lines.push('  /** Provide additional context fields for audit events */');
-    lines.push('  auditContext?: () => Record<string, unknown> | Promise<Record<string, unknown>>;');
+    lines.push('  /** Provide additional context fields for audit events (global, per-call overrides take precedence) */');
+    lines.push('  auditContext?: () => AuditContext | Promise<AuditContext>;');
     lines.push('}');
     lines.push('');
   }

@@ -84,4 +84,5 @@ model AuditEvent {
   event_data       Json
   created_at       DateTime @default(now())
   parent_event_id  String?
+  source           String?
 }

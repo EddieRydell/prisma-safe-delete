@@ -5112,6 +5112,87 @@ describe('E2E: Real database tests', () => {
       expect(events).toHaveLength(1);
       expect(events[0].actor_id).toBe('rc-actor');
     });
+
+    it('per-call auditContext sets extra columns', async () => {
+      await auditSafePrisma.webhook.create({
+        data: { url: 'https://example.com/ctx-test' },
+        actorId: 'ctx-actor',
+        auditContext: { source: 'per-call-source' },
+      });
+      const event = await prisma.auditEvent.findFirst({
+        where: { entity_type: 'Webhook', action: 'create', actor_id: 'ctx-actor' },
+        orderBy: { created_at: 'desc' },
+      });
+      expect(event).not.toBeNull();
+      expect(event?.source).toBe('per-call-source');
+    });
+
+    it('per-call auditContext overrides global auditContext', async () => {
+      // Global sets source: 'e2e-test', per-call overrides to 'override'
+      await auditSafePrisma.webhook.create({
+        data: { url: 'https://example.com/override-test' },
+        actorId: 'override-actor',
+        auditContext: { source: 'override' },
+      });
+      const event = await prisma.auditEvent.findFirst({
+        where: { entity_type: 'Webhook', action: 'create', actor_id: 'override-actor' },
+        orderBy: { created_at: 'desc' },
+      });
+      expect(event).not.toBeNull();
+      expect(event?.source).toBe('override');
+    });
+
+    it('cascade soft delete writes parent_event_id on child audit events', async () => {
+      // Organization -> Project (both auditable for delete)
+      await prisma.organization.create({
+        data: { id: 'org-cascade-audit', name: 'Cascade Audit Org' },
+      });
+      await auditSafePrisma.project.create({
+        data: { id: 'proj-cascade-audit', name: 'Cascade Audit Project', organizationId: 'org-cascade-audit' },
+        actorId: 'cascade-actor',
+      });
+
+      // Soft delete the org (cascades to project)
+      await auditSafePrisma.organization.softDelete({
+        where: { id: 'org-cascade-audit' },
+        actorId: 'cascade-actor',
+      });
+
+      // Find the parent (org) audit event
+      const orgEvent = await prisma.auditEvent.findFirst({
+        where: { entity_type: 'Organization', entity_id: 'org-cascade-audit', action: 'soft_delete' },
+      });
+      expect(orgEvent).not.toBeNull();
+
+      // Find the child (project) audit event
+      const projEvent = await prisma.auditEvent.findFirst({
+        where: { entity_type: 'Project', entity_id: 'proj-cascade-audit', action: 'soft_delete' },
+      });
+      expect(projEvent).not.toBeNull();
+      // Child event should reference parent event's ID
+      expect(projEvent?.parent_event_id).toBe(orgEvent?.id);
+    });
+
+    it('cascade soft delete sets deleted_by on child records with deleted_by field', async () => {
+      // Project has a deleted_by field; Organization.softDelete with actorId should populate it
+      await prisma.organization.create({
+        data: { id: 'org-deleted-by', name: 'Deleted By Org' },
+      });
+      await prisma.project.create({
+        data: { id: 'proj-deleted-by', name: 'Deleted By Project', organizationId: 'org-deleted-by' },
+      });
+
+      // Soft delete org with actorId — Project.deleted_by should be set
+      await auditSafePrisma.organization.softDelete({
+        where: { id: 'org-deleted-by' },
+        actorId: 'deleted-by-actor',
+      });
+
+      const project = await prisma.project.findUnique({ where: { id: 'proj-deleted-by' } });
+      expect(project).not.toBeNull();
+      expect(project?.deleted_at).not.toBeNull();
+      expect(project?.deleted_by).toBe('deleted-by-actor');
+    });
   });
 
   describe('softDelete return postProcessing', () => {

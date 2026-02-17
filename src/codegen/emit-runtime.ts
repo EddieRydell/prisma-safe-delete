@@ -46,8 +46,8 @@ export function emitRuntime(
   lines.push("import { CASCADE_GRAPH } from './cascade-graph.js';");
   const delegateTypeImports = schema.models.map(m => `Safe${m.name}Delegate`).join(', ');
   const hasAuditModels = schema.models.some(m => m.isAuditable);
-  const wrapOptionsImport = hasAuditModels && options.auditTable !== undefined && options.auditTable !== null ? ', WrapOptions' : '';
-  lines.push(`import type { SafePrismaClient, SafeTransactionClient, IncludingDeletedClient, OnlyDeletedClient, ${delegateTypeImports}${wrapOptionsImport} } from './types.js';`);
+  const auditTypeImports = hasAuditModels && options.auditTable !== undefined && options.auditTable !== null ? ', WrapOptions' : '';
+  lines.push(`import type { SafePrismaClient, SafeTransactionClient, IncludingDeletedClient, OnlyDeletedClient, ${delegateTypeImports}${auditTypeImports} } from './types.js';`);
   lines.push('');
 
   // Emit model metadata
@@ -214,7 +214,7 @@ export function emitRuntime(
   const needsSoftDeleteWithCascadeWrapper = schema.models.some(
     m => m.isSoftDeletable && m.deletedAtField !== null && !isSimpleModel(m, options) && !(m.isAuditable && hasAudit)
   );
-  lines.push(emitSoftDeleteCascadeFunction(needsSoftDeleteWithCascadeWrapper));
+  lines.push(emitSoftDeleteCascadeFunction(needsSoftDeleteWithCascadeWrapper, hasAudit));
   lines.push('');
 
   // Emit model delegate wrappers
@@ -1189,7 +1189,7 @@ function injectIntoRelations(
 }`.trim();
 }
 
-function emitSoftDeleteCascadeFunction(includeWrapper = true): string {
+function emitSoftDeleteCascadeFunction(includeWrapper = true, hasAudit = false): string {
   const wrapperFn = includeWrapper ? `
 /**
  * Performs a soft delete with cascade (with its own transaction)
@@ -1205,6 +1205,16 @@ async function softDeleteWithCascade(
   });
 }
 ` : '';
+  // Audit params are only emitted when hasAudit is true (avoids --noUnusedLocals errors)
+  const auditParams = hasAudit ? `
+  auditActorId?: string | null,
+  auditWrapOptions?: any,
+  auditCallCtx?: Record<string, unknown>,` : '';
+  const auditCascadeParams = hasAudit ? `
+  auditParentEventIds?: string[],
+  auditActorId?: string | null,
+  auditWrapOptions?: any,
+  auditCallCtx?: Record<string, unknown>,` : '';
   return `${wrapperFn}
 /**
  * Performs a soft delete with cascade within an existing transaction
@@ -1213,7 +1223,7 @@ async function softDeleteWithCascadeInTx(
   tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>,
-  deletedBy?: string
+  deletedBy?: string,${auditParams}
 ): Promise<{ count: number; cascaded: Record<string, number> }> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) {
@@ -1223,7 +1233,7 @@ async function softDeleteWithCascadeInTx(
   const now = new Date();
   const lowerModelName = modelName.charAt(0).toLowerCase() + modelName.slice(1);
 
-  // Find all records to delete
+  // Find all records to delete (pre-mutation snapshots for audit)
   const delegate = tx[lowerModelName as keyof typeof tx] as any;
   // Decompose compound key where clause if needed
   const decomposedWhere = decomposeCompoundKeyWhere(modelName, where);
@@ -1240,9 +1250,24 @@ async function softDeleteWithCascadeInTx(
   const pkValues = records.map((r: Record<string, unknown>) =>
     extractPrimaryKey(modelName, r)
   );
-
+${hasAudit ? `
+  // Write audit events for parent records BEFORE mutation (pre-mutation snapshots)
+  let parentEventIds: string[] | undefined;
+  if (auditActorId !== undefined && isAuditable(modelName, 'delete')) {
+    const ctx = await _mergeAuditContext(auditWrapOptions, auditCallCtx);
+    parentEventIds = [];
+    for (const record of records) {
+      const eventId = await writeAuditEvent(
+        tx, modelName, getEntityId(modelName, record), 'soft_delete',
+        auditActorId, record, undefined, ctx,
+      );
+      parentEventIds.push(eventId);
+    }
+  }
+` : ''}
   // Cascade to children (depth-first)
-  const cascaded = await cascadeToChildren(tx, modelName, pkValues, now, deletedBy);
+  const cascaded = await cascadeToChildren(tx, modelName, pkValues, now, deletedBy${hasAudit ? `,
+    parentEventIds, auditActorId, auditWrapOptions, auditCallCtx` : ''});
 
   // Update parent records
   const needsMangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(modelName).length > 0);
@@ -1304,7 +1329,7 @@ async function cascadeToChildren(
   parentModel: string,
   parentPkValues: Record<string, unknown>[],
   deletedAt: Date,
-  deletedBy?: string
+  deletedBy?: string,${auditCascadeParams}
 ): Promise<Record<string, number>> {
   const children = CASCADE_GRAPH[parentModel] ?? [];
   const cascaded: Record<string, number> = {};
@@ -1329,7 +1354,7 @@ async function cascadeToChildren(
       return condition;
     });
 
-    // Find child records
+    // Find child records (pre-mutation snapshots)
     const childRecords = await childDelegate.findMany({
       where: {
         OR: childWhereConditions,
@@ -1343,9 +1368,55 @@ async function cascadeToChildren(
     const childPkValues = childRecords.map((r: Record<string, unknown>) =>
       extractPrimaryKey(child.model, r)
     );
-
+${hasAudit ? `
+    // Write audit events for child records BEFORE mutation, with parent_event_id linking
+    let childEventIds: string[] | undefined;
+    if (auditActorId !== undefined && isAuditable(child.model, 'delete') && auditParentEventIds) {
+      const ctx = await _mergeAuditContext(auditWrapOptions, auditCallCtx);
+      childEventIds = [];
+      for (const childRecord of childRecords) {
+        // Find which parent this child belongs to (match FK values)
+        let parentEventId: string | undefined;
+        for (let pi = 0; pi < parentPkValues.length; pi++) {
+          const pkVal = parentPkValues[pi];
+          if (!pkVal) continue;
+          let matches = true;
+          for (let fi = 0; fi < child.foreignKey.length; fi++) {
+            const fk = child.foreignKey[fi];
+            const pk = child.parentKey[fi];
+            if (fk && pk && String(childRecord[fk]) !== String(pkVal[pk])) {
+              matches = false;
+              break;
+            }
+          }
+          if (matches) {
+            parentEventId = auditParentEventIds[pi];
+            break;
+          }
+        }
+        const eventId = await writeAuditEvent(
+          tx, child.model, getEntityId(child.model, childRecord), 'soft_delete',
+          auditActorId, childRecord, parentEventId, ctx,
+        );
+        childEventIds.push(eventId);
+      }
+    } else if (auditActorId !== undefined && !isAuditable(child.model, 'delete')) {
+      // Non-auditable child: chain breaks, pass undefined for grandchildren.
+      // Any soft-deletable grandchildren of this child will not receive a parent_event_id,
+      // even if they are themselves auditable, because the linking chain is broken here.
+      if (process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.warn(
+          \`[prisma-safe-delete] audit chain break: cascade from '\${parentModel}' through '\${child.model}' (\${child.model} is not auditable for 'delete'). \` +
+          \`Any auditable grandchildren of '\${child.model}' will not have a parent_event_id. To preserve the chain, add @audit to '\${child.model}'.\`
+        );
+      }
+      childEventIds = undefined;
+    }
+` : ''}
     // Recurse to grandchildren first (depth-first)
-    const grandchildCascaded = await cascadeToChildren(tx, child.model, childPkValues, deletedAt, deletedBy);
+    const grandchildCascaded = await cascadeToChildren(tx, child.model, childPkValues, deletedAt, deletedBy${hasAudit ? `,
+      childEventIds, auditActorId, auditWrapOptions, auditCallCtx` : ''});
 
     // Merge grandchild results
     for (const [model, count] of Object.entries(grandchildCascaded)) {
@@ -2126,21 +2197,21 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       restoreMethods = `
     // Restore methods (audited)
     restore: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const record = await restoreRecordInTx(tx, '${name}', where, projection);
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where, ...projection }, injectedPaths);
         if (isAuditable('${name}', 'update') && processed) {
-          const ctx = await wrapOptions?.auditContext?.();
+          const ctx = await _mergeAuditContext(wrapOptions, callCtx);
           await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);
         }
         return processed;
       });
     }) as Safe${name}Delegate['restore'],
     restoreMany: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const deletedAtField = getDeletedAtField('${name}');
         const recordsBefore = isAuditable('${name}', 'update')
@@ -2148,7 +2219,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
           : [];
         const result = await restoreManyInTx(tx, '${name}', rest.where);
         if (isAuditable('${name}', 'update') && recordsBefore.length > 0) {
-          const ctx = await wrapOptions?.auditContext?.();
+          const ctx = await _mergeAuditContext(wrapOptions, callCtx);
           await Promise.all(recordsBefore.map((record: any) =>
             writeAuditEvent(tx, '${name}', getEntityId('${name}', record), 'restore', actorId ?? null, record, undefined, ctx),
           ));
@@ -2157,14 +2228,14 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       });
     }) as Safe${name}Delegate['restoreMany'],
     restoreCascade: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const { record, cascaded } = await restoreWithCascadeInTx(tx, '${name}', where, projection);
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where, ...projection }, injectedPaths);
         if (isAuditable('${name}', 'update') && processed) {
-          const ctx = await wrapOptions?.auditContext?.();
+          const ctx = await _mergeAuditContext(wrapOptions, callCtx);
           await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);
         }
         return { record: processed, cascaded };
@@ -2196,12 +2267,12 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       hardDeleteMethods = `
     // Hard delete with audit (intentionally ugly name to discourage use)
     __dangerousHardDelete: (async (args: any) => {
-      const { actorId, ...rest } = args;
-      return prisma.$transaction(async (tx: Prisma.TransactionClient) => _auditedHardDelete(tx, tx.${lowerName}, rest, '${name}', actorId ?? null, wrapOptions));
+      const { actorId, auditContext: callCtx, ...rest } = args;
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => _auditedHardDelete(tx, tx.${lowerName}, rest, '${name}', actorId ?? null, wrapOptions, callCtx));
     }) as Safe${name}Delegate['__dangerousHardDelete'],
     __dangerousHardDeleteMany: (async (args: any) => {
-      const { actorId, ...rest } = args;
-      return prisma.$transaction(async (tx: Prisma.TransactionClient) => _auditedHardDeleteMany(tx, tx.${lowerName}, rest, '${name}', actorId ?? null, wrapOptions));
+      const { actorId, auditContext: callCtx, ...rest } = args;
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => _auditedHardDeleteMany(tx, tx.${lowerName}, rest, '${name}', actorId ?? null, wrapOptions, callCtx));
     }) as Safe${name}Delegate['__dangerousHardDeleteMany'],`;
     } else {
       hardDeleteMethods = `
@@ -2244,7 +2315,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
         softDeleteMethods = `
     // Soft delete methods (fast path, audited)
     softDelete: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -2258,17 +2329,15 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
         throwIfNotFound(result.count, '${name}');
         const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
-        // Audit event_data uses the post-processed record (to-one relations may be nullified).
-        // This reflects the caller's view, consistent with how create/update audit works.
         if (isAuditable('${name}', 'delete') && processed) {
-          const ctx = await wrapOptions?.auditContext?.();
+          const ctx = await _mergeAuditContext(wrapOptions, callCtx);
           await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);
         }
         return { record: processed, cascaded: {} };
       });
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdateTx}
         const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
@@ -2280,7 +2349,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
           data: updateData,
         });
         if (isAuditable('${name}', 'delete') && records.length > 0) {
-          const ctx = await wrapOptions?.auditContext?.();
+          const ctx = await _mergeAuditContext(wrapOptions, callCtx);
           await Promise.all(records.map((record: any) =>
             writeAuditEvent(tx, '${name}', getEntityId('${name}', record), 'soft_delete', actorId ?? null, record, undefined, ctx),
           ));
@@ -2332,40 +2401,25 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
         softDeleteMethods = `
     // Soft delete methods (with cascade support, audited)
     softDelete: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-        // actorId is passed as the deletedBy parameter to softDeleteWithCascadeInTx
-        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', where, actorId);
+        // actorId is passed as deletedBy (4th arg) to set the model's deleted_by field,
+        // and as auditActorId (5th arg, coerced to null if undefined) to populate the
+        // audit event's actor_id. null auditActorId still writes the audit event (actor unknown).
+        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', where, actorId, actorId ?? null, wrapOptions, callCtx);
         throwIfNotFound(count, '${name}');
         const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
         const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
-        if (isAuditable('${name}', 'delete') && processed) {
-          const ctx = await wrapOptions?.auditContext?.();
-          await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);
-        }
         return { record: processed, cascaded };
       });
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
-      const { actorId, ...rest } = args;
+      const { actorId, auditContext: callCtx, ...rest } = args;
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-        // Pre-fetch records for audit before they're soft-deleted.
-        // decomposeCompoundKeyWhere is applied here explicitly; softDeleteWithCascadeInTx
-        // applies it internally on the same where clause, so both target the same records.
-        const recordsBefore = isAuditable('${name}', 'delete')
-          ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${name}', rest.where), ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })
-          : [];
-        // actorId is passed as the deletedBy parameter to softDeleteWithCascadeInTx
-        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', rest.where, actorId);
-        if (isAuditable('${name}', 'delete') && recordsBefore.length > 0) {
-          const ctx = await wrapOptions?.auditContext?.();
-          await Promise.all(recordsBefore.map((record: any) =>
-            writeAuditEvent(tx, '${name}', getEntityId('${name}', record), 'soft_delete', actorId ?? null, record, undefined, ctx),
-          ));
-        }
+        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', rest.where, actorId, actorId ?? null, wrapOptions, callCtx);
         return { count, cascaded };
       });
     }) as Safe${name}Delegate['softDeleteMany'],`;
@@ -2496,7 +2550,7 @@ function emitAuditedMethodCallSite(
       emitNonAuditedSoftDeletablePassthrough(lines, method, name, lowerName, model, options, context);
     } else {
       lines.push(`${ind}${method}: (async (args: any) => {`);
-      lines.push(`${ind}  const { actorId, ...rest } = args;`);
+      lines.push(`${ind}  const { actorId, auditContext: _callCtx, ...rest } = args;`);
       lines.push(`${ind}  return ${context.delegateExpr}.${lowerName}.${method}(rest);`);
       lines.push(`${ind}}) as Safe${name}Delegate['${method}'],`);
     }
@@ -2510,7 +2564,7 @@ function emitAuditedMethodCallSite(
   const deletedAtField = model.deletedAtField;
 
   lines.push(`${ind}${method}: (async (args: any) => {`);
-  lines.push(`${ind}  const { actorId, ...rest } = args;`);
+  lines.push(`${ind}  const { actorId, auditContext: callCtx, ...rest } = args;`);
 
   // Build the args to pass to the helper
   let argsExpr = 'rest';
@@ -2552,7 +2606,7 @@ function emitAuditedMethodCallSite(
   // Build the helper call
   const txExpr = context.wrapInTransaction ? 'tx' : context.delegateExpr;
   const delegateAccess = `${txExpr}.${lowerName}`;
-  const helperCall = `${helper}(${txExpr}, ${delegateAccess}, ${argsExpr}, '${name}', actorId ?? null, wrapOptions)`;
+  const helperCall = `${helper}(${txExpr}, ${delegateAccess}, ${argsExpr}, '${name}', actorId ?? null, wrapOptions, callCtx)`;
 
   if (context.wrapInTransaction) {
     if (needsPostProcess) {
@@ -2598,9 +2652,9 @@ function emitNonAuditedSoftDeletablePassthrough(
   const isSentinel = options.uniqueStrategy === 'sentinel' && model.deletedAtField !== null;
   // Safe: deletedAtField is only used inside `if (isSentinel)` blocks where model.deletedAtField is non-null
   const deletedAtField = model.deletedAtField ?? '';
-  // Reproduce the standard soft-deletable write method, just strip actorId first
+  // Reproduce the standard soft-deletable write method, just strip actorId + auditContext first
   lines.push(`${ind}${method}: (async (args: any) => {`);
-  lines.push(`${ind}  const { actorId, ...rest } = args;`);
+  lines.push(`${ind}  const { actorId, auditContext: _callCtx, ...rest } = args;`);
 
   switch (method) {
     case 'create': {
@@ -2950,7 +3004,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         if (model.isAuditable && hasAudit) {
           // Audited fast path in transaction: already inside tx, add audit event writing
           lines.push(`      softDelete: (async (args: any) => {`);
-          lines.push(`        const { actorId, ...rest } = args;`);
+          lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
           lines.push(`        const { where, ...restProjection } = rest;`);
           lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
           lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
@@ -2970,13 +3024,13 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });`);
           lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where: decomposedWhere, ...projection }, injectedPaths);`);
           lines.push(`        if (isAuditable('${model.name}', 'delete') && processed) {`);
-          lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+          lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
           lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);`);
           lines.push(`        }`);
           lines.push(`        return { record: processed, cascaded: {} };`);
           lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
           lines.push(`      softDeleteMany: (async (args: any) => {`);
-          lines.push(`        const { actorId, ...rest } = args;`);
+          lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
           lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };`);
           if (model.deletedByField !== null) {
             lines.push(`        const deletedByField = ${JSON.stringify(model.deletedByField)};`);
@@ -2993,7 +3047,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`          data: updateData,`);
           lines.push(`        });`);
           lines.push(`        if (isAuditable('${model.name}', 'delete') && records.length > 0) {`);
-          lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+          lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
           lines.push(`          await Promise.all(records.map((record: any) =>`);
           lines.push(`            writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', record), 'soft_delete', actorId ?? null, record, undefined, ctx),`);
           lines.push(`          ));`);
@@ -3051,34 +3105,22 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         if (model.isAuditable && hasAudit) {
           // Audited complex path in transaction: already inside tx, add audit event writing
           lines.push(`      softDelete: (async (args: any) => {`);
-          lines.push(`        const { actorId, ...rest } = args;`);
+          lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
           lines.push(`        const { where, ...restProjection } = rest;`);
           lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
-          lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', where, actorId);`);
+          // actorId is passed as deletedBy (4th arg) to set the model's deleted_by field,
+          // and as auditActorId (5th arg, coerced to null if undefined) to populate the
+          // audit event's actor_id. null auditActorId still writes the audit event (actor unknown).
+          lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', where, actorId, actorId ?? null, wrapOptions, callCtx);`);
           lines.push(`        throwIfNotFound(count, '${model.name}');`);
           lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
           lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });`);
           lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where: decomposedWhere, ...projection }, injectedPaths);`);
-          lines.push(`        if (isAuditable('${model.name}', 'delete') && processed) {`);
-          lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
-          lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);`);
-          lines.push(`        }`);
           lines.push(`        return { record: processed, cascaded };`);
           lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
           lines.push(`      softDeleteMany: (async (args: any) => {`);
-          lines.push(`        const { actorId, ...rest } = args;`);
-          // Pre-fetch records for audit; decomposeCompoundKeyWhere matches softDeleteWithCascadeInTx's internal decomposition
-          lines.push(`        const recordsBefore = isAuditable('${model.name}', 'delete')`);
-          lines.push(`          ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${model.name}', rest.where), ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })`);
-          lines.push(`          : [];`);
-          // actorId is passed as the deletedBy parameter to softDeleteWithCascadeInTx
-          lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, actorId);`);
-          lines.push(`        if (isAuditable('${model.name}', 'delete') && recordsBefore.length > 0) {`);
-          lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
-          lines.push(`          await Promise.all(recordsBefore.map((record: any) =>`);
-          lines.push(`            writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', record), 'soft_delete', actorId ?? null, record, undefined, ctx),`);
-          lines.push(`          ));`);
-          lines.push(`        }`);
+          lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
+          lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, actorId, actorId ?? null, wrapOptions, callCtx);`);
           lines.push(`        return { count, cascaded };`);
           lines.push(`      }) as Safe${model.name}Delegate['softDeleteMany'],`);
         } else {
@@ -3109,26 +3151,26 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       // Restore methods
       if (model.isAuditable && hasAudit) {
         lines.push(`      restore: (async (args: any) => {`);
-        lines.push(`        const { actorId, ...rest } = args;`);
+        lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
         lines.push(`        const { where, ...restProjection } = rest;`);
         lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
         lines.push(`        const record = await restoreRecordInTx(tx, '${model.name}', where, projection);`);
         lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
         lines.push(`        if (isAuditable('${model.name}', 'update') && processed) {`);
-        lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+        lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
         lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);`);
         lines.push(`        }`);
         lines.push(`        return processed;`);
         lines.push(`      }) as Safe${model.name}Delegate['restore'],`);
         lines.push(`      restoreMany: (async (args: any) => {`);
-        lines.push(`        const { actorId, ...rest } = args;`);
+        lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
         lines.push(`        const deletedAtField = getDeletedAtField('${model.name}');`);
         lines.push(`        const recordsBefore = isAuditable('${model.name}', 'update')`);
         lines.push(`          ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${model.name}', rest.where), [deletedAtField!]: { not: ACTIVE_DELETED_AT_VALUE } } })`);
         lines.push(`          : [];`);
         lines.push(`        const result = await restoreManyInTx(tx, '${model.name}', rest.where);`);
         lines.push(`        if (isAuditable('${model.name}', 'update') && recordsBefore.length > 0) {`);
-        lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+        lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
         lines.push(`          await Promise.all(recordsBefore.map((record: any) =>`);
         lines.push(`            writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', record), 'restore', actorId ?? null, record, undefined, ctx),`);
         lines.push(`          ));`);
@@ -3136,13 +3178,13 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`        return result;`);
         lines.push(`      }) as Safe${model.name}Delegate['restoreMany'],`);
         lines.push(`      restoreCascade: (async (args: any) => {`);
-        lines.push(`        const { actorId, ...rest } = args;`);
+        lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
         lines.push(`        const { where, ...restProjection } = rest;`);
         lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
         lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection);`);
         lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
         lines.push(`        if (isAuditable('${model.name}', 'update') && processed) {`);
-        lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+        lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
         lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);`);
         lines.push(`        }`);
         lines.push(`        return { record: processed, cascaded };`);
@@ -3168,12 +3210,12 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       // Hard delete methods (intentionally scary names)
       if (model.isAuditable && hasAudit) {
         lines.push(`      __dangerousHardDelete: (async (args: any) => {`);
-        lines.push(`        const { actorId, ...rest } = args;`);
-        lines.push(`        return _auditedHardDelete(tx, tx.${lowerName}, rest, '${model.name}', actorId ?? null, wrapOptions);`);
+        lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
+        lines.push(`        return _auditedHardDelete(tx, tx.${lowerName}, rest, '${model.name}', actorId ?? null, wrapOptions, callCtx);`);
         lines.push(`      }) as Safe${model.name}Delegate['__dangerousHardDelete'],`);
         lines.push(`      __dangerousHardDeleteMany: (async (args: any) => {`);
-        lines.push(`        const { actorId, ...rest } = args;`);
-        lines.push(`        return _auditedHardDeleteMany(tx, tx.${lowerName}, rest, '${model.name}', actorId ?? null, wrapOptions);`);
+        lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
+        lines.push(`        return _auditedHardDeleteMany(tx, tx.${lowerName}, rest, '${model.name}', actorId ?? null, wrapOptions, callCtx);`);
         lines.push(`      }) as Safe${model.name}Delegate['__dangerousHardDeleteMany'],`);
       } else {
         lines.push(`      __dangerousHardDelete: ((args: any) => tx.${lowerName}.delete(args)) as PrismaClient['${lowerName}']['delete'],`);
