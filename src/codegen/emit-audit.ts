@@ -113,7 +113,13 @@ async function writeAuditEvent(
     for (const field of pk) obj[field] = event[field];
     return JSON.stringify(obj);
   }
-  return String(event[pk as string] ?? event.id ?? '');
+  const pkValue = event[pk as string];
+  if (pkValue === undefined || pkValue === null) {
+    throw new Error(
+      \`[prisma-safe-delete] writeAuditEvent: could not extract PK '\${String(pk)}' from created audit event. Check that your @audit-table model's primary key is correctly configured.\`
+    );
+  }
+  return String(pkValue);
 }`);
   lines.push('');
 
@@ -429,6 +435,11 @@ export function resolveAuditTableConfig(schema: ParsedSchema): AuditTableConfig 
   if (schema.auditTable === null) return null;
 
   const model = schema.auditTable;
+  // Only String (nullable) parent_event_id fields are supported for cascade linking.
+  // If parent_event_id exists but is a different type (e.g. Int), it will be silently
+  // ignored. The PK returned by writeAuditEvent is always a String (via JSON.stringify
+  // for composite keys or String() for scalar keys), so the parent_event_id column
+  // must be String? to receive it.
   const hasParentEventId = model.fields.some(
     (f) => f.name === 'parent_event_id' && f.type === 'String' && !f.isRequired,
   );
