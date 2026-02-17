@@ -478,7 +478,7 @@ describe('emitRuntime', () => {
     // Post is a fast-path model. Check its softDelete returns { record, cascaded: {} }
     const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
     expect(postDelegate).not.toBeNull();
-    expect(postDelegate![0]).toContain('return { record, cascaded: {} }');
+    expect(postDelegate![0]).toContain('return { record: processed, cascaded: {} }');
   });
 
   it('fast-path softDeleteMany returns { count: result.count, cascaded: {} }', () => {
@@ -499,7 +499,7 @@ describe('emitRuntime', () => {
     // User is a complex-path model
     const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
     expect(userDelegate).not.toBeNull();
-    expect(userDelegate![0]).toContain('return { record, cascaded }');
+    expect(userDelegate![0]).toContain('return { record: processed, cascaded }');
   });
 
   it('complex-path softDeleteMany returns { count, cascaded }', () => {

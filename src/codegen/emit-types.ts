@@ -95,9 +95,15 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  /** Restore a soft-deleted ${name} record AND all cascade-deleted children (matched by deleted_at timestamp) */`);
     lines.push(`  restoreCascade: <T extends Prisma.${name}DeleteArgs>(args: T) => Promise<{ record: Prisma.${name}GetPayload<T> | null; cascaded: CascadeResult }>;`);
     lines.push(`  /** Hard delete a single ${name} record (PERMANENT - bypasses soft delete) */`);
-    lines.push(`  __dangerousHardDelete: PrismaClient['${lowerName}']['delete'];`);
-    lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);
-    lines.push(`  __dangerousHardDeleteMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
+    if (model.isAuditable) {
+      lines.push(`  __dangerousHardDelete: <T extends Prisma.${name}DeleteArgs>(args: T & { actorId?: string | null }) => Promise<Prisma.${name}GetPayload<T>>;`);
+      lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);
+      lines.push(`  __dangerousHardDeleteMany: (args: Prisma.${name}DeleteManyArgs & { actorId?: string | null }) => Promise<Prisma.BatchPayload>;`);
+    } else {
+      lines.push(`  __dangerousHardDelete: PrismaClient['${lowerName}']['delete'];`);
+      lines.push(`  /** Hard delete multiple ${name} records (PERMANENT - bypasses soft delete) */`);
+      lines.push(`  __dangerousHardDeleteMany: (args: Prisma.${name}DeleteManyArgs) => Promise<Prisma.BatchPayload>;`);
+    }
     lines.push(`  /** Query including soft-deleted records */`);
     lines.push(`  includingDeleted: IncludingDeleted${name}Delegate;`);
     lines.push(`};`);

@@ -217,6 +217,7 @@ async function _auditedUpdateMany(
       if (after) {
         return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
       }
+      return undefined;
     }));
   }
   return result;
@@ -242,6 +243,7 @@ async function _auditedUpdateManyAndReturn(
     if (before) {
       return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
     }
+    return undefined;
   }));
   return results;
 }
@@ -302,6 +304,47 @@ async function _auditedDeleteMany(
   await Promise.all(records.map((record: any) =>
     writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx),
   ));
+  return result;
+}
+
+/**
+ * Audited hard delete: permanently delete record, write audit event with 'hard_delete' action, return record.
+ */
+async function _auditedHardDelete(
+  tx: Prisma.TransactionClient,
+  delegate: any,
+  args: any,
+  modelName: string,
+  actorId: string | null,
+  wrapOptions: any,
+): Promise<any> {
+  const record = await delegate.delete(args);
+  if (isAuditable(modelName, 'delete')) {
+    const ctx = await wrapOptions?.auditContext?.();
+    await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'hard_delete', actorId, record, undefined, ctx);
+  }
+  return record;
+}
+
+/**
+ * Audited hard deleteMany: fetch records, permanently deleteMany, write audit events with 'hard_delete' action, return result.
+ */
+async function _auditedHardDeleteMany(
+  tx: Prisma.TransactionClient,
+  delegate: any,
+  args: any,
+  modelName: string,
+  actorId: string | null,
+  wrapOptions: any,
+): Promise<any> {
+  const records = await delegate.findMany({ where: args?.where });
+  const result = await delegate.deleteMany(args);
+  if (isAuditable(modelName, 'delete') && records.length > 0) {
+    const ctx = await wrapOptions?.auditContext?.();
+    await Promise.all(records.map((record: any) =>
+      writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'hard_delete', actorId, record, undefined, ctx),
+    ));
+  }
   return result;
 }`.trim();
 }
