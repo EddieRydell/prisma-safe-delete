@@ -79,21 +79,7 @@ function emitModelTypes(model: ParsedModel): string[] {
 
     // If audited, re-type write methods with actorId
     if (model.isAuditable) {
-      const actorIdParam = '{ actorId?: string | null }';
-      lines.push(`  /** Create a ${name} record (audited) */`);
-      lines.push(`  create: <T extends Prisma.${name}CreateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
-      lines.push(`  /** Create multiple ${name} records (audited) */`);
-      lines.push(`  createMany: (args: Prisma.${name}CreateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
-      lines.push(`  /** Create multiple ${name} records and return them (audited) */`);
-      lines.push(`  createManyAndReturn: <T extends Prisma.${name}CreateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
-      lines.push(`  /** Update a ${name} record (audited) */`);
-      lines.push(`  update: <T extends Prisma.${name}UpdateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
-      lines.push(`  /** Update multiple ${name} records (audited) */`);
-      lines.push(`  updateMany: (args: Prisma.${name}UpdateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
-      lines.push(`  /** Update multiple ${name} records and return them (audited) */`);
-      lines.push(`  updateManyAndReturn: <T extends Prisma.${name}UpdateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
-      lines.push(`  /** Upsert a ${name} record (audited - determines create vs update at runtime) */`);
-      lines.push(`  upsert: <T extends Prisma.${name}UpsertArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+      emitAuditedMutationTypes(lines, name, '{ actorId?: string | null }');
     }
 
     lines.push(`  /** Soft delete a single ${name} record with cascade */`);
@@ -126,20 +112,7 @@ function emitModelTypes(model: ParsedModel): string[] {
     lines.push(`  PrismaClient['${lowerName}'],`);
     lines.push(`  ${omitStr}`);
     lines.push(`> & {`);
-    lines.push(`  /** Create a ${name} record (audited) */`);
-    lines.push(`  create: <T extends Prisma.${name}CreateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
-    lines.push(`  /** Create multiple ${name} records (audited) */`);
-    lines.push(`  createMany: (args: Prisma.${name}CreateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
-    lines.push(`  /** Create multiple ${name} records and return them (audited) */`);
-    lines.push(`  createManyAndReturn: <T extends Prisma.${name}CreateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
-    lines.push(`  /** Update a ${name} record (audited) */`);
-    lines.push(`  update: <T extends Prisma.${name}UpdateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
-    lines.push(`  /** Update multiple ${name} records (audited) */`);
-    lines.push(`  updateMany: (args: Prisma.${name}UpdateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
-    lines.push(`  /** Update multiple ${name} records and return them (audited) */`);
-    lines.push(`  updateManyAndReturn: <T extends Prisma.${name}UpdateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
-    lines.push(`  /** Upsert a ${name} record (audited) */`);
-    lines.push(`  upsert: <T extends Prisma.${name}UpsertArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+    emitAuditedMutationTypes(lines, name, actorIdParam);
     lines.push(`  /** Delete a single ${name} record (audited) */`);
     lines.push(`  delete: <T extends Prisma.${name}DeleteArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
     lines.push(`  /** Delete multiple ${name} records (audited) */`);
@@ -152,6 +125,24 @@ function emitModelTypes(model: ParsedModel): string[] {
   }
 
   return lines;
+}
+
+/** Emits the 7 audited mutation type signatures shared by soft-deletable+audited and audit-only models. */
+function emitAuditedMutationTypes(lines: string[], name: string, actorIdParam: string): void {
+  lines.push(`  /** Create a ${name} record (audited) */`);
+  lines.push(`  create: <T extends Prisma.${name}CreateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+  lines.push(`  /** Create multiple ${name} records (audited) */`);
+  lines.push(`  createMany: (args: Prisma.${name}CreateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+  lines.push(`  /** Create multiple ${name} records and return them (audited) */`);
+  lines.push(`  createManyAndReturn: <T extends Prisma.${name}CreateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
+  lines.push(`  /** Update a ${name} record (audited) */`);
+  lines.push(`  update: <T extends Prisma.${name}UpdateArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
+  lines.push(`  /** Update multiple ${name} records (audited) */`);
+  lines.push(`  updateMany: (args: Prisma.${name}UpdateManyArgs & ${actorIdParam}) => Promise<Prisma.BatchPayload>;`);
+  lines.push(`  /** Update multiple ${name} records and return them (audited) */`);
+  lines.push(`  updateManyAndReturn: <T extends Prisma.${name}UpdateManyAndReturnArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>[]>;`);
+  lines.push(`  /** Upsert a ${name} record (audited - determines create vs update at runtime) */`);
+  lines.push(`  upsert: <T extends Prisma.${name}UpsertArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
 }
 
 function emitSafePrismaClientType(schema: ParsedSchema): string[] {

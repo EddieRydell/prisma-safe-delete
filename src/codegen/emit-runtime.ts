@@ -2316,7 +2316,7 @@ function emitAuditedMethodCallSite(
   // For non-auditable actions, emit a simple passthrough that strips actorId
   if (!isAuditableAction) {
     if (context.softDeletable) {
-      emitNonAuditedSoftDeletablePassthrough(lines, method, name, lowerName, options, context);
+      emitNonAuditedSoftDeletablePassthrough(lines, method, name, lowerName, model, options, context);
     } else {
       lines.push(`${ind}${method}: (async (args: any) => {`);
       lines.push(`${ind}  const { actorId, ...rest } = args;`);
@@ -2408,7 +2408,8 @@ function emitNonAuditedSoftDeletablePassthrough(
   method: string,
   name: string,
   lowerName: string,
-  _options: EmitRuntimeOptions,
+  model: ParsedModel,
+  options: EmitRuntimeOptions,
   context: {
     wrapInTransaction: boolean;
     indent: string;
@@ -2417,6 +2418,9 @@ function emitNonAuditedSoftDeletablePassthrough(
 ): void {
   const ind = context.indent;
   const d = context.wrapInTransaction ? `prisma.${lowerName}` : `${context.delegateExpr}.${lowerName}`;
+  const isSentinel = options.uniqueStrategy === 'sentinel' && model.deletedAtField !== null;
+  // Safe: deletedAtField is only used inside `if (isSentinel)` blocks where model.deletedAtField is non-null
+  const deletedAtField = model.deletedAtField ?? '';
   // Reproduce the standard soft-deletable write method, just strip actorId first
   lines.push(`${ind}${method}: (async (args: any) => {`);
   lines.push(`${ind}  const { actorId, ...rest } = args;`);
@@ -2424,16 +2428,36 @@ function emitNonAuditedSoftDeletablePassthrough(
   switch (method) {
     case 'create': {
       lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
-      lines.push(`${ind}  return postProcessRead(${d}.create(pp), '${name}', pp, injectedPaths) as any;`);
+      if (isSentinel) {
+        lines.push(`${ind}  const withSentinel = { ...pp, data: { ...pp?.data, ['${deletedAtField}']: pp?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };`);
+        lines.push(`${ind}  return postProcessRead(${d}.create(withSentinel), '${name}', withSentinel, injectedPaths) as any;`);
+      } else {
+        lines.push(`${ind}  return postProcessRead(${d}.create(pp), '${name}', pp, injectedPaths) as any;`);
+      }
       break;
     }
     case 'createMany': {
-      lines.push(`${ind}  return ${d}.createMany(rest);`);
+      if (isSentinel) {
+        lines.push(`${ind}  const data = Array.isArray(rest.data)`);
+        lines.push(`${ind}    ? rest.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+        lines.push(`${ind}    : { ...rest.data, ['${deletedAtField}']: rest.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+        lines.push(`${ind}  return ${d}.createMany({ ...rest, data });`);
+      } else {
+        lines.push(`${ind}  return ${d}.createMany(rest);`);
+      }
       break;
     }
     case 'createManyAndReturn': {
       lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
-      lines.push(`${ind}  return postProcessRead(${d}.createManyAndReturn(pp), '${name}', pp, injectedPaths) as any;`);
+      if (isSentinel) {
+        lines.push(`${ind}  const data = Array.isArray(pp.data)`);
+        lines.push(`${ind}    ? pp.data.map((d: any) => ({ ...d, ['${deletedAtField}']: d['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }))`);
+        lines.push(`${ind}    : { ...pp.data, ['${deletedAtField}']: pp.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE };`);
+        lines.push(`${ind}  const withSentinel = { ...pp, data };`);
+        lines.push(`${ind}  return postProcessRead(${d}.createManyAndReturn(withSentinel), '${name}', withSentinel, injectedPaths) as any;`);
+      } else {
+        lines.push(`${ind}  return postProcessRead(${d}.createManyAndReturn(pp), '${name}', pp, injectedPaths) as any;`);
+      }
       break;
     }
     case 'update': {
@@ -2454,7 +2478,15 @@ function emitNonAuditedSoftDeletablePassthrough(
     }
     case 'upsert': {
       lines.push(`${ind}  const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(rest, '${name}');`);
-      lines.push(`${ind}  const filtered = injectFilters(pp, '${name}');`);
+      if (isSentinel) {
+        lines.push(`${ind}  const filtered = injectFilters({`);
+        lines.push(`${ind}    ...pp,`);
+        lines.push(`${ind}    create: { ...pp?.create, ['${deletedAtField}']: pp?.create?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE }`);
+        lines.push(`${ind}  }, '${name}');`);
+        lines.push(`${ind}  if (filtered.where) filtered.where = transformSentinelFindUniqueWhere(filtered.where, '${name}');`);
+      } else {
+        lines.push(`${ind}  const filtered = injectFilters(pp, '${name}');`);
+      }
       lines.push(`${ind}  return postProcessRead(${d}.upsert(filtered), '${name}', filtered, injectedPaths) as any;`);
       break;
     }
