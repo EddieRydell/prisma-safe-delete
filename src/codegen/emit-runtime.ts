@@ -1401,7 +1401,16 @@ ${hasAudit ? `
         childEventIds.push(eventId);
       }
     } else if (auditActorId !== undefined && !isAuditable(child.model, 'delete')) {
-      // Non-auditable child: chain breaks, pass undefined for grandchildren
+      // Non-auditable child: chain breaks, pass undefined for grandchildren.
+      // Any soft-deletable grandchildren of this child will not receive a parent_event_id,
+      // even if they are themselves auditable, because the linking chain is broken here.
+      if (process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.warn(
+          \`[prisma-safe-delete] audit chain break: cascade from '\${parentModel}' through '\${child.model}' (\${child.model} is not auditable for 'delete'). \` +
+          \`Any auditable grandchildren of '\${child.model}' will not have a parent_event_id. To preserve the chain, add @audit to '\${child.model}'.\`
+        );
+      }
       childEventIds = undefined;
     }
 ` : ''}
@@ -2396,6 +2405,9 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // actorId is passed as deletedBy (4th arg) to set the model's deleted_by field,
+        // and as auditActorId (5th arg, coerced to null if undefined) to populate the
+        // audit event's actor_id. null auditActorId still writes the audit event (actor unknown).
         const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', where, actorId, actorId ?? null, wrapOptions, callCtx);
         throwIfNotFound(count, '${name}');
         const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
@@ -3096,6 +3108,9 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
           lines.push(`        const { where, ...restProjection } = rest;`);
           lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
+          // actorId is passed as deletedBy (4th arg) to set the model's deleted_by field,
+          // and as auditActorId (5th arg, coerced to null if undefined) to populate the
+          // audit event's actor_id. null auditActorId still writes the audit event (actor unknown).
           lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', where, actorId, actorId ?? null, wrapOptions, callCtx);`);
           lines.push(`        throwIfNotFound(count, '${model.name}');`);
           lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);

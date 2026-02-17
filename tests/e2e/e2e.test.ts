@@ -5172,6 +5172,27 @@ describe('E2E: Real database tests', () => {
       // Child event should reference parent event's ID
       expect(projEvent?.parent_event_id).toBe(orgEvent?.id);
     });
+
+    it('cascade soft delete sets deleted_by on child records with deleted_by field', async () => {
+      // Project has a deleted_by field; Organization.softDelete with actorId should populate it
+      await prisma.organization.create({
+        data: { id: 'org-deleted-by', name: 'Deleted By Org' },
+      });
+      await prisma.project.create({
+        data: { id: 'proj-deleted-by', name: 'Deleted By Project', organizationId: 'org-deleted-by' },
+      });
+
+      // Soft delete org with actorId — Project.deleted_by should be set
+      await auditSafePrisma.organization.softDelete({
+        where: { id: 'org-deleted-by' },
+        actorId: 'deleted-by-actor',
+      });
+
+      const project = await prisma.project.findUnique({ where: { id: 'proj-deleted-by' } });
+      expect(project).not.toBeNull();
+      expect(project?.deleted_at).not.toBeNull();
+      expect(project?.deleted_by).toBe('deleted-by-actor');
+    });
   });
 
   describe('softDelete return postProcessing', () => {
