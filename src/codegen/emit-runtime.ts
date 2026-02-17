@@ -2121,7 +2121,57 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
     }) as PrismaClient['${lowerName}']['updateManyAndReturn'],${upsertMethod}
     fields: original.fields,`;
 
-    const restoreMethods = `
+    let restoreMethods: string;
+    if (model.isAuditable && hasAudit) {
+      restoreMethods = `
+    // Restore methods (audited)
+    restore: (async (args: any) => {
+      const { actorId, ...rest } = args;
+      const { where, ...restProjection } = rest;
+      const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const record = await restoreRecordInTx(tx, '${name}', where, projection);
+        const processed = await postProcessRead(Promise.resolve(record), '${name}', { where, ...projection }, injectedPaths);
+        if (isAuditable('${name}', 'update') && processed) {
+          const ctx = await wrapOptions?.auditContext?.();
+          await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);
+        }
+        return processed;
+      });
+    }) as Safe${name}Delegate['restore'],
+    restoreMany: (async (args: any) => {
+      const { actorId, ...rest } = args;
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const deletedAtField = getDeletedAtField('${name}');
+        const recordsBefore = isAuditable('${name}', 'update')
+          ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${name}', rest.where), [deletedAtField!]: { not: ACTIVE_DELETED_AT_VALUE } } })
+          : [];
+        const result = await restoreManyInTx(tx, '${name}', rest.where);
+        if (isAuditable('${name}', 'update') && recordsBefore.length > 0) {
+          const ctx = await wrapOptions?.auditContext?.();
+          await Promise.all(recordsBefore.map((record: any) =>
+            writeAuditEvent(tx, '${name}', getEntityId('${name}', record), 'restore', actorId ?? null, record, undefined, ctx),
+          ));
+        }
+        return result;
+      });
+    }) as Safe${name}Delegate['restoreMany'],
+    restoreCascade: (async (args: any) => {
+      const { actorId, ...rest } = args;
+      const { where, ...restProjection } = rest;
+      const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${name}', where, projection);
+        const processed = await postProcessRead(Promise.resolve(record), '${name}', { where, ...projection }, injectedPaths);
+        if (isAuditable('${name}', 'update') && processed) {
+          const ctx = await wrapOptions?.auditContext?.();
+          await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);
+        }
+        return { record: processed, cascaded };
+      });
+    }) as Safe${name}Delegate['restoreCascade'],`;
+    } else {
+      restoreMethods = `
     // Restore methods
     restore: (async (args: any) => {
       const { where, ...restProjection } = args;
@@ -2139,6 +2189,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const processed = await postProcessRead(Promise.resolve(record), '${name}', { where, ...projection }, injectedPaths);
       return { record: processed, cascaded };
     }) as Safe${name}Delegate['restoreCascade'],`;
+    }
 
     let hardDeleteMethods: string;
     if (model.isAuditable && hasAudit) {
@@ -2207,6 +2258,8 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
         throwIfNotFound(result.count, '${name}');
         const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
+        // Audit event_data uses the post-processed record (to-one relations may be nullified).
+        // This reflects the caller's view, consistent with how create/update audit works.
         if (isAuditable('${name}', 'delete') && processed) {
           const ctx = await wrapOptions?.auditContext?.();
           await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);
@@ -2218,11 +2271,12 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const { actorId, ...rest } = args;
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdateTx}
+        const decomposedWhere = decomposeCompoundKeyWhere('${name}', rest.where);
         const records = isAuditable('${name}', 'delete')
-          ? await tx.${lowerName}.findMany({ where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })
+          ? await tx.${lowerName}.findMany({ where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })
           : [];
         const result = await tx.${lowerName}.updateMany({
-          where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
+          where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
           data: updateData,
         });
         if (isAuditable('${name}', 'delete') && records.length > 0) {
@@ -2282,6 +2336,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // actorId is passed as the deletedBy parameter to softDeleteWithCascadeInTx
         const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', where, actorId);
         throwIfNotFound(count, '${name}');
         const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
@@ -2297,9 +2352,13 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
     softDeleteMany: (async (args: any) => {
       const { actorId, ...rest } = args;
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // Pre-fetch records for audit before they're soft-deleted.
+        // decomposeCompoundKeyWhere is applied here explicitly; softDeleteWithCascadeInTx
+        // applies it internally on the same where clause, so both target the same records.
         const recordsBefore = isAuditable('${name}', 'delete')
           ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${name}', rest.where), ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })
           : [];
+        // actorId is passed as the deletedBy parameter to softDeleteWithCascadeInTx
         const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', rest.where, actorId);
         if (isAuditable('${name}', 'delete') && recordsBefore.length > 0) {
           const ctx = await wrapOptions?.auditContext?.();
@@ -2925,11 +2984,12 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
             lines.push(`          updateData[deletedByField] = actorId;`);
             lines.push(`        }`);
           }
+          lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', rest.where);`);
           lines.push(`        const records = isAuditable('${model.name}', 'delete')`);
-          lines.push(`          ? await tx.${lowerName}.findMany({ where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })`);
+          lines.push(`          ? await tx.${lowerName}.findMany({ where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })`);
           lines.push(`          : [];`);
           lines.push(`        const result = await tx.${lowerName}.updateMany({`);
-          lines.push(`          where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },`);
+          lines.push(`          where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },`);
           lines.push(`          data: updateData,`);
           lines.push(`        });`);
           lines.push(`        if (isAuditable('${model.name}', 'delete') && records.length > 0) {`);
@@ -3007,9 +3067,11 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
           lines.push(`      softDeleteMany: (async (args: any) => {`);
           lines.push(`        const { actorId, ...rest } = args;`);
+          // Pre-fetch records for audit; decomposeCompoundKeyWhere matches softDeleteWithCascadeInTx's internal decomposition
           lines.push(`        const recordsBefore = isAuditable('${model.name}', 'delete')`);
           lines.push(`          ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${model.name}', rest.where), ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } })`);
           lines.push(`          : [];`);
+          // actorId is passed as the deletedBy parameter to softDeleteWithCascadeInTx
           lines.push(`        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${model.name}', rest.where, actorId);`);
           lines.push(`        if (isAuditable('${model.name}', 'delete') && recordsBefore.length > 0) {`);
           lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
@@ -3045,22 +3107,64 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       }
 
       // Restore methods
-      lines.push(`      restore: (async (args: any) => {`);
-      lines.push(`        const { where, ...restProjection } = args;`);
-      lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
-      lines.push(`        const record = await restoreRecordInTx(tx, '${model.name}', where, projection);`);
-      lines.push(`        return postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
-      lines.push(`      }) as Safe${model.name}Delegate['restore'],`);
-      lines.push(`      restoreMany: (async (args: any) => {`);
-      lines.push(`        return restoreManyInTx(tx, '${model.name}', args.where);`);
-      lines.push(`      }) as Safe${model.name}Delegate['restoreMany'],`);
-      lines.push(`      restoreCascade: (async (args: any) => {`);
-      lines.push(`        const { where, ...restProjection } = args;`);
-      lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
-      lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection);`);
-      lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
-      lines.push(`        return { record: processed, cascaded };`);
-      lines.push(`      }) as Safe${model.name}Delegate['restoreCascade'],`);
+      if (model.isAuditable && hasAudit) {
+        lines.push(`      restore: (async (args: any) => {`);
+        lines.push(`        const { actorId, ...rest } = args;`);
+        lines.push(`        const { where, ...restProjection } = rest;`);
+        lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
+        lines.push(`        const record = await restoreRecordInTx(tx, '${model.name}', where, projection);`);
+        lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
+        lines.push(`        if (isAuditable('${model.name}', 'update') && processed) {`);
+        lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+        lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);`);
+        lines.push(`        }`);
+        lines.push(`        return processed;`);
+        lines.push(`      }) as Safe${model.name}Delegate['restore'],`);
+        lines.push(`      restoreMany: (async (args: any) => {`);
+        lines.push(`        const { actorId, ...rest } = args;`);
+        lines.push(`        const deletedAtField = getDeletedAtField('${model.name}');`);
+        lines.push(`        const recordsBefore = isAuditable('${model.name}', 'update')`);
+        lines.push(`          ? await tx.${lowerName}.findMany({ where: { ...decomposeCompoundKeyWhere('${model.name}', rest.where), [deletedAtField!]: { not: ACTIVE_DELETED_AT_VALUE } } })`);
+        lines.push(`          : [];`);
+        lines.push(`        const result = await restoreManyInTx(tx, '${model.name}', rest.where);`);
+        lines.push(`        if (isAuditable('${model.name}', 'update') && recordsBefore.length > 0) {`);
+        lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+        lines.push(`          await Promise.all(recordsBefore.map((record: any) =>`);
+        lines.push(`            writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', record), 'restore', actorId ?? null, record, undefined, ctx),`);
+        lines.push(`          ));`);
+        lines.push(`        }`);
+        lines.push(`        return result;`);
+        lines.push(`      }) as Safe${model.name}Delegate['restoreMany'],`);
+        lines.push(`      restoreCascade: (async (args: any) => {`);
+        lines.push(`        const { actorId, ...rest } = args;`);
+        lines.push(`        const { where, ...restProjection } = rest;`);
+        lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
+        lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection);`);
+        lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
+        lines.push(`        if (isAuditable('${model.name}', 'update') && processed) {`);
+        lines.push(`          const ctx = await wrapOptions?.auditContext?.();`);
+        lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'restore', actorId ?? null, processed, undefined, ctx);`);
+        lines.push(`        }`);
+        lines.push(`        return { record: processed, cascaded };`);
+        lines.push(`      }) as Safe${model.name}Delegate['restoreCascade'],`);
+      } else {
+        lines.push(`      restore: (async (args: any) => {`);
+        lines.push(`        const { where, ...restProjection } = args;`);
+        lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
+        lines.push(`        const record = await restoreRecordInTx(tx, '${model.name}', where, projection);`);
+        lines.push(`        return postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
+        lines.push(`      }) as Safe${model.name}Delegate['restore'],`);
+        lines.push(`      restoreMany: (async (args: any) => {`);
+        lines.push(`        return restoreManyInTx(tx, '${model.name}', args.where);`);
+        lines.push(`      }) as Safe${model.name}Delegate['restoreMany'],`);
+        lines.push(`      restoreCascade: (async (args: any) => {`);
+        lines.push(`        const { where, ...restProjection } = args;`);
+        lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
+        lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection);`);
+        lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
+        lines.push(`        return { record: processed, cascaded };`);
+        lines.push(`      }) as Safe${model.name}Delegate['restoreCascade'],`);
+      }
       // Hard delete methods (intentionally scary names)
       if (model.isAuditable && hasAudit) {
         lines.push(`      __dangerousHardDelete: (async (args: any) => {`);

@@ -4977,6 +4977,9 @@ describe('E2E: Real database tests', () => {
         where: { entity_type: 'Project', action: 'hard_delete' },
       });
       expect(events).toHaveLength(2);
+      for (const event of events) {
+        expect(event.actor_id).toBe('actor-hdm');
+      }
     });
 
     it('actorId is recorded in audit event', async () => {
@@ -5064,6 +5067,50 @@ describe('E2E: Real database tests', () => {
       });
       expect(events).toHaveLength(1);
       expect(events[0].actor_id).toBe('tx-actor');
+    });
+
+    it('writes audit event on restore', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-restore', name: 'Restore Org' },
+      });
+      await auditSafePrisma.project.create({
+        data: { id: 'proj-restore', name: 'Restore Project', organizationId: org.id },
+      });
+
+      // Soft delete then restore
+      await auditSafePrisma.project.softDelete({ where: { id: 'proj-restore' } });
+      await auditSafePrisma.project.restore({
+        where: { id: 'proj-restore' },
+        actorId: 'restore-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-restore', action: 'restore' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('restore-actor');
+    });
+
+    it('writes audit event on restoreCascade', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-rc', name: 'RC Org' },
+      });
+      await auditSafePrisma.project.create({
+        data: { id: 'proj-rc', name: 'RC Project', organizationId: org.id },
+      });
+
+      // Soft delete then restore cascade
+      await auditSafePrisma.project.softDelete({ where: { id: 'proj-rc' } });
+      await auditSafePrisma.project.restoreCascade({
+        where: { id: 'proj-rc' },
+        actorId: 'rc-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-rc', action: 'restore' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('rc-actor');
     });
   });
 

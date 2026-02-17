@@ -309,6 +309,8 @@ async function _auditedDeleteMany(
 
 /**
  * Audited hard delete: permanently delete record, write audit event with 'hard_delete' action, return record.
+ * Gated on isAuditable(modelName, 'delete') — hard deletes are a subset of delete operations,
+ * so models must have 'delete' in their @audit config to get hard_delete events.
  */
 async function _auditedHardDelete(
   tx: Prisma.TransactionClient,
@@ -328,6 +330,7 @@ async function _auditedHardDelete(
 
 /**
  * Audited hard deleteMany: fetch records, permanently deleteMany, write audit events with 'hard_delete' action, return result.
+ * Gated on isAuditable(modelName, 'delete') — see _auditedHardDelete comment.
  */
 async function _auditedHardDeleteMany(
   tx: Prisma.TransactionClient,
