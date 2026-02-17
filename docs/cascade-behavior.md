@@ -73,6 +73,12 @@ await safePrisma.$transaction(async (tx) => {
 }, { isolationLevel: 'Serializable' });
 ```
 
+## Audit Logging and Cascades
+
+If a soft-deletable model is also auditable (`/// @audit`), the `softDelete` operation itself is audited, but cascade-deleted children do **not** generate individual audit events. The `cascaded` return value provides the cascade counts; persist it if you need a full audit trail of cascade operations.
+
+For audit-only models (no `deleted_at`), `delete` and `deleteMany` are audited per-record when the model's audit actions include `delete`.
+
 ## Database-Level Enforcement
 
 prisma-safe-delete operates at the application layer. It does not create database triggers, row-level security policies, or other database-level protections. Developers can bypass soft-delete via:

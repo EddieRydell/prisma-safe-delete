@@ -28,6 +28,7 @@ Soft deletion is a common pattern where records are marked as deleted (typically
 - **Escape hatches**: `$includingDeleted`, `$onlyDeleted`, per-model overrides, and raw `$prisma` access
 - **Transaction support** with full soft-delete API including escape hatches
 - **Restore operations** including cascade restore matching by timestamp
+- **Audit logging** with automatic event capture for create, update, and delete operations
 - **Compound key support** for both primary and foreign keys
 
 ## Installation
@@ -138,6 +139,51 @@ All read operations (`findMany`, `findFirst`, `findUnique`, `count`, `aggregate`
 | `$transaction` | Interactive transaction with full soft-delete API |
 
 For full API documentation with examples, see [docs/api-reference.md](docs/api-reference.md).
+
+## Audit Logging
+
+Mark models with `/// @audit` to automatically capture audit events for mutations. Requires an `/// @audit-table` model in your schema to store events.
+
+```prisma
+/// @audit
+model Project {
+  id         String    @id @default(cuid())
+  name       String
+  deleted_at DateTime?
+}
+
+/// @audit(create, delete)
+model Webhook {
+  id   String @id @default(cuid())
+  url  String
+}
+
+/// @audit-table
+model AuditEvent {
+  id               String   @id @default(cuid())
+  entity_type      String
+  entity_id        String
+  action           String
+  actor_id         String?
+  event_data       Json
+  created_at       DateTime @default(now())
+  parent_event_id  String?
+}
+```
+
+```typescript
+const safePrisma = wrapPrismaClient(prisma, {
+  auditContext: async () => ({ ip: req.ip, userAgent: req.headers['user-agent'] }),
+});
+
+// All mutations on audited models accept an optional actorId
+await safePrisma.project.create({
+  data: { name: 'New Project' },
+  actorId: currentUserId,
+});
+```
+
+Audit events capture before/after snapshots for updates, the full record for creates and deletes, and are written atomically in the same transaction as the mutation. For full details, see [docs/api-reference.md](docs/api-reference.md#audit-logging).
 
 ## Unique Constraint Handling
 
@@ -263,6 +309,10 @@ This only affects raw queries and `$prisma` — the wrapper handles sentinel com
 | Compile-time enforcement of return types | Tested |
 | Fast-path optimization for leaf models | Tested |
 | Fluent API bypass confirmed (documented limitation) | Tested |
+| Audit events written for audited model mutations | Tested |
+| Audit-only models (no soft-delete) with actorId | Tested |
+| Selective audit actions (`@audit(create, delete)`) | Tested |
+| Audit context propagation via `WrapOptions` | Tested |
 
 Run the full test suite:
 

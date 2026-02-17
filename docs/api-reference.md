@@ -109,7 +109,7 @@ console.log(cascaded);  // Aggregated cascade counts across all matched records
 
 The `cascaded` field is a `Record<string, number>` mapping model names to the number of records that were cascade-deleted. It's empty (`{}`) when there are no cascade children.
 
-**Audit trail**: The `cascaded` return value is ephemeral — it is not persisted anywhere. If your application requires an audit trail of cascade operations (e.g., for SOC 2 compliance), you must log or persist the return value yourself. Use an interactive transaction to make the audit log atomic with the soft-delete:
+**Audit trail**: The `cascaded` return value is ephemeral — it is not persisted anywhere. For automatic audit logging of mutations, see [Audit Logging](#audit-logging). For manual logging, use an interactive transaction:
 
 ```typescript
 await safePrisma.$transaction(async (tx) => {
@@ -118,7 +118,6 @@ await safePrisma.$transaction(async (tx) => {
     deletedBy: currentUserId,
   });
 
-  // Persist the cascade audit trail in the same transaction
   await tx.auditLog.create({
     data: {
       action: 'SOFT_DELETE',
@@ -401,3 +400,180 @@ await safePrisma.$transaction(async (tx) => {
 ```
 
 **Important**: Only interactive transactions (`$transaction(async (tx) => { ... })`) receive the soft-delete wrapper. Sequential transactions (`$transaction([promise1, promise2])`) pass through to raw Prisma with no soft-delete filtering. Always use the interactive form when soft-delete behavior is needed.
+
+## Audit Logging
+
+Audit logging automatically captures mutation events (create, update, delete) for marked models. Events are written atomically in the same transaction as the mutation.
+
+### Schema Setup
+
+Three schema annotations control audit logging:
+
+| Annotation | Purpose |
+|-----------|---------|
+| `/// @audit` | Mark a model as auditable for all actions (create, update, delete) |
+| `/// @audit(create, delete)` | Mark a model as auditable for specific actions only |
+| `/// @audit-table` | Designate a model as the audit event table |
+
+**Audit table**: Exactly one model must be marked with `/// @audit-table`. This model stores all audit events. It is never itself auditable or soft-deletable.
+
+```prisma
+/// @audit
+model Project {
+  id         String    @id @default(cuid())
+  name       String
+  deleted_at DateTime?
+  deleted_by String?
+}
+
+/// @audit(create, delete)
+model Webhook {
+  id   String @id @default(cuid())
+  url  String
+}
+
+/// @audit-table
+model AuditEvent {
+  id               String   @id @default(cuid())
+  entity_type      String
+  entity_id        String
+  action           String
+  actor_id         String?
+  event_data       Json
+  created_at       DateTime @default(now())
+  parent_event_id  String?
+}
+```
+
+#### Required audit table fields
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `entity_type` | `String` | Model name (e.g., `"Project"`) |
+| `entity_id` | `String` | Primary key of the affected record (JSON string for compound PKs) |
+| `action` | `String` | `"create"`, `"update"`, or `"delete"` |
+| `actor_id` | `String?` | Who performed the action (from `actorId` parameter) |
+| `event_data` | `Json` | Snapshot of the record or before/after diff |
+| `created_at` | `DateTime` | When the event occurred |
+
+#### Optional audit table fields
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `parent_event_id` | `String?` | Links child audit events to a parent (for cascade operations) |
+
+You can add additional fields to the audit table (e.g., `ip_address`, `user_agent`). Extra fields are populated via `auditContext` (see below).
+
+### Configuring the Client
+
+When your schema has auditable models, `wrapPrismaClient` accepts an optional `WrapOptions` parameter:
+
+```typescript
+import { wrapPrismaClient, type WrapOptions } from './generated/soft-delete';
+
+const safePrisma = wrapPrismaClient(prisma, {
+  auditContext: async () => ({
+    ip_address: req.ip,
+    user_agent: req.headers['user-agent'],
+  }),
+});
+```
+
+The `auditContext` callback is called once per audit event and its return value is spread into the audit event record. This lets you inject request-scoped context (IP address, user agent, trace IDs) into every audit event.
+
+### Using Audited Models
+
+All mutation methods on audited models accept an optional `actorId` parameter:
+
+```typescript
+// Create — actorId is optional
+const project = await safePrisma.project.create({
+  data: { name: 'New Project' },
+  actorId: currentUserId,
+});
+
+// Update — captures before/after snapshot
+const updated = await safePrisma.project.update({
+  where: { id: project.id },
+  data: { name: 'Renamed' },
+  actorId: currentUserId,
+});
+
+// Delete (soft-delete for soft-deletable models, hard delete for audit-only)
+await safePrisma.webhook.delete({
+  where: { id: 'wh-1' },
+  actorId: currentUserId,
+});
+```
+
+`actorId` is always optional (`string | null`). If omitted, the audit event's `actor_id` is `null`.
+
+### Audited Methods
+
+Which methods are intercepted depends on the model's `@audit` actions:
+
+| Method | Action | Audited when |
+|--------|--------|-------------|
+| `create` | `create` | `@audit` or `@audit(create, ...)` |
+| `createMany` | `create` | `@audit` or `@audit(create, ...)` |
+| `createManyAndReturn` | `create` | `@audit` or `@audit(create, ...)` |
+| `update` | `update` | `@audit` or `@audit(update, ...)` |
+| `updateMany` | `update` | `@audit` or `@audit(update, ...)` |
+| `updateManyAndReturn` | `update` | `@audit` or `@audit(update, ...)` |
+| `upsert` | runtime | Always intercepted; action determined at runtime (`create` if new, `update` if existing). Audit event is written only if the resulting action is in the model's audit actions. |
+| `delete` | `delete` | `@audit` or `@audit(delete, ...)` (audit-only models only; soft-deletable models use `softDelete`) |
+| `deleteMany` | `delete` | `@audit` or `@audit(delete, ...)` (audit-only models only) |
+
+Methods whose action is **not** in the model's audit actions pass through without wrapping in a transaction or capturing events. They still strip the `actorId` parameter before forwarding to Prisma.
+
+### Audit Event Data
+
+The `event_data` field captures different snapshots depending on the action:
+
+| Action | `event_data` contents |
+|--------|----------------------|
+| `create` | The full created record |
+| `update` | `{ before: <record before>, after: <record after> }` |
+| `delete` | The full deleted record |
+| `upsert` (created) | The full created record |
+| `upsert` (updated) | `{ before: <existing record>, after: <updated record> }` |
+
+For batch operations (`createMany`, `updateMany`, `deleteMany`), one audit event is written per affected record.
+
+### Audit + Soft Delete
+
+Models can be both soft-deletable and auditable:
+
+```prisma
+/// @audit
+model Project {
+  id         String    @id @default(cuid())
+  name       String
+  deleted_at DateTime?
+  deleted_by String?
+}
+```
+
+When a model is both:
+- `softDelete` uses `actorId` instead of `deletedBy` for the identity parameter
+- All write methods (create, update, upsert, etc.) are wrapped with audit logging
+- Soft-delete filtering still applies to all reads and updates
+
+### Transactions
+
+Audited methods work in transactions with the same API:
+
+```typescript
+await safePrisma.$transaction(async (tx) => {
+  const project = await tx.project.create({
+    data: { name: 'In Transaction' },
+    actorId: currentUserId,
+  });
+
+  await tx.project.update({
+    where: { id: project.id },
+    data: { name: 'Updated in Transaction' },
+    actorId: currentUserId,
+  });
+  // Both audit events are committed atomically with the mutations
+});
