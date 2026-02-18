@@ -1385,7 +1385,7 @@ function createAuditSchema() {
         createMockField({ name: 'action', type: 'String' }),
         createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
         createMockField({ name: 'event_data', type: 'Json' }),
-        createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true }),
+        createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'now', args: [] } }),
         createMockField({ name: 'parent_event_id', type: 'String', isRequired: false }),
         createMockField({ name: 'source', type: 'String', isRequired: false }),
       ],
@@ -1480,7 +1480,7 @@ describe('emitTypes - audit', () => {
           createMockField({ name: 'action', type: 'String' }),
           createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
           createMockField({ name: 'event_data', type: 'Json' }),
-          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true }),
+          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'now', args: [] } }),
         ],
       }),
     ];
@@ -1625,6 +1625,21 @@ describe('emitRuntime - audit', () => {
 
     expect(output).toContain('filteredContext');
     expect(output).toContain('AUDIT_EXTRA_COLUMNS.has(key)');
+  });
+
+  it('writeAuditEvent warns on dropped context keys', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('droppedKeys');
+    expect(output).toContain('unknown audit context key(s)');
+    expect(output).toContain('Check for typos in your auditContext');
   });
 
   it('writeAuditEvent does not set client-side created_at', () => {
@@ -1898,6 +1913,35 @@ describe('emitRuntime - audit', () => {
 
     expect(output).toContain('AuditContext');
   });
+
+  it('deduplicates audit chain break warnings with a Set', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('_auditChainBreakWarned');
+    expect(output).toContain('_auditChainBreakWarned.has(warnKey)');
+  });
+
+  it('_auditedUpdateManyAndReturn detects before-records missing from results', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // Check both directions: after→before (existing) and before→after (new)
+    expect(output).toContain('exists in results but had no before-state');
+    expect(output).toContain('was present before updateManyAndReturn but missing from results');
+  });
 });
 
 describe('emitRuntime - non-audited softDelete transaction wrapping', () => {
@@ -2012,6 +2056,37 @@ describe('validateAuditSetup', () => {
           createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
           createMockField({ name: 'event_data', type: 'Json' }),
           createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: false }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+
+    expect(() => { validateAuditSetup(schema); }).toThrow(
+      '@default(now()) for tamper-resistant server-side timestamps',
+    );
+  });
+
+  it('rejects audit table with non-now() default on created_at', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        documentation: '/// @audit',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+      createMockModel({
+        name: 'AuditEvent',
+        documentation: '/// @audit-table',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'entity_type', type: 'String' }),
+          createMockField({ name: 'entity_id', type: 'String' }),
+          createMockField({ name: 'action', type: 'String' }),
+          createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
+          createMockField({ name: 'event_data', type: 'Json' }),
+          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'cuid', args: [] } }),
         ],
       }),
     ];

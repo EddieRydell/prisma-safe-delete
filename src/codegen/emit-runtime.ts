@@ -1247,6 +1247,9 @@ async function softDeleteWithCascade(
   auditWrapOptions?: any,
   auditCallCtx?: Record<string, unknown>,` : '';
   return `${wrapperFn}
+${hasAudit ? `/** Deduplicates audit chain break warnings — emits once per parent→child pair per process. */
+const _auditChainBreakWarned = new Set<string>();
+` : ''}
 /**
  * Performs a soft delete with cascade within an existing transaction
  */
@@ -1435,11 +1438,15 @@ ${hasAudit ? `
       // Non-auditable child: chain breaks, pass undefined for grandchildren.
       // Any soft-deletable grandchildren of this child will not receive a parent_event_id,
       // even if they are themselves auditable, because the linking chain is broken here.
-      // eslint-disable-next-line no-console
-      console.warn(
-        \`[prisma-safe-delete] audit chain break: cascade from '\${parentModel}' through '\${child.model}' (\${child.model} is not auditable for 'delete'). \` +
-        \`Any auditable grandchildren of '\${child.model}' will not have a parent_event_id. To preserve the chain, add @audit to '\${child.model}'.\`
-      );
+      const warnKey = \`\${parentModel}->\${child.model}\`;
+      if (!_auditChainBreakWarned.has(warnKey)) {
+        _auditChainBreakWarned.add(warnKey);
+        // eslint-disable-next-line no-console
+        console.warn(
+          \`[prisma-safe-delete] audit chain break: cascade from '\${parentModel}' through '\${child.model}' (\${child.model} is not auditable for 'delete'). \` +
+          \`Any auditable grandchildren of '\${child.model}' will not have a parent_event_id. To preserve the chain, add @audit to '\${child.model}'.\`
+        );
+      }
       childEventIds = undefined;
     }
 ` : ''}

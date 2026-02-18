@@ -102,10 +102,19 @@ async function writeAuditEvent(
   // Filter context to only known extra columns — prevents unknown keys from reaching the database
   const filteredContext: Record<string, unknown> = {};
   if (context) {
+    const droppedKeys: string[] = [];
     for (const key of Object.keys(context)) {
       if (AUDIT_EXTRA_COLUMNS.has(key)) {
         filteredContext[key] = context[key];
+      } else {
+        droppedKeys.push(key);
       }
+    }
+    if (droppedKeys.length > 0) {
+      console.warn(
+        \`[prisma-safe-delete] writeAuditEvent: unknown audit context key(s) \${droppedKeys.map(k => \`'\${k}'\`).join(', ')} dropped. \` +
+        \`Allowed keys: \${[...AUDIT_EXTRA_COLUMNS].join(', ') || '(none)'}. Check for typos in your auditContext.\`,
+      );
     }
   }
   const data: Record<string, unknown> = {
@@ -183,6 +192,13 @@ function getEntityId(modelName: string, record: Record<string, unknown>): string
  * Emits shared _audited* helper functions that encapsulate audit logic.
  * Both main delegates and tx wrappers call these, eliminating code duplication.
  * Each helper takes a tx + delegate so it works in both contexts.
+ *
+ * ATOMICITY CONTRACT: All _audited* helpers assume that \`tx\` is an interactive
+ * transaction client and \`delegate\` is derived from that same transaction
+ * (i.e. \`tx[modelName]\`). This is structurally guaranteed by the callers in
+ * emit-runtime.ts which always pass \`tx\` and \`tx.modelName\` together.
+ * If any operation throws (audit write or data mutation), the entire transaction
+ * rolls back — no orphaned audit events or un-audited mutations can occur.
  */
 function emitAuditOperationHelpers(): string {
   return `
@@ -301,7 +317,7 @@ async function _auditedUpdateMany(
       const after = afterRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
       if (!after) {
         throw new Error(
-          \`[prisma-safe-delete] _auditedUpdateMany: record \${JSON.stringify(pk)} for model '\${modelName}' was present before updateMany but missing after. This indicates a concurrent modification — aborting to preserve audit completeness.\`,
+          \`[prisma-safe-delete] _auditedUpdateMany: record \${JSON.stringify(pk)} for model '\${modelName}' was present before updateMany but missing after. This indicates a concurrent modification — the enclosing transaction will be rolled back to preserve audit completeness.\`,
         );
       }
       return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
@@ -330,11 +346,21 @@ async function _auditedUpdateManyAndReturn(
     const before = beforeRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
     if (!before) {
       throw new Error(
-        \`[prisma-safe-delete] _auditedUpdateManyAndReturn: record \${JSON.stringify(pk)} for model '\${modelName}' exists in results but had no before-state. This indicates a concurrent modification — aborting to preserve audit completeness.\`,
+        \`[prisma-safe-delete] _auditedUpdateManyAndReturn: record \${JSON.stringify(pk)} for model '\${modelName}' exists in results but had no before-state. This indicates a concurrent modification — the enclosing transaction will be rolled back to preserve audit completeness.\`,
       );
     }
     return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
   }));
+  // Check for before-records that disappeared from results (un-audited mutations)
+  const afterPks = new Set(results.map((r: any) => JSON.stringify(extractPrimaryKey(modelName, r))));
+  for (const before of beforeRecords) {
+    const pk = JSON.stringify(extractPrimaryKey(modelName, before));
+    if (!afterPks.has(pk)) {
+      throw new Error(
+        \`[prisma-safe-delete] _auditedUpdateManyAndReturn: record \${pk} for model '\${modelName}' was present before updateManyAndReturn but missing from results. This indicates a concurrent modification — the enclosing transaction will be rolled back to preserve audit completeness.\`,
+      );
+    }
+  }
   return results;
 }
 
