@@ -585,10 +585,10 @@ export function validateAuditSetup(schema: ParsedSchema): void {
   }
 
   // Validate that created_at uses @default(now()) specifically for server-side timestamps.
-  // The missing-column case is already caught by the requiredColumns loop above;
-  // this check only runs when created_at exists but has a wrong or missing default.
+  // The missing-column and missing-default cases are already caught by the loop above;
+  // this check only fires when created_at has a default that isn't now().
   const createdAtField = fieldMap.get('created_at');
-  if (createdAtField !== undefined && createdAtField.defaultFunctionName !== 'now') {
+  if (createdAtField !== undefined && createdAtField.hasDefaultValue && createdAtField.defaultFunctionName !== 'now') {
     errors.push(
       '  Column created_at: must have @default(now()) for tamper-resistant server-side timestamps',
     );

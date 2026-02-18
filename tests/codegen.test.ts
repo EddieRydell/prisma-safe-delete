@@ -2062,7 +2062,7 @@ describe('validateAuditSetup', () => {
     const schema = parseDMMF(createMockDMMF(models));
 
     expect(() => { validateAuditSetup(schema); }).toThrow(
-      '@default(now()) for tamper-resistant server-side timestamps',
+      '@default(now()) so audit timestamps are server-side',
     );
   });
 
@@ -2116,7 +2116,7 @@ describe('emitTypes - $writeAuditEvent', () => {
     expect(txBlock).toContain('entityId: string');
     expect(txBlock).toContain('action: string');
     expect(txBlock).toContain('actorId?: string | null');
-    expect(txBlock).toContain('eventData: unknown');
+    expect(txBlock).toContain('eventData: Prisma.InputJsonValue');
     expect(txBlock).toContain('parentEventId?: string');
     expect(txBlock).toContain('auditContext?: AuditContext');
     expect(txBlock).toContain('Promise<string>');

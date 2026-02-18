@@ -3619,7 +3619,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
 
   if (hasAudit) {
     lines.push('');
-    lines.push('    $writeAuditEvent: async (params: { entityType: string; entityId: string; action: string; actorId?: string | null; eventData: unknown; parentEventId?: string; auditContext?: AuditContext }) => {');
+    lines.push('    $writeAuditEvent: async (params: { entityType: string; entityId: string; action: string; actorId?: string | null; eventData: Prisma.InputJsonValue; parentEventId?: string; auditContext?: AuditContext }) => {');
     lines.push('      const ctx = await _mergeAuditContext(wrapOptions, params.auditContext);');
     lines.push('      return writeAuditEvent(tx, params.entityType, params.entityId, params.action, params.actorId ?? null, params.eventData, params.parentEventId, ctx);');
     lines.push('    },');
@@ -3682,7 +3682,7 @@ function emitWrapperFunction(schema: ParsedSchema, hasAudit: boolean): string {
   lines.push('    $onlyDeleted: createOnlyDeletedClient(prisma),');
 
   if (hasAudit) {
-    lines.push('    $writeAuditEvent: async (params: { entityType: string; entityId: string; action: string; actorId?: string | null; eventData: unknown; parentEventId?: string; auditContext?: AuditContext }) => {');
+    lines.push('    $writeAuditEvent: async (params: { entityType: string; entityId: string; action: string; actorId?: string | null; eventData: Prisma.InputJsonValue; parentEventId?: string; auditContext?: AuditContext }) => {');
     lines.push('      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {');
     lines.push('        const ctx = await _mergeAuditContext(wrapOptions, params.auditContext);');
     lines.push('        return writeAuditEvent(tx, params.entityType, params.entityId, params.action, params.actorId ?? null, params.eventData, params.parentEventId, ctx);');

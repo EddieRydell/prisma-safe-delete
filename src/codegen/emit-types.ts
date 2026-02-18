@@ -211,7 +211,7 @@ function emitWriteAuditEventType(lines: string[]): void {
   lines.push('    entityId: string;');
   lines.push('    action: string;');
   lines.push('    actorId?: string | null;');
-  lines.push('    eventData: unknown;');
+  lines.push('    eventData: Prisma.InputJsonValue;');
   lines.push('    parentEventId?: string;');
   lines.push('    auditContext?: AuditContext;');
   lines.push('  }) => Promise<string>;');
