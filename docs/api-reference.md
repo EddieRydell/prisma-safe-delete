@@ -460,7 +460,7 @@ model AuditEvent {
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `parent_event_id` | `String?` | Reserved for future use — linking child audit events to a parent (e.g., cascade operations). Currently not populated by the library. |
+| `parent_event_id` | `String?` | Links child audit events to a parent event. Automatically populated during cascade operations — when a `softDelete` cascades to children, each child's audit event references the parent's audit event ID. Also accepted as a parameter on `$writeAuditEvent` for manual linking. |
 
 You can add additional fields to the audit table (e.g., `ip_address`, `user_agent`). Extra fields are populated via `auditContext` (see below).
 
@@ -480,6 +480,28 @@ const safePrisma = wrapPrismaClient(prisma, {
 ```
 
 The `auditContext` callback is called once per audit event and its return value is spread into the audit event record. This lets you inject request-scoped context (IP address, user agent, trace IDs) into every audit event.
+
+### Per-Call Audit Context
+
+All audited mutation methods and `$writeAuditEvent` accept an optional `auditContext` parameter that merges with (and overrides) the global `WrapOptions.auditContext`:
+
+```typescript
+// Global context provides defaults
+const safePrisma = wrapPrismaClient(prisma, {
+  auditContext: async () => ({ ip_address: req.ip }),
+});
+
+// Per-call context overrides or extends the global context
+await safePrisma.project.update({
+  where: { id: project.id },
+  data: { name: 'Renamed' },
+  actorId: currentUserId,
+  auditContext: { trace_id: 'req-abc-123' },
+});
+// Resulting audit event has both ip_address (from global) and trace_id (from per-call)
+```
+
+Per-call `auditContext` values are merged shallowly — if the same key appears in both global and per-call context, the per-call value wins. Only keys matching columns in your audit table are written; extra keys are silently ignored.
 
 ### Using Audited Models
 
@@ -582,3 +604,55 @@ await safePrisma.$transaction(async (tx) => {
   });
   // Both audit events are committed atomically with the mutations
 });
+```
+
+### `$writeAuditEvent`
+
+Write a custom audit event outside of automatic mutation tracking. Available on both `SafePrismaClient` and `SafeTransactionClient` when the schema has auditable models.
+
+```typescript
+await safePrisma.$writeAuditEvent({
+  entityType: 'Project',
+  entityId: project.id,
+  action: 'archive',
+  actorId: currentUserId,
+  eventData: { reason: 'inactive for 90 days' },
+});
+```
+
+#### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `entityType` | `string` | Yes | Model or entity name (e.g., `"Project"`) |
+| `entityId` | `string` | Yes | Primary key of the affected record |
+| `action` | `string` | Yes | Action name (e.g., `"archive"`, `"export"`, any custom string) |
+| `actorId` | `string \| null` | No | Who performed the action (defaults to `null`) |
+| `eventData` | `Prisma.InputJsonValue` | Yes | Arbitrary JSON payload for the event |
+| `parentEventId` | `string` | No | Link this event to a parent audit event |
+| `auditContext` | `AuditContext` | No | Per-call context that merges with global `WrapOptions.auditContext` |
+
+#### Behavior
+
+- **On `SafePrismaClient`**: Wraps the write in a `$transaction` automatically.
+- **On `SafeTransactionClient`** (inside `$transaction`): Writes directly within the existing transaction — the audit event is atomic with the rest of the transaction.
+
+```typescript
+// In a transaction — audit event is atomic with the business logic
+await safePrisma.$transaction(async (tx) => {
+  await tx.project.update({
+    where: { id: project.id },
+    data: { status: 'archived' },
+  });
+
+  await tx.$writeAuditEvent({
+    entityType: 'Project',
+    entityId: project.id,
+    action: 'archive',
+    actorId: currentUserId,
+    eventData: { previousStatus: 'active' },
+  });
+});
+```
+
+Only keys matching columns in your audit table are written from `auditContext`; extra keys are silently ignored.

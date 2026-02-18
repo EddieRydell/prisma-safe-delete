@@ -8,7 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Audit logging**: Mark models with `/// @audit` or `/// @audit(create, delete)` to automatically capture mutation events. Requires an `/// @audit-table` model in the schema to store events.
+- `$writeAuditEvent` method on `SafePrismaClient` and `SafeTransactionClient` for writing custom audit events outside of automatic mutation tracking
+- `eventData` parameter on `$writeAuditEvent` typed as `Prisma.InputJsonValue` for better DX
+
+### Fixed
+- Duplicate `created_at` validation error when audit table field has no default value
+
+## [4.0.0] - 2026-02-18
+
+### Changed
+- **Breaking**: SOC 2 compliance hardening for the audit system (#60):
+  - Delete audit uses pre-mutation snapshots (fetches record before deletion)
+  - Audit timestamps are server-side only (`created_at` relies on `@default(now())`)
+  - Audit context is whitelisted against `AUDIT_EXTRA_COLUMNS` before insertion
+  - Audit chain breaks always warn (no `NODE_ENV` gate)
+  - Missing after-records in `updateMany`/`updateManyAndReturn` throw on concurrent modification
+  - Null PK in `getEntityId` throws descriptive error instead of empty-string fallback
+
+## [3.2.1] - 2026-02-17
+
+### Fixed
+- Replace `ParsedModel` with discriminated union for type safety (#59)
+
+## [3.2.0] - 2026-02-17
+
+### Added
+- Per-call `auditContext` parameter on all audited mutation methods — merges with the global `WrapOptions.auditContext` callback (#57)
+- Cascade `parent_event_id` linking — child audit events from cascade operations reference their parent's audit event ID (#57)
+
+## [3.1.1] - 2026-02-17
+
+### Fixed
+- Audit completeness and `softDelete` return post-processing (#56)
+
+## [3.1.0] - 2026-02-17
+
+### Added
+- **Audit logging**: Mark models with `/// @audit` or `/// @audit(create, delete)` to automatically capture mutation events (#55)
   - Audit events capture before/after snapshots for updates, full records for creates/deletes
   - `actorId` parameter on all mutation methods for audited models (optional `string | null`)
   - `WrapOptions.auditContext` callback to inject request-scoped context (IP, user agent, trace IDs) into audit events
@@ -17,7 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Selective action auditing: `@audit(create, delete)` only audits specified actions
   - `upsert` determines action (create vs update) at runtime and audits accordingly
   - Batch operations (`createMany`, `updateMany`, `deleteMany`) write one audit event per affected record
-  - `parent_event_id` support for linking related audit events
+  - Requires an `/// @audit-table` model in the schema to store events
+
+## [3.0.0] - 2026-02-16
+
+### Added
 - `cascade = "false"` generator option to disable cascade graph building; all models use the fast path and return `cascaded: {}` (#52)
 - Generator warning for required to-one relations pointing to soft-deletable models (runtime nullification may return `null` despite the Prisma type)
 
@@ -29,9 +69,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Soft-deleted records visible through to-one relation `include`/`select` — query results are now post-processed to nullify deleted to-one relations, with `deleted_at` injected into selects and stripped from results (#50)
 - To-one nullification also applies to write method returns (`create`, `update`, `upsert`, `createManyAndReturn`, `updateManyAndReturn`) (#50)
 - `_count: true` now correctly filters out soft-deleted records by expanding to per-relation count queries with `deleted_at` filters
-- `restoreCascade` now traverses through non-soft-deletable intermediary models to restore soft-deletable grandchildren (e.g., `Organization(soft) -> Asset(non-soft) -> AssetComment(soft)`)
+- `restoreCascade` now traverses through non-soft-deletable intermediary models to restore soft-deletable grandchildren
 - `restore`, `restoreMany`, and `restoreCascade` now throw a clear error message on unique constraint violations (P2002) instead of exposing raw Prisma errors
 - Removed idempotency short-circuit in unique field mangling that could skip mangling in edge cases
+
+## [2.3.2] - 2026-02-16
+
+### Fixed
+- Various bugfixes (#42, #43, #44, #45) (#51)
 
 ## [2.3.1] - 2026-02-16
 

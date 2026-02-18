@@ -92,10 +92,13 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
+      # RELEASE_PAT is a fine-grained PAT with contents:write permission
+      # and "bypass branch protection" enabled. Required so semantic-release
+      # can push the CHANGELOG.md and package.json updates back to main.
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ secrets.RELEASE_PAT }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -113,6 +116,6 @@ jobs:
       - name: Release
         run: pnpm exec semantic-release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
