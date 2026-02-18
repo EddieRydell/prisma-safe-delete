@@ -1,5 +1,6 @@
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
+import sonarjs from 'eslint-plugin-sonarjs';
 
 export default tseslint.config(
   eslint.configs.recommended,
@@ -12,6 +13,7 @@ export default tseslint.config(
         tsconfigRootDir: import.meta.dirname,
       },
     },
+    plugins: { sonarjs },
     rules: {
       // Strictest settings
       '@typescript-eslint/no-explicit-any': 'error',
@@ -39,6 +41,23 @@ export default tseslint.config(
       'eqeqeq': ['error', 'always'],
       'no-console': 'error',
       'no-debugger': 'error',
+
+      // Sonarjs — bug detection (not covered by typescript-eslint)
+      'sonarjs/no-all-duplicated-branches': 'error',
+      'sonarjs/no-duplicated-branches': 'error',
+      'sonarjs/no-identical-conditions': 'error',
+      'sonarjs/no-identical-expressions': 'error',
+      'sonarjs/no-element-overwrite': 'error',
+      'sonarjs/no-empty-collection': 'error',
+      'sonarjs/no-unused-collection': 'error',
+      'sonarjs/no-unthrown-error': 'error',
+      'sonarjs/no-useless-increment': 'error',
+
+      // Sonarjs — code quality
+      'sonarjs/cognitive-complexity': ['warn', 25],
+      'sonarjs/no-identical-functions': 'error',
+      'sonarjs/no-alphabetical-sort': 'warn',
+      'sonarjs/no-misleading-array-reverse': 'warn',
     },
   },
   // Relaxed rules for test files
@@ -63,6 +82,13 @@ export default tseslint.config(
       '@typescript-eslint/non-nullable-type-assertion-style': 'off',
       // Allow async without await in mocks
       '@typescript-eslint/require-await': 'off',
+    },
+  },
+  // Code emitter files are inherently high-complexity (branching per model/strategy)
+  {
+    files: ['src/codegen/emit-runtime.ts'],
+    rules: {
+      'sonarjs/cognitive-complexity': 'off',
     },
   },
   {

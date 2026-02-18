@@ -302,8 +302,8 @@ function extractUniqueStringFields(model: DMMFModel): string[] {
     }
   }
 
-  // Return sorted for deterministic output
-  return [...uniqueStringFields].sort();
+  // Return sorted for deterministic output (ASCII order, not locale-dependent)
+  return [...uniqueStringFields].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**
@@ -327,8 +327,8 @@ function extractAllUniqueFields(model: DMMFModel): string[] {
     }
   }
 
-  // Return sorted for deterministic output
-  return [...uniqueFields].sort();
+  // Return sorted for deterministic output (ASCII order, not locale-dependent)
+  return [...uniqueFields].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**

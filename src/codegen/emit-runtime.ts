@@ -76,9 +76,7 @@ export function emitRuntime(
   lines.push('/** Primary key configuration per model */');
   lines.push('const PRIMARY_KEYS: Record<string, string | string[]> = {');
   for (const model of schema.models) {
-    const pkValue = Array.isArray(model.primaryKey)
-      ? JSON.stringify(model.primaryKey)
-      : JSON.stringify(model.primaryKey);
+    const pkValue = JSON.stringify(model.primaryKey);
     lines.push(`  ${model.name}: ${pkValue},`);
   }
   lines.push('};');
