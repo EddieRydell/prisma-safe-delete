@@ -973,19 +973,17 @@ describe('emitRuntime - bug fix regression tests', () => {
     expect(mangleFn![0]).not.toContain('already mangled');
   });
 
-  it('#42: restoreCascadeChildren does not bail out on non-soft-deletable children', () => {
+  it('#42: restoreCascadeChildren skips non-soft-deletable children', () => {
     const schema = createTestSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    // The old code had: if (!child.isSoftDeletable || !child.deletedAtField) continue;
-    // This skipped non-soft-deletable intermediary nodes entirely, preventing
-    // traversal to their soft-deletable grandchildren.
+    // Non-soft-deletable children are hard-deleted during cascade (and DB ON DELETE CASCADE
+    // handles their descendants). They cannot be restored, so restoreCascadeChildren should
+    // skip them entirely to avoid wasteful DB queries.
     const restoreCascadeFn = /async function restoreCascadeChildren[\s\S]*?^}/m.exec(output);
     expect(restoreCascadeFn).not.toBeNull();
-    expect(restoreCascadeFn![0]).not.toContain('if (!child.isSoftDeletable || !child.deletedAtField) continue');
-    // It should still gate restore operations behind the check
-    expect(restoreCascadeFn![0]).toContain('if (child.isSoftDeletable && child.deletedAtField)');
+    expect(restoreCascadeFn![0]).toContain('if (!child.isSoftDeletable || !child.deletedAtField) continue');
   });
 
   it('#44: _count: true expands to select with filters instead of pass-through', () => {

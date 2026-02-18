@@ -2023,10 +2023,13 @@ async function restoreCascadeChildren(
   const cascaded: Record<string, number> = {};
 
   for (const child of children) {
+    // Skip non-soft-deletable children — they were hard-deleted during the original cascade
+    // and cannot be restored. DB ON DELETE CASCADE handled their descendants.
+    if (!child.isSoftDeletable || !child.deletedAtField) continue;
+
     const lowerChildModel = child.model.charAt(0).toLowerCase() + child.model.slice(1);
     const childDelegate = tx[lowerChildModel as keyof typeof tx] as any;
 
-    // Build where clause to find children
     if (child.foreignKey.length === 0 || child.parentKey.length === 0) continue;
 
     const childWhereConditions = parentPkValues.map((pkVal) => {
@@ -2041,22 +2044,21 @@ async function restoreCascadeChildren(
       return condition;
     });
 
-    // Find children — filter by deletedAt only for soft-deletable children
+    // Find children with matching deleted_at timestamp
     const childRecords = await childDelegate.findMany({
       where: {
         OR: childWhereConditions,
-        ...(child.isSoftDeletable && child.deletedAtField ? { [child.deletedAtField]: deletedAt } : {}),
+        [child.deletedAtField]: deletedAt,
       },
     });
 
     if (childRecords.length === 0) continue;
 
-    // Get child PKs for recursive restore
     const childPkValues = childRecords.map((r: Record<string, unknown>) =>
       extractPrimaryKey(child.model, r)
     );
 
-    // Recurse to grandchildren first (for ALL children, including non-soft-deletable)
+    // Recurse to grandchildren first (depth-first, reverse of cascade delete)
     const grandchildCascaded = await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt${hasAudit ? `,
       auditActorId, auditWrapOptions, auditCallCtx` : ''});
 
@@ -2065,125 +2067,122 @@ async function restoreCascadeChildren(
       cascaded[model] = (cascaded[model] ?? 0) + count;
     }
 
-    // Only restore soft-deletable children
-    if (child.isSoftDeletable && child.deletedAtField) {
-      const childNeedsUnmangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
+    const childNeedsUnmangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
 
-      if (childNeedsUnmangling) {
-        // Per-record restore: unmangle unique fields individually
-        for (const childRecord of childRecords) {
-          const childPkVal = extractPrimaryKey(child.model, childRecord);
-          const unmangledFields = unmangleUniqueFields(child.model, childRecord);
+    if (childNeedsUnmangling) {
+      // Per-record restore: unmangle unique fields individually
+      for (const childRecord of childRecords) {
+        const childPkVal = extractPrimaryKey(child.model, childRecord);
+        const unmangledFields = unmangleUniqueFields(child.model, childRecord);
 
-          // Check for conflicts (using compound unique constraints when available)
-          if (Object.keys(unmangledFields).length > 0) {
-            const constraints = UNIQUE_CONSTRAINTS[child.model] ?? [];
-            const unmangledRecord: Record<string, unknown> = { ...childRecord, ...unmangledFields };
+        // Check for conflicts (using compound unique constraints when available)
+        if (Object.keys(unmangledFields).length > 0) {
+          const constraints = UNIQUE_CONSTRAINTS[child.model] ?? [];
+          const unmangledRecord: Record<string, unknown> = { ...childRecord, ...unmangledFields };
 
-            if (constraints.length > 0) {
-              for (const constraint of constraints) {
-                const involvesUnmangled = constraint.fields.some((f: string) => f in unmangledFields);
-                if (!involvesUnmangled) continue;
+          if (constraints.length > 0) {
+            for (const constraint of constraints) {
+              const involvesUnmangled = constraint.fields.some((f: string) => f in unmangledFields);
+              if (!involvesUnmangled) continue;
 
-                const constraintWhere: Record<string, unknown> = {
+              const constraintWhere: Record<string, unknown> = {
+                [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+              };
+              let hasAllFields = true;
+              for (const f of constraint.fields) {
+                const val = unmangledRecord[f];
+                if (val === null || val === undefined) {
+                  hasAllFields = false;
+                  break;
+                }
+                constraintWhere[f] = val;
+              }
+              if (!hasAllFields) continue;
+
+              const existing = await childDelegate.findFirst({ where: constraintWhere });
+              if (existing) {
+                const fieldNames = constraint.fields.join(', ');
+                throw new Error(
+                  \`Cannot restore \${child.model}: unique constraint on (\${fieldNames}) \` +
+                  \`already satisfied by an active record.\`
+                );
+              }
+            }
+          } else {
+            for (const [field, value] of Object.entries(unmangledFields)) {
+              const existing = await childDelegate.findFirst({
+                where: {
+                  [field]: value,
                   [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-                };
-                let hasAllFields = true;
-                for (const f of constraint.fields) {
-                  const val = unmangledRecord[f];
-                  if (val === null || val === undefined) {
-                    hasAllFields = false;
-                    break;
-                  }
-                  constraintWhere[f] = val;
-                }
-                if (!hasAllFields) continue;
+                },
+              });
 
-                const existing = await childDelegate.findFirst({ where: constraintWhere });
-                if (existing) {
-                  const fieldNames = constraint.fields.join(', ');
-                  throw new Error(
-                    \`Cannot restore \${child.model}: unique constraint on (\${fieldNames}) \` +
-                    \`already satisfied by an active record.\`
-                  );
-                }
-              }
-            } else {
-              for (const [field, value] of Object.entries(unmangledFields)) {
-                const existing = await childDelegate.findFirst({
-                  where: {
-                    [field]: value,
-                    [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-                  },
-                });
-
-                if (existing) {
-                  throw new Error(
-                    \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
-                    \`already exists in an active record.\`
-                  );
-                }
+              if (existing) {
+                throw new Error(
+                  \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
+                  \`already exists in an active record.\`
+                );
               }
             }
-          }
-
-          const updateData: Record<string, unknown> = {
-            ...unmangledFields,
-            [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-          };
-
-          if (child.deletedByField) {
-            updateData[child.deletedByField] = null;
-          }
-
-          try {
-            await childDelegate.update({
-              where: createPkWhereFromValues(child.model, childPkVal),
-              data: updateData,
-            });
-          } catch (e: unknown) {
-            if (e && typeof e === 'object' && 'code' in e && (e as Record<string, unknown>).code === 'P2002') {
-              const meta = (e as Record<string, unknown>).meta as Record<string, unknown> | undefined;
-              const fields = meta?.target ? String(meta.target) : 'unknown';
-              throw new Error(
-                \`Cannot restore \${child.model}: unique constraint violation on (\${fields}). \` +
-                \`An active record with the same unique value was created concurrently.\`
-              );
-            }
-            throw e;
           }
         }
-      } else {
-        // Bulk restore: no unmangling needed
-        const bulkUpdateData: Record<string, unknown> = {
+
+        const updateData: Record<string, unknown> = {
+          ...unmangledFields,
           [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
         };
 
         if (child.deletedByField) {
-          bulkUpdateData[child.deletedByField] = null;
+          updateData[child.deletedByField] = null;
         }
 
-        const childPkConditions = childPkValues;
-        await childDelegate.updateMany({
-          where: { OR: childPkConditions, [child.deletedAtField]: deletedAt },
-          data: bulkUpdateData,
-        });
-      }
-${hasAudit ? `
-      // Write audit events for restored children (restore is an update action)
-      if (auditActorId !== undefined && isAuditable(child.model, 'update')) {
-        const ctx = await _mergeAuditContext(auditWrapOptions, auditCallCtx);
-        for (const childRecord of childRecords) {
-          await writeAuditEvent(
-            tx, child.model, getEntityId(child.model, childRecord), 'restore',
-            auditActorId, childRecord, undefined, ctx,
-          );
+        try {
+          await childDelegate.update({
+            where: createPkWhereFromValues(child.model, childPkVal),
+            data: updateData,
+          });
+        } catch (e: unknown) {
+          if (e && typeof e === 'object' && 'code' in e && (e as Record<string, unknown>).code === 'P2002') {
+            const meta = (e as Record<string, unknown>).meta as Record<string, unknown> | undefined;
+            const fields = meta?.target ? String(meta.target) : 'unknown';
+            throw new Error(
+              \`Cannot restore \${child.model}: unique constraint violation on (\${fields}). \` +
+              \`An active record with the same unique value was created concurrently.\`
+            );
+          }
+          throw e;
         }
       }
-` : ''}
-      // Track the count for this child model
-      cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
+    } else {
+      // Bulk restore: no unmangling needed
+      const bulkUpdateData: Record<string, unknown> = {
+        [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+      };
+
+      if (child.deletedByField) {
+        bulkUpdateData[child.deletedByField] = null;
+      }
+
+      const childPkConditions = childPkValues;
+      await childDelegate.updateMany({
+        where: { OR: childPkConditions, [child.deletedAtField]: deletedAt },
+        data: bulkUpdateData,
+      });
     }
+${hasAudit ? `
+    // Write audit events for restored children (restore is an update action)
+    if (auditActorId !== undefined && isAuditable(child.model, 'update')) {
+      const ctx = await _mergeAuditContext(auditWrapOptions, auditCallCtx);
+      for (const childRecord of childRecords) {
+        await writeAuditEvent(
+          tx, child.model, getEntityId(child.model, childRecord), 'restore',
+          auditActorId, childRecord, undefined, ctx,
+        );
+      }
+    }
+` : ''}
+    // Track the count for this child model
+    cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
   }
 
   return cascaded;
@@ -2281,20 +2280,23 @@ async function previewCascadeChildren(
 
     if (childRecords.length === 0) continue;
 
-    const childPkValues = childRecords.map((r: Record<string, unknown>) =>
-      extractPrimaryKey(child.model, r)
-    );
+    // Count this child model — both soft-deletable (will be soft-deleted) and
+    // non-soft-deletable (will be hard-deleted) children are affected by the cascade.
+    cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
 
-    // Recurse to grandchildren (read-only)
-    const grandchildCascaded = await previewCascadeChildren(tx, child.model, childPkValues);
-
-    for (const [model, count] of Object.entries(grandchildCascaded)) {
-      cascaded[model] = (cascaded[model] ?? 0) + count;
-    }
-
-    // Count soft-deletable children (but don't update them)
+    // Only recurse into soft-deletable children — our code handles their descendants.
+    // Non-soft-deletable children are hard-deleted and DB ON DELETE CASCADE handles
+    // their descendants, which we don't preview.
     if (child.isSoftDeletable && child.deletedAtField) {
-      cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
+      const childPkValues = childRecords.map((r: Record<string, unknown>) =>
+        extractPrimaryKey(child.model, r)
+      );
+
+      const grandchildCascaded = await previewCascadeChildren(tx, child.model, childPkValues);
+
+      for (const [model, count] of Object.entries(grandchildCascaded)) {
+        cascaded[model] = (cascaded[model] ?? 0) + count;
+      }
     }
   }
 
@@ -2770,7 +2772,7 @@ const AUDIT_DELETE_METHODS: AuditMethodDescriptor[] = [
 function emitAuditedMethodCallSite(
   lines: string[],
   desc: AuditMethodDescriptor,
-  model: ParsedModel,
+  model: SoftDeletableModel | AuditOnlyModel,
   options: EmitRuntimeOptions,
   context: {
     wrapInTransaction: boolean;

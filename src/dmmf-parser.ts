@@ -100,7 +100,7 @@ export interface AuditTableModel extends ParsedModelBase {
   deletedAtField: null;
   deletedByField: null;
   isAuditable: false;
-  auditActions: AuditAction[];
+  auditActions: readonly [];
 }
 
 /**
@@ -113,7 +113,7 @@ export interface PlainModel extends ParsedModelBase {
   deletedAtField: null;
   deletedByField: null;
   isAuditable: false;
-  auditActions: AuditAction[];
+  auditActions: readonly [];
 }
 
 /**
