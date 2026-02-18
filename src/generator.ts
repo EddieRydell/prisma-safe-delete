@@ -524,7 +524,7 @@ export function buildToOneRelationWarningLines(
  * Validates the audit table has the required columns when auditable models exist.
  * Throws descriptive errors at generation time.
  */
-function validateAuditSetup(schema: ParsedSchema): void {
+export function validateAuditSetup(schema: ParsedSchema): void {
   const auditableModels = schema.models.filter((m) => m.isAuditable);
   if (auditableModels.length === 0) return;
 
@@ -578,6 +578,14 @@ function validateAuditSetup(schema: ParsedSchema): void {
         `  Column ${col.name}: must be required (not nullable)`,
       );
     }
+  }
+
+  // Validate that created_at has @default (server-side timestamp for audit integrity)
+  const createdAtField = fieldMap.get('created_at');
+  if (createdAtField !== undefined && !createdAtField.hasDefaultValue) {
+    errors.push(
+      '  Column created_at: must have @default(now()) for tamper-resistant server-side timestamps',
+    );
   }
 
   if (errors.length > 0) {
