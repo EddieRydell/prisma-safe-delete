@@ -31,6 +31,29 @@ describe('parseDMMF', () => {
     expect(parsedModel.fields).toHaveLength(3);
   });
 
+  it('extracts defaultFunctionName from function defaults', () => {
+    const model = createMockModel({
+      name: 'AuditEvent',
+      fields: [
+        createMockField({ name: 'id', type: 'String', isId: true }),
+        createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'now', args: [] } }),
+        createMockField({ name: 'static_default', type: 'String', hasDefaultValue: true, default: 'hello' }),
+        createMockField({ name: 'no_default', type: 'String' }),
+      ],
+    });
+    const result = parseDMMF(createMockDMMF([model]));
+    const fields = result.models[0]?.fields;
+
+    const createdAt = fields?.find(f => f.name === 'created_at');
+    expect(createdAt?.defaultFunctionName).toBe('now');
+
+    const staticDefault = fields?.find(f => f.name === 'static_default');
+    expect(staticDefault?.defaultFunctionName).toBeNull();
+
+    const noDefault = fields?.find(f => f.name === 'no_default');
+    expect(noDefault?.defaultFunctionName).toBeNull();
+  });
+
   it('detects soft-deletable model with deleted_at field', () => {
     const model = createMockModel({
       name: 'Post',

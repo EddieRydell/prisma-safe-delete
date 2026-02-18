@@ -1307,7 +1307,7 @@ describe('Integration: audit codegen compilation', () => {
           createMockField({ name: 'action', type: 'String' }),
           createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
           createMockField({ name: 'event_data', type: 'Json' }),
-          createMockField({ name: 'created_at', type: 'DateTime' }),
+          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'now', args: [] } }),
           createMockField({ name: 'parent_event_id', type: 'String', isRequired: false }),
         ],
       }),

@@ -8,7 +8,7 @@ import {
   emitIndex,
   resolveAuditTableConfig,
 } from '../src/codegen/index.js';
-import { buildToOneRelationWarningLines } from '../src/generator.js';
+import { buildToOneRelationWarningLines, validateAuditSetup } from '../src/generator.js';
 import { createMockField, createMockModel, createMockDMMF } from './helpers/mock-dmmf.js';
 
 function createTestSchema() {
@@ -1385,7 +1385,7 @@ function createAuditSchema() {
         createMockField({ name: 'action', type: 'String' }),
         createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
         createMockField({ name: 'event_data', type: 'Json' }),
-        createMockField({ name: 'created_at', type: 'DateTime' }),
+        createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'now', args: [] } }),
         createMockField({ name: 'parent_event_id', type: 'String', isRequired: false }),
         createMockField({ name: 'source', type: 'String', isRequired: false }),
       ],
@@ -1480,7 +1480,7 @@ describe('emitTypes - audit', () => {
           createMockField({ name: 'action', type: 'String' }),
           createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
           createMockField({ name: 'event_data', type: 'Json' }),
-          createMockField({ name: 'created_at', type: 'DateTime' }),
+          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'now', args: [] } }),
         ],
       }),
     ];
@@ -1506,6 +1506,35 @@ describe('emitTypes - audit', () => {
     const output = emitTypes(schema, TEST_CLIENT_PATH);
 
     expect(output).toMatch(/auditContext\?.*AuditContext/);
+  });
+
+  it('audit table model gets read-only delegate type', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // AuditEvent should be a Pick with only read methods
+    expect(output).toContain("Read-only delegate for AuditEvent (audit table");
+    expect(output).toMatch(/SafeAuditEventDelegate = Pick</);
+    expect(output).toMatch(/'findMany'.*'findFirst'.*'count'.*'aggregate'.*'groupBy'/);
+    // Should NOT contain write methods
+    expect(output).not.toMatch(/SafeAuditEventDelegate[\s\S]*?'create'/);
+    expect(output).not.toMatch(/SafeAuditEventDelegate[\s\S]*?'update'/);
+    expect(output).not.toMatch(/SafeAuditEventDelegate[\s\S]*?'delete'/);
+  });
+
+  it('audit table uses SafeAuditEventDelegate in SafeTransactionClient', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    // In SafeTransactionClient, audit table should use Safe delegate (not raw PrismaClient)
+    expect(output).toMatch(/SafeTransactionClient[\s\S]*auditEvent: SafeAuditEventDelegate/);
+  });
+
+  it('audit table uses SafeAuditEventDelegate in IncludingDeletedClient', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).toMatch(/IncludingDeletedClient[\s\S]*auditEvent: SafeAuditEventDelegate/);
   });
 });
 
@@ -1545,6 +1574,124 @@ describe('emitRuntime - audit', () => {
 
     expect(output).not.toContain('AUDITABLE_MODELS');
     expect(output).not.toContain('writeAuditEvent');
+  });
+
+  it('audit table gets read-only delegate in runtime', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const auditDelegate = /function createAuditEventDelegate[\s\S]*?^}/m.exec(output);
+    expect(auditDelegate).not.toBeNull();
+    const auditCode = auditDelegate![0];
+    // Should have read methods
+    expect(auditCode).toContain('findMany');
+    expect(auditCode).toContain('findFirst');
+    expect(auditCode).toContain('count');
+    // Should NOT have write methods
+    expect(auditCode).not.toContain('.create');
+    expect(auditCode).not.toContain('.update');
+    expect(auditCode).not.toContain('.delete');
+  });
+
+  it('emits AUDIT_EXTRA_COLUMNS whitelist', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('AUDIT_EXTRA_COLUMNS');
+    expect(output).toContain('"source"');
+  });
+
+  it('writeAuditEvent filters context to known extra columns', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('filteredContext');
+    expect(output).toContain('AUDIT_EXTRA_COLUMNS.has(key)');
+  });
+
+  it('writeAuditEvent warns on dropped context keys', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('droppedKeys');
+    expect(output).toContain('unknown audit context key(s)');
+    expect(output).toContain('Check for typos in your auditContext');
+  });
+
+  it('writeAuditEvent does not set client-side created_at', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // Extract writeAuditEvent function body
+    const writeAuditFn = /async function writeAuditEvent[\s\S]*?^}/m.exec(output);
+    expect(writeAuditFn).not.toBeNull();
+    expect(writeAuditFn![0]).not.toContain('created_at: new Date()');
+  });
+
+  it('_auditedDelete captures snapshot before deletion', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const deleteFn = /async function _auditedDelete[\s\S]*?^}/m.exec(output);
+    expect(deleteFn).not.toBeNull();
+    const deleteCode = deleteFn![0];
+    // findUniqueOrThrow should come before delete
+    const snapshotIdx = deleteCode.indexOf('findUniqueOrThrow');
+    const deleteIdx = deleteCode.indexOf('delegate.delete(');
+    expect(snapshotIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(snapshotIdx);
+  });
+
+  it('getEntityId throws on null PK', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const getEntityIdFn = /function getEntityId[\s\S]*?^}/m.exec(output);
+    expect(getEntityIdFn).not.toBeNull();
+    expect(getEntityIdFn![0]).toContain('throw new Error');
+    expect(getEntityIdFn![0]).not.toContain("?? ''");
   });
 
   it('audited + soft-deletable model uses actorId in softDelete', () => {
@@ -1766,6 +1913,35 @@ describe('emitRuntime - audit', () => {
 
     expect(output).toContain('AuditContext');
   });
+
+  it('deduplicates audit chain break warnings with a Set', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    expect(output).toContain('_auditChainBreakWarned');
+    expect(output).toContain('_auditChainBreakWarned.has(warnKey)');
+  });
+
+  it('_auditedUpdateManyAndReturn detects before-records missing from results', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    // Check both directions: after→before (existing) and before→after (new)
+    expect(output).toContain('exists in results but had no before-state');
+    expect(output).toContain('was present before updateManyAndReturn but missing from results');
+  });
 });
 
 describe('emitRuntime - non-audited softDelete transaction wrapping', () => {
@@ -1855,5 +2031,74 @@ describe('emitIndex - audit', () => {
 
     expect(output).not.toContain('WrapOptions');
     expect(output).not.toContain('AuditContext');
+  });
+});
+
+describe('validateAuditSetup', () => {
+  it('rejects audit table without @default(now()) on created_at', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        documentation: '/// @audit',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+      createMockModel({
+        name: 'AuditEvent',
+        documentation: '/// @audit-table',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'entity_type', type: 'String' }),
+          createMockField({ name: 'entity_id', type: 'String' }),
+          createMockField({ name: 'action', type: 'String' }),
+          createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
+          createMockField({ name: 'event_data', type: 'Json' }),
+          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: false }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+
+    expect(() => { validateAuditSetup(schema); }).toThrow(
+      '@default(now()) for tamper-resistant server-side timestamps',
+    );
+  });
+
+  it('rejects audit table with non-now() default on created_at', () => {
+    const models = [
+      createMockModel({
+        name: 'User',
+        documentation: '/// @audit',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+      createMockModel({
+        name: 'AuditEvent',
+        documentation: '/// @audit-table',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'entity_type', type: 'String' }),
+          createMockField({ name: 'entity_id', type: 'String' }),
+          createMockField({ name: 'action', type: 'String' }),
+          createMockField({ name: 'actor_id', type: 'String', isRequired: false }),
+          createMockField({ name: 'event_data', type: 'Json' }),
+          createMockField({ name: 'created_at', type: 'DateTime', hasDefaultValue: true, default: { name: 'cuid', args: [] } }),
+        ],
+      }),
+    ];
+    const schema = parseDMMF(createMockDMMF(models));
+
+    expect(() => { validateAuditSetup(schema); }).toThrow(
+      '@default(now()) for tamper-resistant server-side timestamps',
+    );
+  });
+
+  it('accepts audit table with @default(now()) on created_at', () => {
+    const schema = createAuditSchema();
+    expect(() => { validateAuditSetup(schema); }).not.toThrow();
   });
 });

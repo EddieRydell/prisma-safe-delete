@@ -78,6 +78,9 @@ export function emitAuditHelpers(schema: ParsedSchema, config: AuditTableConfig)
   lines.push(`const AUDIT_TABLE_NAME = ${JSON.stringify(config.lowerName)};`);
   lines.push(`const AUDIT_TABLE_MODEL_NAME = ${JSON.stringify(config.modelName)};`);
   lines.push(`const AUDIT_TABLE_HAS_PARENT_EVENT_ID = ${String(config.hasParentEventId)};`);
+  // Emit whitelist of allowed extra columns for audit context validation
+  const extraColNames = config.extraColumns.map((c) => JSON.stringify(c.name));
+  lines.push(`const AUDIT_EXTRA_COLUMNS: ReadonlySet<string> = new Set([${extraColNames.join(', ')}]);`);
   lines.push('');
 
   // Emit writeAuditEvent function
@@ -96,14 +99,33 @@ async function writeAuditEvent(
   context?: Record<string, unknown>,
 ): Promise<string> {
   const delegate = tx[AUDIT_TABLE_NAME as keyof typeof tx] as any;
+  // Filter context to only known extra columns — prevents unknown keys from reaching the database
+  const filteredContext: Record<string, unknown> = {};
+  if (context) {
+    const droppedKeys: string[] = [];
+    for (const key of Object.keys(context)) {
+      if (AUDIT_EXTRA_COLUMNS.has(key)) {
+        filteredContext[key] = context[key];
+      } else {
+        droppedKeys.push(key);
+      }
+    }
+    if (droppedKeys.length > 0) {
+      console.warn(
+        \`[prisma-safe-delete] writeAuditEvent: unknown audit context key(s) \${droppedKeys.map(k => \`'\${k}'\`).join(', ')} dropped. \` +
+        \`Allowed keys: \${[...AUDIT_EXTRA_COLUMNS].join(', ') || '(none)'}. Check for typos in your auditContext.\`,
+      );
+    }
+  }
   const data: Record<string, unknown> = {
-    ...(context ?? {}),
+    ...filteredContext,
     entity_type: entityType,
     entity_id: entityId,
     action,
     actor_id: actorId,
     event_data: eventData,
-    created_at: new Date(),
+    // created_at intentionally omitted — relies on @default(now()) for tamper-resistant server-side timestamps.
+    // validateAuditSetup() enforces that the audit table's created_at has @default(now()).
     ...(AUDIT_TABLE_HAS_PARENT_EVENT_ID ? { parent_event_id: parentEventId ?? null } : {}),
   };
   const event = await delegate.create({ data });
@@ -142,10 +164,20 @@ function getEntityId(modelName: string, record: Record<string, unknown>): string
   const pk = PRIMARY_KEYS[modelName];
   if (Array.isArray(pk)) {
     const obj: Record<string, unknown> = {};
-    for (const field of pk) obj[field] = record[field];
+    for (const field of pk) {
+      const val = record[field];
+      if (val === undefined || val === null) {
+        throw new Error(\`[prisma-safe-delete] getEntityId: PK field '\${field}' is \${String(val)} on model '\${modelName}'. Cannot generate audit entity_id.\`);
+      }
+      obj[field] = val;
+    }
     return JSON.stringify(obj);
   }
-  return String(record[pk as string] ?? '');
+  const pkValue = record[pk as string];
+  if (pkValue === undefined || pkValue === null) {
+    throw new Error(\`[prisma-safe-delete] getEntityId: PK field '\${String(pk)}' is \${String(pkValue)} on model '\${modelName}'. Cannot generate audit entity_id.\`);
+  }
+  return String(pkValue);
 }`);
   lines.push('');
 
@@ -160,6 +192,13 @@ function getEntityId(modelName: string, record: Record<string, unknown>): string
  * Emits shared _audited* helper functions that encapsulate audit logic.
  * Both main delegates and tx wrappers call these, eliminating code duplication.
  * Each helper takes a tx + delegate so it works in both contexts.
+ *
+ * ATOMICITY CONTRACT: All _audited* helpers assume that \`tx\` is an interactive
+ * transaction client and \`delegate\` is derived from that same transaction
+ * (i.e. \`tx[modelName]\`). This is structurally guaranteed by the callers in
+ * emit-runtime.ts which always pass \`tx\` and \`tx.modelName\` together.
+ * If any operation throws (audit write or data mutation), the entire transaction
+ * rolls back — no orphaned audit events or un-audited mutations can occur.
  */
 function emitAuditOperationHelpers(): string {
   return `
@@ -276,10 +315,12 @@ async function _auditedUpdateMany(
     await Promise.all(beforeRecords.map((before: any) => {
       const pk = extractPrimaryKey(modelName, before);
       const after = afterRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
-      if (after) {
-        return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
+      if (!after) {
+        throw new Error(
+          \`[prisma-safe-delete] _auditedUpdateMany: record \${JSON.stringify(pk)} for model '\${modelName}' was present before updateMany but missing after. This indicates a concurrent modification — the enclosing transaction will be rolled back to preserve audit completeness.\`,
+        );
       }
-      return undefined;
+      return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
     }));
   }
   return result;
@@ -303,11 +344,23 @@ async function _auditedUpdateManyAndReturn(
   await Promise.all(results.map((after: any) => {
     const pk = extractPrimaryKey(modelName, after);
     const before = beforeRecords.find((r: any) => JSON.stringify(extractPrimaryKey(modelName, r)) === JSON.stringify(pk));
-    if (before) {
-      return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
+    if (!before) {
+      throw new Error(
+        \`[prisma-safe-delete] _auditedUpdateManyAndReturn: record \${JSON.stringify(pk)} for model '\${modelName}' exists in results but had no before-state. This indicates a concurrent modification — the enclosing transaction will be rolled back to preserve audit completeness.\`,
+      );
     }
-    return undefined;
+    return writeAuditEvent(tx, modelName, getEntityId(modelName, after), 'update', actorId, { before, after }, undefined, ctx);
   }));
+  // Check for before-records that disappeared from results (un-audited mutations)
+  const afterPks = new Set(results.map((r: any) => JSON.stringify(extractPrimaryKey(modelName, r))));
+  for (const before of beforeRecords) {
+    const pk = JSON.stringify(extractPrimaryKey(modelName, before));
+    if (!afterPks.has(pk)) {
+      throw new Error(
+        \`[prisma-safe-delete] _auditedUpdateManyAndReturn: record \${pk} for model '\${modelName}' was present before updateManyAndReturn but missing from results. This indicates a concurrent modification — the enclosing transaction will be rolled back to preserve audit completeness.\`,
+      );
+    }
+  }
   return results;
 }
 
@@ -335,7 +388,8 @@ async function _auditedUpsert(
 }
 
 /**
- * Audited delete: delete record, write audit event, return record.
+ * Audited delete: capture pre-mutation snapshot, write audit event, then delete.
+ * Snapshot is captured before deletion for consistent audit ordering with soft-delete.
  */
 async function _auditedDelete(
   tx: Prisma.TransactionClient,
@@ -346,14 +400,14 @@ async function _auditedDelete(
   wrapOptions: any,
   callCtx?: Record<string, unknown>,
 ): Promise<any> {
-  const record = await delegate.delete(args);
+  const snapshot = await delegate.findUniqueOrThrow({ where: args.where });
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
-  await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx);
-  return record;
+  await writeAuditEvent(tx, modelName, getEntityId(modelName, snapshot), 'delete', actorId, snapshot, undefined, ctx);
+  return delegate.delete(args);
 }
 
 /**
- * Audited deleteMany: fetch records, deleteMany, write audit events, return result.
+ * Audited deleteMany: fetch pre-mutation snapshots, write audit events, then deleteMany.
  */
 async function _auditedDeleteMany(
   tx: Prisma.TransactionClient,
@@ -365,12 +419,11 @@ async function _auditedDeleteMany(
   callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const records = await delegate.findMany({ where: args?.where });
-  const result = await delegate.deleteMany(args);
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
   await Promise.all(records.map((record: any) =>
     writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'delete', actorId, record, undefined, ctx),
   ));
-  return result;
+  return delegate.deleteMany(args);
 }
 
 /**
@@ -387,12 +440,12 @@ async function _auditedHardDelete(
   wrapOptions: any,
   callCtx?: Record<string, unknown>,
 ): Promise<any> {
-  const record = await delegate.delete(args);
   if (isAuditable(modelName, 'delete')) {
+    const snapshot = await delegate.findUniqueOrThrow({ where: args.where });
     const ctx = await _mergeAuditContext(wrapOptions, callCtx);
-    await writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'hard_delete', actorId, record, undefined, ctx);
+    await writeAuditEvent(tx, modelName, getEntityId(modelName, snapshot), 'hard_delete', actorId, snapshot, undefined, ctx);
   }
-  return record;
+  return delegate.delete(args);
 }
 
 /**
@@ -409,14 +462,13 @@ async function _auditedHardDeleteMany(
   callCtx?: Record<string, unknown>,
 ): Promise<any> {
   const records = await delegate.findMany({ where: args?.where });
-  const result = await delegate.deleteMany(args);
   if (isAuditable(modelName, 'delete') && records.length > 0) {
     const ctx = await _mergeAuditContext(wrapOptions, callCtx);
     await Promise.all(records.map((record: any) =>
       writeAuditEvent(tx, modelName, getEntityId(modelName, record), 'hard_delete', actorId, record, undefined, ctx),
     ));
   }
-  return result;
+  return delegate.deleteMany(args);
 }`.trim();
 }
 

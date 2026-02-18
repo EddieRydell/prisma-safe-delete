@@ -11,6 +11,8 @@ export interface ParsedField {
   isId: boolean;
   isUnique: boolean;
   hasDefaultValue: boolean;
+  /** For function defaults (e.g. @default(now())), the function name; null otherwise */
+  defaultFunctionName: string | null;
   isRelation: boolean;
 }
 
@@ -227,6 +229,14 @@ function extractPrimaryKey(model: DMMFModel): string | string[] {
  * Parses a single DMMF field into our ParsedField format
  */
 function parseField(field: DMMFField): ParsedField {
+  // Extract function name from defaults like @default(now()), @default(cuid()), etc.
+  // DMMF represents these as { name: string, args: any[] }; scalar defaults are primitives.
+  const rawDefault = (field as unknown as { default?: unknown }).default;
+  const defaultFunctionName =
+    rawDefault !== null && rawDefault !== undefined && typeof rawDefault === 'object' && 'name' in rawDefault
+      ? String((rawDefault as { name: unknown }).name)
+      : null;
+
   return {
     name: field.name,
     type: field.type,
@@ -235,6 +245,7 @@ function parseField(field: DMMFField): ParsedField {
     isId: field.isId,
     isUnique: field.isUnique,
     hasDefaultValue: field.hasDefaultValue,
+    defaultFunctionName,
     isRelation: field.relationName !== undefined,
   };
 }

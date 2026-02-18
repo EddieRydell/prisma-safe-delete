@@ -1247,6 +1247,9 @@ async function softDeleteWithCascade(
   auditWrapOptions?: any,
   auditCallCtx?: Record<string, unknown>,` : '';
   return `${wrapperFn}
+${hasAudit ? `/** Deduplicates audit chain break warnings — emits once per parent→child pair per process. */
+const _auditChainBreakWarned = new Set<string>();
+` : ''}
 /**
  * Performs a soft delete with cascade within an existing transaction
  */
@@ -1435,7 +1438,9 @@ ${hasAudit ? `
       // Non-auditable child: chain breaks, pass undefined for grandchildren.
       // Any soft-deletable grandchildren of this child will not receive a parent_event_id,
       // even if they are themselves auditable, because the linking chain is broken here.
-      if (process.env.NODE_ENV !== 'production') {
+      const warnKey = \`\${parentModel}->\${child.model}\`;
+      if (!_auditChainBreakWarned.has(warnKey)) {
+        _auditChainBreakWarned.add(warnKey);
         // eslint-disable-next-line no-console
         console.warn(
           \`[prisma-safe-delete] audit chain break: cascade from '\${parentModel}' through '\${child.model}' (\${child.model} is not auditable for 'delete'). \` +
@@ -2727,6 +2732,27 @@ ${includingDeletedMethods}
     return emitAuditOnlyDelegate(model, lowerName, options);
   }
 
+  // Audit table model: read-only delegate to prevent tampering with audit trail
+  if (model.isAuditTable) {
+    return `
+/**
+ * Creates a read-only delegate for ${name} (audit table)
+ */
+function create${name}Delegate(prisma: PrismaClient${hasAudit ? ', wrapOptions?: WrapOptions' : ''}): Safe${name}Delegate {
+  const original = prisma.${lowerName};
+  return {
+    findMany: original.findMany.bind(original),
+    findFirst: original.findFirst.bind(original),
+    findFirstOrThrow: original.findFirstOrThrow.bind(original),
+    findUnique: original.findUnique.bind(original),
+    findUniqueOrThrow: original.findUniqueOrThrow.bind(original),
+    count: original.count.bind(original),
+    aggregate: original.aggregate.bind(original),
+    groupBy: original.groupBy.bind(original),
+  } as Safe${name}Delegate;
+}`.trim();
+  }
+
   return `
 /**
  * Creates a delegate for ${name} (no soft-delete)
@@ -3045,6 +3071,9 @@ function emitIncludingDeletedClient(schema: ParsedSchema): string {
       lines.push(`      aggregate: ((...args: any[]) => prisma.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`      groupBy: ((...args: any[]) => prisma.${lowerName}.groupBy(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['groupBy'],`);
       lines.push(`    },`);
+    } else if (model.isAuditTable) {
+      // Audit table: read-only in $includingDeleted too
+      lines.push(`    ${lowerName}: create${model.name}Delegate(prisma),`);
     } else {
       // Non-soft-deletable models can use raw delegate
       lines.push(`    ${lowerName}: prisma.${lowerName},`);
@@ -3489,6 +3518,18 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         emitAuditedMethodCallSite(lines, desc, model, options, txAuditOnlyContext);
       }
       lines.push(`    } as Safe${model.name}Delegate,`);
+    } else if (model.isAuditTable) {
+      // Audit table in transaction: read-only access
+      lines.push(`    ${lowerName}: {`);
+      lines.push(`      findMany: tx.${lowerName}.findMany.bind(tx.${lowerName}),`);
+      lines.push(`      findFirst: tx.${lowerName}.findFirst.bind(tx.${lowerName}),`);
+      lines.push(`      findFirstOrThrow: tx.${lowerName}.findFirstOrThrow.bind(tx.${lowerName}),`);
+      lines.push(`      findUnique: tx.${lowerName}.findUnique.bind(tx.${lowerName}),`);
+      lines.push(`      findUniqueOrThrow: tx.${lowerName}.findUniqueOrThrow.bind(tx.${lowerName}),`);
+      lines.push(`      count: tx.${lowerName}.count.bind(tx.${lowerName}),`);
+      lines.push(`      aggregate: tx.${lowerName}.aggregate.bind(tx.${lowerName}),`);
+      lines.push(`      groupBy: tx.${lowerName}.groupBy.bind(tx.${lowerName}),`);
+      lines.push(`    } as Safe${model.name}Delegate,`);
     } else {
       lines.push(`    ${lowerName}: tx.${lowerName},`);
     }
@@ -3552,6 +3593,18 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`        aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
       lines.push(`        groupBy: ((...args: any[]) => tx.${lowerName}.groupBy(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['groupBy'],`);
       lines.push(`      },`);
+    } else if (model.isAuditTable) {
+      // Audit table: read-only in $includingDeleted too
+      lines.push(`      ${lowerName}: {`);
+      lines.push(`        findMany: tx.${lowerName}.findMany.bind(tx.${lowerName}),`);
+      lines.push(`        findFirst: tx.${lowerName}.findFirst.bind(tx.${lowerName}),`);
+      lines.push(`        findFirstOrThrow: tx.${lowerName}.findFirstOrThrow.bind(tx.${lowerName}),`);
+      lines.push(`        findUnique: tx.${lowerName}.findUnique.bind(tx.${lowerName}),`);
+      lines.push(`        findUniqueOrThrow: tx.${lowerName}.findUniqueOrThrow.bind(tx.${lowerName}),`);
+      lines.push(`        count: tx.${lowerName}.count.bind(tx.${lowerName}),`);
+      lines.push(`        aggregate: tx.${lowerName}.aggregate.bind(tx.${lowerName}),`);
+      lines.push(`        groupBy: tx.${lowerName}.groupBy.bind(tx.${lowerName}),`);
+      lines.push(`      } as Safe${model.name}Delegate,`);
     } else {
       lines.push(`      ${lowerName}: tx.${lowerName},`);
     }
