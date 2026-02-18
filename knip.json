@@ -9,5 +9,6 @@
     "tests/e2e-no-cascade/generated/**",
     "tests/**/prisma.config.ts"
   ],
-  "ignoreDependencies": ["dotenv", "@prisma/client", "conventional-changelog-conventionalcommits"]
+  "ignoreDependencies": ["dotenv", "@prisma/client", "conventional-changelog-conventionalcommits"],
+  "ignoreExportsUsedInFile": true
 }

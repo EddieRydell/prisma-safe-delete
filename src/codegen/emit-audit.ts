@@ -97,14 +97,14 @@ async function writeAuditEvent(
 ): Promise<string> {
   const delegate = tx[AUDIT_TABLE_NAME as keyof typeof tx] as any;
   const data: Record<string, unknown> = {
+    ...(context ?? {}),
     entity_type: entityType,
     entity_id: entityId,
     action,
     actor_id: actorId,
     event_data: eventData,
     created_at: new Date(),
-    ...(AUDIT_TABLE_HAS_PARENT_EVENT_ID && parentEventId !== undefined ? { parent_event_id: parentEventId } : {}),
-    ...(context ?? {}),
+    ...(AUDIT_TABLE_HAS_PARENT_EVENT_ID ? { parent_event_id: parentEventId ?? null } : {}),
   };
   const event = await delegate.create({ data });
   const pk = PRIMARY_KEYS[AUDIT_TABLE_MODEL_NAME];

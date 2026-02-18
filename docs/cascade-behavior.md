@@ -47,7 +47,7 @@ console.log(cascaded); // { Post: 2, Comment: 5 }
 
 - Only follows `onDelete: Cascade` relations
 - Only soft-deletes children that have a `deleted_at` field
-- Children without `deleted_at` are left unchanged
+- Children without `deleted_at` are **hard-deleted** (matching the database's `onDelete: Cascade` behavior). Their descendants are also removed by the database cascade.
 - All cascaded records get the same `deleted_at` timestamp
 - Entire operation is transactional (all-or-nothing)
 

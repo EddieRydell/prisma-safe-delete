@@ -1,4 +1,4 @@
-import type { ParsedModel, ParsedSchema } from '../dmmf-parser.js';
+import type { AuditOnlyModel, ParsedModel, ParsedSchema, SoftDeletableModel } from '../dmmf-parser.js';
 import type { CascadeGraph } from '../cascade-graph.js';
 import { emitAuditHelpers, type AuditTableConfig } from './emit-audit.js';
 
@@ -54,7 +54,7 @@ export function emitRuntime(
   lines.push('/** Metadata about soft-deletable models */');
   lines.push('const SOFT_DELETABLE_MODELS: Record<string, { deletedAtField: string }> = {');
   for (const model of schema.models) {
-    if (model.isSoftDeletable && model.deletedAtField !== null) {
+    if (model.isSoftDeletable) {
       lines.push(`  ${model.name}: { deletedAtField: ${JSON.stringify(model.deletedAtField)} },`);
     }
   }
@@ -140,6 +140,28 @@ export function emitRuntime(
   lines.push('};');
   lines.push('');
 
+  // Emit unique constraints metadata (for compound unique conflict checking on restore)
+  lines.push('/**');
+  lines.push(' * Structured unique constraint info per model.');
+  lines.push(' * Each entry lists the fields in that constraint. Compound constraints have multiple fields.');
+  lines.push(' * Used for accurate conflict checking during restore (avoids false positives on compound uniques).');
+  lines.push(' */');
+  lines.push('const UNIQUE_CONSTRAINTS: Record<string, { fields: string[] }[]> = {');
+  for (const model of schema.models) {
+    // Only emit constraints for models that have unique string fields (those are the ones that get mangled/unmangled)
+    const relevantConstraints = model.uniqueConstraints.filter(c =>
+      c.fields.some(f => model.uniqueStringFields.includes(f))
+    );
+    if (relevantConstraints.length > 0) {
+      const entries = relevantConstraints.map(c =>
+        `{ fields: ${JSON.stringify(c.fields)} }`
+      );
+      lines.push(`  ${model.name}: [${entries.join(', ')}],`);
+    }
+  }
+  lines.push('};');
+  lines.push('');
+
   // Emit unique strategy constant
   lines.push('/**');
   lines.push(' * Strategy for handling unique constraints on soft delete.');
@@ -171,7 +193,7 @@ export function emitRuntime(
     lines.push(' */');
     lines.push('const SENTINEL_COMPOUND_UNIQUES: Record<string, { keyName: string; fields: string[]; deletedAtField: string }[]> = {');
     for (const model of schema.models) {
-      if (!model.isSoftDeletable || model.deletedAtField === null) continue;
+      if (!model.isSoftDeletable) continue;
       const sentinelUniques = model.uniqueConstraints.filter(c => c.includesDeletedAt && c.compoundKeyName !== undefined);
       if (sentinelUniques.length === 0) continue;
       const entries = sentinelUniques.map(c =>
@@ -209,12 +231,9 @@ export function emitRuntime(
   }
 
   // Emit soft delete cascade function
-  // softDeleteWithCascade (the wrapper) is only needed by non-audited complex-path models in the main delegate.
-  // softDeleteWithCascadeInTx is always needed for any complex-path model (used by both main delegate audited models and TX wrapper).
-  const needsSoftDeleteWithCascadeWrapper = schema.models.some(
-    m => m.isSoftDeletable && m.deletedAtField !== null && !isSimpleModel(m, options) && !(m.isAuditable && hasAudit)
-  );
-  lines.push(emitSoftDeleteCascadeFunction(needsSoftDeleteWithCascadeWrapper, hasAudit));
+  // softDeleteWithCascade (the wrapper) is no longer needed — all callers now use softDeleteWithCascadeInTx directly.
+  // softDeleteWithCascadeInTx is always needed for any complex-path model (used by both main delegate and TX wrapper).
+  lines.push(emitSoftDeleteCascadeFunction(false, hasAudit));
   lines.push('');
 
   // Emit model delegate wrappers
@@ -484,7 +503,7 @@ function mangleUniqueFields(
     if (mangledValue.length > maxLength) {
       throw new Error(
         \`Cannot soft delete \${modelName}: mangling unique field "\${field}" would exceed max length \` +
-        \`(\${mangledValue.length} > \${maxLength}). Original value: "\${strValue.substring(0, 50)}\${strValue.length > 50 ? '...' : ''}". \` +
+        \`(\${mangledValue.length} > \${maxLength}, original length: \${strValue.length}). \` +
         \`Consider using a partial unique index instead, or hard delete the record.\`
       );
     }
@@ -862,6 +881,20 @@ function postProcessRead<T>(
     if (result === null || result === undefined) return result;
     const nullified = nullifyDeletedToOneRelations(result, modelName, args);
     return stripInjectedFields(nullified, injectedPaths) as T;
+  });
+}
+
+/**
+ * Post-processes read results for $onlyDeleted: strips injected fields but does NOT
+ * nullify deleted to-one relations (since we are intentionally querying deleted records).
+ */
+function postProcessReadOnlyDeleted<T>(
+  promise: Promise<T>,
+  injectedPaths: string[]
+): Promise<T> {
+  return promise.then(result => {
+    if (result === null || result === undefined) return result;
+    return stripInjectedFields(result, injectedPaths) as T;
   });
 }`.trim();
 }
@@ -1414,17 +1447,20 @@ ${hasAudit ? `
       childEventIds = undefined;
     }
 ` : ''}
-    // Recurse to grandchildren first (depth-first)
-    const grandchildCascaded = await cascadeToChildren(tx, child.model, childPkValues, deletedAt, deletedBy${hasAudit ? `,
-      childEventIds, auditActorId, auditWrapOptions, auditCallCtx` : ''});
-
-    // Merge grandchild results
-    for (const [model, count] of Object.entries(grandchildCascaded)) {
-      cascaded[model] = (cascaded[model] ?? 0) + count;
-    }
-
-    // Soft delete children (if soft-deletable)
     if (child.isSoftDeletable && child.deletedAtField) {
+      // Recurse to grandchildren first (depth-first) — only for soft-deletable children.
+      // For non-soft-deletable children, we hard-delete them below and let DB ON DELETE CASCADE
+      // handle their descendants. Recursing first would soft-delete grandchildren that the DB
+      // cascade then destroys, causing data loss.
+      const grandchildCascaded = await cascadeToChildren(tx, child.model, childPkValues, deletedAt, deletedBy${hasAudit ? `,
+        childEventIds, auditActorId, auditWrapOptions, auditCallCtx` : ''});
+
+      // Merge grandchild results
+      for (const [model, count] of Object.entries(grandchildCascaded)) {
+        cascaded[model] = (cascaded[model] ?? 0) + count;
+      }
+
+      // Soft delete children
       const childNeedsMangling = UNIQUE_STRATEGY === 'mangle' && (getUniqueStringFields(child.model).length > 0);
 
       if (childNeedsMangling) {
@@ -1463,6 +1499,46 @@ ${hasAudit ? `
           data: bulkUpdateData,
         });
       }
+
+      // Track the count for this child model
+      cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
+    } else {
+      // Non-soft-deletable children: hard delete them
+      const childPkConditions = childRecords.map((r: Record<string, unknown>) =>
+        extractPrimaryKey(child.model, r)
+      );
+${hasAudit ? `
+      // Write audit events for hard-deleted non-soft-deletable children
+      if (auditActorId !== undefined && isAuditable(child.model, 'delete') && auditParentEventIds) {
+        const ctx = await _mergeAuditContext(auditWrapOptions, auditCallCtx);
+        for (const childRecord of childRecords) {
+          // Find which parent this child belongs to (match FK values)
+          let parentEventId: string | undefined;
+          for (let pi = 0; pi < parentPkValues.length; pi++) {
+            const pkVal = parentPkValues[pi];
+            if (!pkVal) continue;
+            let matches = true;
+            for (let fi = 0; fi < child.foreignKey.length; fi++) {
+              const fk = child.foreignKey[fi];
+              const pk = child.parentKey[fi];
+              if (fk && pk && String(childRecord[fk]) !== String(pkVal[pk])) {
+                matches = false;
+                break;
+              }
+            }
+            if (matches) {
+              parentEventId = auditParentEventIds[pi];
+              break;
+            }
+          }
+          await writeAuditEvent(
+            tx, child.model, getEntityId(child.model, childRecord), 'hard_delete',
+            auditActorId, childRecord, parentEventId, ctx,
+          );
+        }
+      }
+` : ''}
+      await childDelegate.deleteMany({ where: { OR: childPkConditions } });
 
       // Track the count for this child model
       cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
@@ -1532,21 +1608,60 @@ async function restoreRecordWithDelegate(
   // Get unmangled field values
   const unmangledFields = unmangleUniqueFields(modelName, record);
 
-  // Check for conflicts before restoring
+  // Check for conflicts before restoring (using compound unique constraints when available)
   if (Object.keys(unmangledFields).length > 0) {
-    for (const [field, value] of Object.entries(unmangledFields)) {
-      const existing = await delegate.findFirst({
-        where: {
-          [field]: value,
-          [deletedAtField]: ACTIVE_DELETED_AT_VALUE, // Only check against active records
-        },
-      });
+    const constraints = UNIQUE_CONSTRAINTS[modelName] ?? [];
+    // Build the full unmangled record for compound lookups
+    const unmangledRecord: Record<string, unknown> = { ...record, ...unmangledFields };
 
-      if (existing) {
-        throw new Error(
-          \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
-          \`already exists in an active record. Delete or modify the conflicting record first.\`
-        );
+    if (constraints.length > 0) {
+      // Use structured constraints for accurate compound checking
+      for (const constraint of constraints) {
+        // Only check constraints that involve unmangled fields
+        const involvesUnmangled = constraint.fields.some((f: string) => f in unmangledFields);
+        if (!involvesUnmangled) continue;
+
+        // Build compound where clause from all fields in this constraint
+        const constraintWhere: Record<string, unknown> = {
+          [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+        };
+        let hasAllFields = true;
+        for (const f of constraint.fields) {
+          const val = unmangledRecord[f];
+          if (val === null || val === undefined) {
+            // Null values don't conflict with unique constraints
+            hasAllFields = false;
+            break;
+          }
+          constraintWhere[f] = val;
+        }
+        if (!hasAllFields) continue;
+
+        const existing = await delegate.findFirst({ where: constraintWhere });
+        if (existing) {
+          const fieldNames = constraint.fields.join(', ');
+          throw new Error(
+            \`Cannot restore \${modelName}: unique constraint on (\${fieldNames}) \` +
+            \`already satisfied by an active record. Delete or modify the conflicting record first.\`
+          );
+        }
+      }
+    } else {
+      // Fallback: check each unmangled field individually (single-field uniques)
+      for (const [field, value] of Object.entries(unmangledFields)) {
+        const existing = await delegate.findFirst({
+          where: {
+            [field]: value,
+            [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+          },
+        });
+
+        if (existing) {
+          throw new Error(
+            \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+            \`already exists in an active record. Delete or modify the conflicting record first.\`
+          );
+        }
       }
     }
   }
@@ -1645,21 +1760,54 @@ async function restoreManyWithDelegate(
     for (const record of records) {
       const unmangledFields = unmangleUniqueFields(modelName, record);
 
-      // Check for conflicts
+      // Check for conflicts (using compound unique constraints when available)
       if (Object.keys(unmangledFields).length > 0) {
-        for (const [field, value] of Object.entries(unmangledFields)) {
-          const existing = await delegate.findFirst({
-            where: {
-              [field]: value,
-              [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-            },
-          });
+        const constraints = UNIQUE_CONSTRAINTS[modelName] ?? [];
+        const unmangledRecord: Record<string, unknown> = { ...record, ...unmangledFields };
 
-          if (existing) {
-            throw new Error(
-              \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
-              \`already exists in an active record. Delete or modify the conflicting record first.\`
-            );
+        if (constraints.length > 0) {
+          for (const constraint of constraints) {
+            const involvesUnmangled = constraint.fields.some((f: string) => f in unmangledFields);
+            if (!involvesUnmangled) continue;
+
+            const constraintWhere: Record<string, unknown> = {
+              [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+            };
+            let hasAllFields = true;
+            for (const f of constraint.fields) {
+              const val = unmangledRecord[f];
+              if (val === null || val === undefined) {
+                hasAllFields = false;
+                break;
+              }
+              constraintWhere[f] = val;
+            }
+            if (!hasAllFields) continue;
+
+            const existing = await delegate.findFirst({ where: constraintWhere });
+            if (existing) {
+              const fieldNames = constraint.fields.join(', ');
+              throw new Error(
+                \`Cannot restore \${modelName}: unique constraint on (\${fieldNames}) \` +
+                \`already satisfied by an active record. Delete or modify the conflicting record first.\`
+              );
+            }
+          }
+        } else {
+          for (const [field, value] of Object.entries(unmangledFields)) {
+            const existing = await delegate.findFirst({
+              where: {
+                [field]: value,
+                [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+              },
+            });
+
+            if (existing) {
+              throw new Error(
+                \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+                \`already exists in an active record. Delete or modify the conflicting record first.\`
+              );
+            }
           }
         }
       }
@@ -1740,7 +1888,10 @@ async function restoreWithCascadeInTx(
   tx: Prisma.TransactionClient,
   modelName: string,
   where: Record<string, unknown>,
-  projection: Record<string, unknown> = {}
+  projection: Record<string, unknown> = {},${hasAudit ? `
+  auditActorId?: string | null,
+  auditWrapOptions?: any,
+  auditCallCtx?: Record<string, unknown>,` : ''}
 ): Promise<{ record: Record<string, unknown> | null; cascaded: Record<string, number> }> {
   const deletedAtField = getDeletedAtField(modelName);
   if (!deletedAtField) {
@@ -1767,26 +1918,60 @@ async function restoreWithCascadeInTx(
 
   // Restore children first (depth-first, reverse of cascade delete)
   const pkVal = extractPrimaryKey(modelName, record);
-  const cascaded = await restoreCascadeChildren(tx, modelName, [pkVal], deletedAt);
+  const cascaded = await restoreCascadeChildren(tx, modelName, [pkVal], deletedAt${hasAudit ? `,
+    auditActorId, auditWrapOptions, auditCallCtx` : ''});
 
   // Now restore the parent record
   const unmangledFields = unmangleUniqueFields(modelName, record);
 
-  // Check for conflicts
+  // Check for conflicts (using compound unique constraints when available)
   if (Object.keys(unmangledFields).length > 0) {
-    for (const [field, value] of Object.entries(unmangledFields)) {
-      const existing = await delegate.findFirst({
-        where: {
-          [field]: value,
-          [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-        },
-      });
+    const constraints = UNIQUE_CONSTRAINTS[modelName] ?? [];
+    const unmangledRecord: Record<string, unknown> = { ...record, ...unmangledFields };
 
-      if (existing) {
-        throw new Error(
-          \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
-          \`already exists in an active record. Delete or modify the conflicting record first.\`
-        );
+    if (constraints.length > 0) {
+      for (const constraint of constraints) {
+        const involvesUnmangled = constraint.fields.some((f: string) => f in unmangledFields);
+        if (!involvesUnmangled) continue;
+
+        const constraintWhere: Record<string, unknown> = {
+          [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+        };
+        let hasAllFields = true;
+        for (const f of constraint.fields) {
+          const val = unmangledRecord[f];
+          if (val === null || val === undefined) {
+            hasAllFields = false;
+            break;
+          }
+          constraintWhere[f] = val;
+        }
+        if (!hasAllFields) continue;
+
+        const existing = await delegate.findFirst({ where: constraintWhere });
+        if (existing) {
+          const fieldNames = constraint.fields.join(', ');
+          throw new Error(
+            \`Cannot restore \${modelName}: unique constraint on (\${fieldNames}) \` +
+            \`already satisfied by an active record. Delete or modify the conflicting record first.\`
+          );
+        }
+      }
+    } else {
+      for (const [field, value] of Object.entries(unmangledFields)) {
+        const existing = await delegate.findFirst({
+          where: {
+            [field]: value,
+            [deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+          },
+        });
+
+        if (existing) {
+          throw new Error(
+            \`Cannot restore \${modelName}: unique field "\${field}" with value "\${value}" \` +
+            \`already exists in an active record. Delete or modify the conflicting record first.\`
+          );
+        }
       }
     }
   }
@@ -1831,7 +2016,10 @@ async function restoreCascadeChildren(
   tx: Prisma.TransactionClient,
   parentModel: string,
   parentPkValues: Record<string, unknown>[],
-  deletedAt: Date
+  deletedAt: Date,${hasAudit ? `
+  auditActorId?: string | null,
+  auditWrapOptions?: any,
+  auditCallCtx?: Record<string, unknown>,` : ''}
 ): Promise<Record<string, number>> {
   const children = CASCADE_GRAPH[parentModel] ?? [];
   const cascaded: Record<string, number> = {};
@@ -1871,7 +2059,8 @@ async function restoreCascadeChildren(
     );
 
     // Recurse to grandchildren first (for ALL children, including non-soft-deletable)
-    const grandchildCascaded = await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt);
+    const grandchildCascaded = await restoreCascadeChildren(tx, child.model, childPkValues, deletedAt${hasAudit ? `,
+      auditActorId, auditWrapOptions, auditCallCtx` : ''});
 
     // Merge grandchild results
     for (const [model, count] of Object.entries(grandchildCascaded)) {
@@ -1888,21 +2077,54 @@ async function restoreCascadeChildren(
           const childPkVal = extractPrimaryKey(child.model, childRecord);
           const unmangledFields = unmangleUniqueFields(child.model, childRecord);
 
-          // Check for conflicts
+          // Check for conflicts (using compound unique constraints when available)
           if (Object.keys(unmangledFields).length > 0) {
-            for (const [field, value] of Object.entries(unmangledFields)) {
-              const existing = await childDelegate.findFirst({
-                where: {
-                  [field]: value,
-                  [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
-                },
-              });
+            const constraints = UNIQUE_CONSTRAINTS[child.model] ?? [];
+            const unmangledRecord: Record<string, unknown> = { ...childRecord, ...unmangledFields };
 
-              if (existing) {
-                throw new Error(
-                  \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
-                  \`already exists in an active record.\`
-                );
+            if (constraints.length > 0) {
+              for (const constraint of constraints) {
+                const involvesUnmangled = constraint.fields.some((f: string) => f in unmangledFields);
+                if (!involvesUnmangled) continue;
+
+                const constraintWhere: Record<string, unknown> = {
+                  [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+                };
+                let hasAllFields = true;
+                for (const f of constraint.fields) {
+                  const val = unmangledRecord[f];
+                  if (val === null || val === undefined) {
+                    hasAllFields = false;
+                    break;
+                  }
+                  constraintWhere[f] = val;
+                }
+                if (!hasAllFields) continue;
+
+                const existing = await childDelegate.findFirst({ where: constraintWhere });
+                if (existing) {
+                  const fieldNames = constraint.fields.join(', ');
+                  throw new Error(
+                    \`Cannot restore \${child.model}: unique constraint on (\${fieldNames}) \` +
+                    \`already satisfied by an active record.\`
+                  );
+                }
+              }
+            } else {
+              for (const [field, value] of Object.entries(unmangledFields)) {
+                const existing = await childDelegate.findFirst({
+                  where: {
+                    [field]: value,
+                    [child.deletedAtField]: ACTIVE_DELETED_AT_VALUE,
+                  },
+                });
+
+                if (existing) {
+                  throw new Error(
+                    \`Cannot restore \${child.model}: unique field "\${field}" with value "\${value}" \` +
+                    \`already exists in an active record.\`
+                  );
+                }
               }
             }
           }
@@ -1949,7 +2171,18 @@ async function restoreCascadeChildren(
           data: bulkUpdateData,
         });
       }
-
+${hasAudit ? `
+      // Write audit events for restored children (restore is an update action)
+      if (auditActorId !== undefined && isAuditable(child.model, 'update')) {
+        const ctx = await _mergeAuditContext(auditWrapOptions, auditCallCtx);
+        for (const childRecord of childRecords) {
+          await writeAuditEvent(
+            tx, child.model, getEntityId(child.model, childRecord), 'restore',
+            auditActorId, childRecord, undefined, ctx,
+          );
+        }
+      }
+` : ''}
       // Track the count for this child model
       cascaded[child.model] = (cascaded[child.model] ?? 0) + childRecords.length;
     }
@@ -2075,7 +2308,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
   const name = model.name;
   const lowerName = toLowerFirst(name);
 
-  if (model.isSoftDeletable && model.deletedAtField !== null) {
+  if (model.isSoftDeletable) {
     const deletedAtField = model.deletedAtField;
     const simple = isSimpleModel(model, options);
 
@@ -2232,7 +2465,7 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${name}', where, projection);
+        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${name}', where, projection, actorId ?? null, wrapOptions, callCtx);
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where, ...projection }, injectedPaths);
         if (isAuditable('${name}', 'update') && processed) {
           const ctx = await _mergeAuditContext(wrapOptions, callCtx);
@@ -2320,6 +2553,8 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
       return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
+        // Capture pre-mutation snapshot for audit (full record, no projection)
+        const preMutationSnapshot = await tx.${lowerName}.findFirst({ where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } });
         const now = new Date();
         const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };${deletedByUpdateTx}
         const result = await tx.${lowerName}.updateMany({
@@ -2329,9 +2564,9 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
         throwIfNotFound(result.count, '${name}');
         const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });
         const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
-        if (isAuditable('${name}', 'delete') && processed) {
+        if (isAuditable('${name}', 'delete') && preMutationSnapshot) {
           const ctx = await _mergeAuditContext(wrapOptions, callCtx);
-          await writeAuditEvent(tx, '${name}', getEntityId('${name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);
+          await writeAuditEvent(tx, '${name}', getEntityId('${name}', preMutationSnapshot), 'soft_delete', actorId ?? null, preMutationSnapshot, undefined, ctx);
         }
         return { record: processed, cascaded: {} };
       });
@@ -2364,26 +2599,30 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       const { ${identityField}, ...rest } = args;
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
-      const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
-      const now = new Date();
-      const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };${deletedByUpdate}
-      const result = await original.updateMany({
-        where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
-        data: updateData,
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
+        const now = new Date();
+        const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };${deletedByUpdate}
+        const result = await tx.${lowerName}.updateMany({
+          where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
+          data: updateData,
+        });
+        throwIfNotFound(result.count, '${name}');
+        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });
+        const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
+        return { record: processed, cascaded: {} };
       });
-      throwIfNotFound(result.count, '${name}');
-      const record = await original.findFirst({ where: decomposedWhere, ...projection });
-      const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
-      return { record: processed, cascaded: {} };
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
       const { ${identityField}, ...rest } = args;
-      const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdate}
-      const result = await original.updateMany({
-        where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
-        data: updateData,
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const updateData: Record<string, unknown> = { ['${deletedAtField}']: new Date() };${deletedByUpdate}
+        const result = await tx.${lowerName}.updateMany({
+          where: { ...rest.where, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE },
+          data: updateData,
+        });
+        return { count: result.count, cascaded: {} };
       });
-      return { count: result.count, cascaded: {} };
     }) as Safe${name}Delegate['softDeleteMany'],`;
       }
 
@@ -2424,25 +2663,28 @@ function emitModelDelegate(model: ParsedModel, options: EmitRuntimeOptions, hasA
       });
     }) as Safe${name}Delegate['softDeleteMany'],`;
       } else {
-        // Complex path: use softDeleteWithCascade (transaction, per-record updates)
+        // Complex path: use softDeleteWithCascadeInTx (within transaction for atomicity)
         softDeleteMethods = `
     // Soft delete methods (with cascade support)
     softDelete: (async (args: any) => {
       const { ${identityField}, ...rest } = args;
       const { where, ...restProjection } = rest;
       const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${name}');
-      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', where, ${identityField});
-      throwIfNotFound(count, '${name}');
-      // Decompose compound key for findFirst
-      const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
-      const record = await original.findFirst({ where: decomposedWhere, ...projection });
-      const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
-      return { record: processed, cascaded };
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', where, ${identityField});
+        throwIfNotFound(count, '${name}');
+        const decomposedWhere = decomposeCompoundKeyWhere('${name}', where);
+        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });
+        const processed = await postProcessRead(Promise.resolve(record), '${name}', { where: decomposedWhere, ...projection }, injectedPaths);
+        return { record: processed, cascaded };
+      });
     }) as Safe${name}Delegate['softDelete'],
     softDeleteMany: (async (args: any) => {
       const { ${identityField}, ...rest } = args;
-      const { count, cascaded } = await softDeleteWithCascade(prisma, '${name}', rest.where, ${identityField});
-      return { count, cascaded };
+      return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const { count, cascaded } = await softDeleteWithCascadeInTx(tx, '${name}', rest.where, ${identityField});
+        return { count, cascaded };
+      });
     }) as Safe${name}Delegate['softDeleteMany'],`;
       }
 
@@ -2523,8 +2765,9 @@ const AUDIT_DELETE_METHODS: AuditMethodDescriptor[] = [
  * Generates a single audited method call site.
  *
  * context.wrapInTransaction: true for main delegate (wraps in prisma.$transaction)
- * context.softDeletable: true adds injectDeletedAtIntoToOneSelects/injectFilters/postProcessRead
  * context.indent: indentation prefix
+ *
+ * Soft-deletable behavior (injectFilters, postProcessRead, etc.) is derived from model.isSoftDeletable.
  */
 function emitAuditedMethodCallSite(
   lines: string[],
@@ -2533,7 +2776,6 @@ function emitAuditedMethodCallSite(
   options: EmitRuntimeOptions,
   context: {
     wrapInTransaction: boolean;
-    softDeletable: boolean;
     indent: string;
     delegateExpr: string; // e.g. 'prisma' or 'tx'
   },
@@ -2542,11 +2784,12 @@ function emitAuditedMethodCallSite(
   const name = model.name;
   const lowerName = toLowerFirst(name);
   const ind = context.indent;
+  const softDeletable = model.isSoftDeletable;
   const isAuditableAction = action === 'upsert' || model.auditActions.includes(action);
 
   // For non-auditable actions, emit a simple passthrough that strips actorId
   if (!isAuditableAction) {
-    if (context.softDeletable) {
+    if (model.isSoftDeletable) {
       emitNonAuditedSoftDeletablePassthrough(lines, method, name, lowerName, model, options, context);
     } else {
       lines.push(`${ind}${method}: (async (args: any) => {`);
@@ -2558,10 +2801,11 @@ function emitAuditedMethodCallSite(
   }
 
   // For auditable actions, call the _audited* helper
-  const needsPostProcess = context.softDeletable && ['create', 'createManyAndReturn', 'update', 'updateManyAndReturn', 'upsert'].includes(method);
-  const needsInjectFilters = context.softDeletable && ['update', 'updateMany', 'updateManyAndReturn', 'upsert'].includes(method);
-  const needsInjectToOne = context.softDeletable && ['create', 'createManyAndReturn', 'update', 'updateManyAndReturn', 'upsert'].includes(method);
-  const deletedAtField = model.deletedAtField;
+  const needsPostProcess = softDeletable && ['create', 'createManyAndReturn', 'update', 'updateManyAndReturn', 'upsert'].includes(method);
+  const needsInjectFilters = softDeletable && ['update', 'updateMany', 'updateManyAndReturn', 'upsert'].includes(method);
+  const needsInjectToOne = softDeletable && ['create', 'createManyAndReturn', 'update', 'updateManyAndReturn', 'upsert'].includes(method);
+  // After narrowing via model.isSoftDeletable, deletedAtField is string (never null)
+  const deletedAtField = model.isSoftDeletable ? model.deletedAtField : null;
 
   lines.push(`${ind}${method}: (async (args: any) => {`);
   lines.push(`${ind}  const { actorId, auditContext: callCtx, ...rest } = args;`);
@@ -2590,7 +2834,7 @@ function emitAuditedMethodCallSite(
   }
 
   // Sentinel create handling
-  if (context.softDeletable && options.uniqueStrategy === 'sentinel' && deletedAtField !== null) {
+  if (softDeletable && options.uniqueStrategy === 'sentinel' && deletedAtField !== null) {
     if (method === 'create') {
       lines.push(`${ind}  const withSentinel = { ...${argsExpr}, data: { ...${argsExpr}?.data, ['${deletedAtField}']: ${argsExpr}?.data?.['${deletedAtField}'] ?? ACTIVE_DELETED_AT_VALUE } };`);
       argsExpr = 'withSentinel';
@@ -2639,7 +2883,7 @@ function emitNonAuditedSoftDeletablePassthrough(
   method: string,
   name: string,
   lowerName: string,
-  model: ParsedModel,
+  model: SoftDeletableModel,
   options: EmitRuntimeOptions,
   context: {
     wrapInTransaction: boolean;
@@ -2649,9 +2893,8 @@ function emitNonAuditedSoftDeletablePassthrough(
 ): void {
   const ind = context.indent;
   const d = context.wrapInTransaction ? `prisma.${lowerName}` : `${context.delegateExpr}.${lowerName}`;
-  const isSentinel = options.uniqueStrategy === 'sentinel' && model.deletedAtField !== null;
-  // Safe: deletedAtField is only used inside `if (isSentinel)` blocks where model.deletedAtField is non-null
-  const deletedAtField = model.deletedAtField ?? '';
+  const isSentinel = options.uniqueStrategy === 'sentinel';
+  const deletedAtField = model.deletedAtField;
   // Reproduce the standard soft-deletable write method, just strip actorId + auditContext first
   lines.push(`${ind}${method}: (async (args: any) => {`);
   lines.push(`${ind}  const { actorId, auditContext: _callCtx, ...rest } = args;`);
@@ -2730,11 +2973,10 @@ function emitNonAuditedSoftDeletablePassthrough(
  * Emits audited write methods for a soft-deletable + audited model (main delegate).
  * Uses shared _audited* helpers via emitAuditedMethodCallSite.
  */
-function emitAuditedWriteMethods(model: ParsedModel, options: EmitRuntimeOptions): string {
+function emitAuditedWriteMethods(model: SoftDeletableModel, options: EmitRuntimeOptions): string {
   const lines: string[] = [];
   const context = {
     wrapInTransaction: true,
-    softDeletable: true,
     indent: '    ',
     delegateExpr: 'prisma',
   };
@@ -2752,13 +2994,12 @@ function emitAuditedWriteMethods(model: ParsedModel, options: EmitRuntimeOptions
  * Emits a delegate for an audit-only model (no soft-delete).
  * Uses shared _audited* helpers via emitAuditedMethodCallSite.
  */
-function emitAuditOnlyDelegate(model: ParsedModel, lowerName: string, options: EmitRuntimeOptions): string {
+function emitAuditOnlyDelegate(model: AuditOnlyModel, lowerName: string, options: EmitRuntimeOptions): string {
   const name = model.name;
   const lines: string[] = [];
   const allDescs = [...AUDIT_WRITE_METHODS, ...AUDIT_DELETE_METHODS];
   const context = {
     wrapInTransaction: true,
-    softDeletable: false,
     indent: '    ',
     delegateExpr: 'prisma',
   };
@@ -2792,7 +3033,7 @@ function emitIncludingDeletedClient(schema: ParsedSchema): string {
 
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    if (model.isSoftDeletable && model.deletedAtField !== null) {
+    if (model.isSoftDeletable) {
       // Soft-deletable models need wrapped methods to propagate 'include-deleted' mode
       lines.push(`    ${lowerName}: {`);
       lines.push(`      findMany: ((...args: any[]) => prisma.${lowerName}.findMany(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['findMany'],`);
@@ -2824,33 +3065,33 @@ function emitOnlyDeletedClient(schema: ParsedSchema): string {
   lines.push('  return {');
 
   for (const model of schema.models) {
-    if (model.isSoftDeletable && model.deletedAtField !== null) {
+    if (model.isSoftDeletable) {
       const lowerName = toLowerFirst(model.name);
       lines.push(`    ${lowerName}: {`);
       lines.push(`      findMany: ((...args: any[]) => {`);
       lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`        return postProcessRead(prisma.${lowerName}.findMany(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        return postProcessReadOnlyDeleted(prisma.${lowerName}.findMany(filtered), injectedPaths) as any;`);
       lines.push(`      }) as PrismaClient['${lowerName}']['findMany'],`);
       lines.push(`      findFirst: ((...args: any[]) => {`);
       lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`        return postProcessRead(prisma.${lowerName}.findFirst(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        return postProcessReadOnlyDeleted(prisma.${lowerName}.findFirst(filtered), injectedPaths) as any;`);
       lines.push(`      }) as PrismaClient['${lowerName}']['findFirst'],`);
       lines.push(`      findFirstOrThrow: ((...args: any[]) => {`);
       lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`        return postProcessRead(prisma.${lowerName}.findFirstOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        return postProcessReadOnlyDeleted(prisma.${lowerName}.findFirstOrThrow(filtered), injectedPaths) as any;`);
       lines.push(`      }) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
       lines.push(`      findUnique: ((...args: any[]) => {`);
       lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`        return postProcessRead(prisma.${lowerName}.findUnique(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        return postProcessReadOnlyDeleted(prisma.${lowerName}.findUnique(filtered), injectedPaths) as any;`);
       lines.push(`      }) as PrismaClient['${lowerName}']['findUnique'],`);
       lines.push(`      findUniqueOrThrow: ((...args: any[]) => {`);
       lines.push(`        const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`        const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`        return postProcessRead(prisma.${lowerName}.findUniqueOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`        return postProcessReadOnlyDeleted(prisma.${lowerName}.findUniqueOrThrow(filtered), injectedPaths) as any;`);
       lines.push(`      }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       lines.push(`      count: ((...args: any[]) => prisma.${lowerName}.count(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['count'],`);
       lines.push(`      aggregate: ((...args: any[]) => prisma.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
@@ -2875,7 +3116,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
 
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    if (model.isSoftDeletable && model.deletedAtField !== null) {
+    if (model.isSoftDeletable) {
       const simple = isSimpleModel(model, options);
       const deletedAtField = model.deletedAtField;
       lines.push(`    ${lowerName}: {`);
@@ -2928,7 +3169,6 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         // Audited soft-deletable model: use shared _audited* helpers with tx directly
         const txAuditContext = {
           wrapInTransaction: false,
-          softDeletable: true,
           indent: '      ',
           delegateExpr: 'tx',
         };
@@ -3008,6 +3248,8 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`        const { where, ...restProjection } = rest;`);
           lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
           lines.push(`        const decomposedWhere = decomposeCompoundKeyWhere('${model.name}', where);`);
+          lines.push(`        // Capture pre-mutation snapshot for audit (full record, no projection)`);
+          lines.push(`        const preMutationSnapshot = await tx.${lowerName}.findFirst({ where: { ...decomposedWhere, ['${deletedAtField}']: ACTIVE_DELETED_AT_VALUE } });`);
           lines.push(`        const now = new Date();`);
           lines.push(`        const updateData: Record<string, unknown> = { ['${deletedAtField}']: now };`);
           if (model.deletedByField !== null) {
@@ -3023,9 +3265,9 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
           lines.push(`        throwIfNotFound(result.count, '${model.name}');`);
           lines.push(`        const record = await tx.${lowerName}.findFirst({ where: decomposedWhere, ...projection });`);
           lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where: decomposedWhere, ...projection }, injectedPaths);`);
-          lines.push(`        if (isAuditable('${model.name}', 'delete') && processed) {`);
+          lines.push(`        if (isAuditable('${model.name}', 'delete') && preMutationSnapshot) {`);
           lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
-          lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', processed), 'soft_delete', actorId ?? null, processed, undefined, ctx);`);
+          lines.push(`          await writeAuditEvent(tx, '${model.name}', getEntityId('${model.name}', preMutationSnapshot), 'soft_delete', actorId ?? null, preMutationSnapshot, undefined, ctx);`);
           lines.push(`        }`);
           lines.push(`        return { record: processed, cascaded: {} };`);
           lines.push(`      }) as Safe${model.name}Delegate['softDelete'],`);
@@ -3181,7 +3423,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
         lines.push(`        const { actorId, auditContext: callCtx, ...rest } = args;`);
         lines.push(`        const { where, ...restProjection } = rest;`);
         lines.push(`        const { args: projection, injectedPaths } = injectDeletedAtIntoToOneSelects(restProjection, '${model.name}');`);
-        lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection);`);
+        lines.push(`        const { record, cascaded } = await restoreWithCascadeInTx(tx, '${model.name}', where, projection, actorId ?? null, wrapOptions, callCtx);`);
         lines.push(`        const processed = await postProcessRead(Promise.resolve(record), '${model.name}', { where, ...projection }, injectedPaths);`);
         lines.push(`        if (isAuditable('${model.name}', 'update') && processed) {`);
         lines.push(`          const ctx = await _mergeAuditContext(wrapOptions, callCtx);`);
@@ -3239,7 +3481,6 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
       lines.push(`      ...tx.${lowerName},`);
       const txAuditOnlyContext = {
         wrapInTransaction: false,
-        softDeletable: false,
         indent: '      ',
         delegateExpr: 'tx',
       };
@@ -3258,33 +3499,33 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
   lines.push('    /** Query only soft-deleted records with filter propagation */');
   lines.push('    $onlyDeleted: {');
   for (const model of schema.models) {
-    if (model.isSoftDeletable && model.deletedAtField !== null) {
+    if (model.isSoftDeletable) {
       const lowerName = toLowerFirst(model.name);
       lines.push(`      ${lowerName}: {`);
       lines.push(`        findMany: ((...args: any[]) => {`);
       lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`          return postProcessRead(tx.${lowerName}.findMany(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`          return postProcessReadOnlyDeleted(tx.${lowerName}.findMany(filtered), injectedPaths) as any;`);
       lines.push(`        }) as PrismaClient['${lowerName}']['findMany'],`);
       lines.push(`        findFirst: ((...args: any[]) => {`);
       lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`          return postProcessRead(tx.${lowerName}.findFirst(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`          return postProcessReadOnlyDeleted(tx.${lowerName}.findFirst(filtered), injectedPaths) as any;`);
       lines.push(`        }) as PrismaClient['${lowerName}']['findFirst'],`);
       lines.push(`        findFirstOrThrow: ((...args: any[]) => {`);
       lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`          return postProcessRead(tx.${lowerName}.findFirstOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`          return postProcessReadOnlyDeleted(tx.${lowerName}.findFirstOrThrow(filtered), injectedPaths) as any;`);
       lines.push(`        }) as PrismaClient['${lowerName}']['findFirstOrThrow'],`);
       lines.push(`        findUnique: ((...args: any[]) => {`);
       lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`          return postProcessRead(tx.${lowerName}.findUnique(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`          return postProcessReadOnlyDeleted(tx.${lowerName}.findUnique(filtered), injectedPaths) as any;`);
       lines.push(`        }) as PrismaClient['${lowerName}']['findUnique'],`);
       lines.push(`        findUniqueOrThrow: ((...args: any[]) => {`);
       lines.push(`          const { args: pp, injectedPaths } = injectDeletedAtIntoToOneSelects(args[0], '${model.name}');`);
       lines.push(`          const filtered = injectFilters(pp, '${model.name}', 'only-deleted');`);
-      lines.push(`          return postProcessRead(tx.${lowerName}.findUniqueOrThrow(filtered), '${model.name}', filtered, injectedPaths) as any;`);
+      lines.push(`          return postProcessReadOnlyDeleted(tx.${lowerName}.findUniqueOrThrow(filtered), injectedPaths) as any;`);
       lines.push(`        }) as PrismaClient['${lowerName}']['findUniqueOrThrow'],`);
       lines.push(`        count: ((...args: any[]) => tx.${lowerName}.count(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['count'],`);
       lines.push(`        aggregate: ((...args: any[]) => tx.${lowerName}.aggregate(injectFilters(args[0], '${model.name}', 'only-deleted'))) as PrismaClient['${lowerName}']['aggregate'],`);
@@ -3300,7 +3541,7 @@ function emitTransactionWrapper(schema: ParsedSchema, options: EmitRuntimeOption
   lines.push('    $includingDeleted: {');
   for (const model of schema.models) {
     const lowerName = toLowerFirst(model.name);
-    if (model.isSoftDeletable && model.deletedAtField !== null) {
+    if (model.isSoftDeletable) {
       lines.push(`      ${lowerName}: {`);
       lines.push(`        findMany: ((...args: any[]) => tx.${lowerName}.findMany(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['findMany'],`);
       lines.push(`        findFirst: ((...args: any[]) => tx.${lowerName}.findFirst(injectFilters(args[0], '${model.name}', 'include-deleted'))) as PrismaClient['${lowerName}']['findFirst'],`);

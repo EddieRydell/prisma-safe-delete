@@ -333,4 +333,271 @@ describe('E2E Sentinel: Real database tests', () => {
       expect(user.posts[0].id).toBe('p1');
     });
   });
+
+  describe('sentinel cascade soft-delete', () => {
+    it('cascade sets real timestamp (not sentinel) on parent, posts, and comments', async () => {
+      await safePrisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'cascade-sentinel@test.com',
+          posts: {
+            create: [
+              {
+                id: 'p1',
+                title: 'Post 1',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'Comment 1' },
+                    { id: 'c2', content: 'Comment 2' },
+                  ],
+                },
+              },
+              {
+                id: 'p2',
+                title: 'Post 2',
+                comments: {
+                  create: [{ id: 'c3', content: 'Comment 3' }],
+                },
+              },
+            ],
+          },
+        },
+      });
+
+      // Verify all records start with sentinel value
+      const userBefore = await prisma.user.findUnique({ where: { id: 'u1' } });
+      const postBefore = await prisma.post.findUnique({ where: { id: 'p1' } });
+      const commentBefore = await prisma.comment.findUnique({ where: { id: 'c1' } });
+      expect(userBefore.deleted_at).toEqual(SENTINEL_DATE);
+      expect(postBefore.deleted_at).toEqual(SENTINEL_DATE);
+      expect(commentBefore.deleted_at).toEqual(SENTINEL_DATE);
+
+      const before = new Date();
+      await safePrisma.user.softDelete({ where: { id: 'u1' } });
+      const after = new Date();
+
+      // Check all records via raw prisma (bypassing filters)
+      const user = await prisma.user.findUnique({ where: { id: 'u1' } });
+      const post1 = await prisma.post.findUnique({ where: { id: 'p1' } });
+      const post2 = await prisma.post.findUnique({ where: { id: 'p2' } });
+      const comment1 = await prisma.comment.findUnique({ where: { id: 'c1' } });
+      const comment2 = await prisma.comment.findUnique({ where: { id: 'c2' } });
+      const comment3 = await prisma.comment.findUnique({ where: { id: 'c3' } });
+
+      // All should have a real timestamp, NOT the sentinel
+      for (const record of [user, post1, post2, comment1, comment2, comment3]) {
+        expect(record.deleted_at).not.toEqual(SENTINEL_DATE);
+        expect(record.deleted_at.getTime()).toBeGreaterThanOrEqual(before.getTime());
+        expect(record.deleted_at.getTime()).toBeLessThanOrEqual(after.getTime());
+      }
+
+      // All should share the same cascade timestamp
+      expect(post1.deleted_at).toEqual(user.deleted_at);
+      expect(post2.deleted_at).toEqual(user.deleted_at);
+      expect(comment1.deleted_at).toEqual(user.deleted_at);
+      expect(comment2.deleted_at).toEqual(user.deleted_at);
+      expect(comment3.deleted_at).toEqual(user.deleted_at);
+
+      // Excluded from normal findMany
+      const activeUsers = await safePrisma.user.findMany();
+      const activePosts = await safePrisma.post.findMany();
+      const activeComments = await safePrisma.comment.findMany();
+      expect(activeUsers).toHaveLength(0);
+      expect(activePosts).toHaveLength(0);
+      expect(activeComments).toHaveLength(0);
+
+      // Visible via $onlyDeleted
+      const deletedUsers = await safePrisma.$onlyDeleted.user.findMany();
+      const deletedPosts = await safePrisma.$onlyDeleted.post.findMany();
+      const deletedComments = await safePrisma.$onlyDeleted.comment.findMany();
+      expect(deletedUsers).toHaveLength(1);
+      expect(deletedUsers[0].id).toBe('u1');
+      expect(deletedPosts).toHaveLength(2);
+      expect(deletedComments).toHaveLength(3);
+    });
+  });
+
+  describe('sentinel restoreCascade', () => {
+    it('restoreCascade restores sentinel value on parent and all cascaded children', async () => {
+      await safePrisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'restore-cascade@test.com',
+          posts: {
+            create: [
+              {
+                id: 'p1',
+                title: 'Post 1',
+                comments: {
+                  create: [
+                    { id: 'c1', content: 'Comment 1' },
+                    { id: 'c2', content: 'Comment 2' },
+                  ],
+                },
+              },
+              { id: 'p2', title: 'Post 2' },
+            ],
+          },
+        },
+      });
+
+      // Cascade soft-delete
+      await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+      // Verify all deleted (real timestamp, not sentinel)
+      const deletedUser = await prisma.user.findUnique({ where: { id: 'u1' } });
+      expect(deletedUser.deleted_at).not.toEqual(SENTINEL_DATE);
+
+      // Restore with cascade
+      const { record: restored, cascaded } = await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+      expect(restored).not.toBeNull();
+      expect(restored.deleted_at).toEqual(SENTINEL_DATE);
+
+      // Verify cascade counts
+      expect(cascaded.Post).toBe(2);
+      expect(cascaded.Comment).toBe(2);
+
+      // All records should have sentinel value restored via raw prisma
+      const user = await prisma.user.findUnique({ where: { id: 'u1' } });
+      const post1 = await prisma.post.findUnique({ where: { id: 'p1' } });
+      const post2 = await prisma.post.findUnique({ where: { id: 'p2' } });
+      const comment1 = await prisma.comment.findUnique({ where: { id: 'c1' } });
+      const comment2 = await prisma.comment.findUnique({ where: { id: 'c2' } });
+
+      expect(user.deleted_at).toEqual(SENTINEL_DATE);
+      expect(post1.deleted_at).toEqual(SENTINEL_DATE);
+      expect(post2.deleted_at).toEqual(SENTINEL_DATE);
+      expect(comment1.deleted_at).toEqual(SENTINEL_DATE);
+      expect(comment2.deleted_at).toEqual(SENTINEL_DATE);
+
+      // All should appear in normal findMany again
+      const activeUsers = await safePrisma.user.findMany();
+      const activePosts = await safePrisma.post.findMany();
+      const activeComments = await safePrisma.comment.findMany();
+      expect(activeUsers).toHaveLength(1);
+      expect(activePosts).toHaveLength(2);
+      expect(activeComments).toHaveLength(2);
+    });
+
+    it('restoreCascade only restores children with matching timestamp', async () => {
+      await safePrisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'partial-restore@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Post 1' },
+              { id: 'p2', title: 'Post 2' },
+            ],
+          },
+        },
+      });
+
+      // Soft delete post 1 independently first
+      await safePrisma.post.softDelete({ where: { id: 'p1' } });
+      const independentlyDeletedPost = await prisma.post.findUnique({ where: { id: 'p1' } });
+      const independentTimestamp = independentlyDeletedPost.deleted_at;
+
+      // Wait to ensure different timestamp
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Soft delete user (cascades to post 2, but post 1 already has different timestamp)
+      await safePrisma.user.softDelete({ where: { id: 'u1' } });
+
+      // Restore user with cascade
+      await safePrisma.user.restoreCascade({ where: { id: 'u1' } });
+
+      // Post 2 should be restored (same timestamp as user)
+      const post2 = await safePrisma.post.findUnique({ where: { id: 'p2' } });
+      expect(post2).not.toBeNull();
+      expect(post2.deleted_at).toEqual(SENTINEL_DATE);
+
+      // Post 1 should still be deleted (different timestamp from independent delete)
+      const post1 = await prisma.post.findUnique({ where: { id: 'p1' } });
+      expect(post1.deleted_at?.getTime()).toBe(independentTimestamp?.getTime());
+      expect(post1.deleted_at).not.toEqual(SENTINEL_DATE);
+    });
+  });
+
+  describe('sentinel _count filtering', () => {
+    it('_count in include filters out soft-deleted posts', async () => {
+      await safePrisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'count@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Active 1' },
+              { id: 'p2', title: 'Active 2' },
+              { id: 'p3', title: 'To Delete' },
+            ],
+          },
+        },
+      });
+
+      // Soft-delete one post
+      await safePrisma.post.softDelete({ where: { id: 'p3' } });
+
+      const user = await safePrisma.user.findFirst({
+        where: { id: 'u1' },
+        include: { _count: { select: { posts: true } } },
+      });
+
+      // Should count only active posts (sentinel value), not the soft-deleted one
+      expect(user._count.posts).toBe(2);
+    });
+
+    it('_count: true in include filters out soft-deleted posts', async () => {
+      await safePrisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'count-true@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Active' },
+              { id: 'p2', title: 'To Delete 1' },
+              { id: 'p3', title: 'To Delete 2' },
+            ],
+          },
+        },
+      });
+
+      await safePrisma.post.softDelete({ where: { id: 'p2' } });
+      await safePrisma.post.softDelete({ where: { id: 'p3' } });
+
+      const user = await safePrisma.user.findFirst({
+        where: { id: 'u1' },
+        include: { _count: true },
+      });
+
+      expect(user._count.posts).toBe(1);
+    });
+
+    it('_count in select filters out soft-deleted posts', async () => {
+      await safePrisma.user.create({
+        data: {
+          id: 'u1',
+          email: 'count-select@test.com',
+          posts: {
+            create: [
+              { id: 'p1', title: 'Active 1' },
+              { id: 'p2', title: 'Active 2' },
+              { id: 'p3', title: 'Active 3' },
+              { id: 'p4', title: 'To Delete' },
+            ],
+          },
+        },
+      });
+
+      await safePrisma.post.softDelete({ where: { id: 'p4' } });
+
+      const user = await safePrisma.user.findFirst({
+        where: { id: 'u1' },
+        select: { email: true, _count: { select: { posts: true } } },
+      });
+
+      expect(user._count.posts).toBe(3);
+      expect(user.email).toBe('count-select@test.com');
+    });
+  });
 });

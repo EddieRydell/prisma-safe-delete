@@ -66,6 +66,110 @@ describe('buildCascadeGraph', () => {
     expect(child?.deletedAtField).toBe('deleted_at');
   });
 
+  it('uses relation references instead of parent PK when FK targets a non-PK unique field', () => {
+    const models = [
+      createMockModel({
+        name: 'Tenant',
+        fields: [
+          createMockField({ name: 'id', type: 'Int', isId: true }),
+          createMockField({ name: 'slug', type: 'String', isUnique: true }),
+          createMockField({
+            name: 'projects',
+            type: 'Project',
+            kind: 'object',
+            isList: true,
+            relationName: 'TenantProjects',
+          }),
+          createMockField({
+            name: 'deleted_at',
+            type: 'DateTime',
+            isRequired: false,
+          }),
+        ],
+      }),
+      createMockModel({
+        name: 'Project',
+        fields: [
+          createMockField({ name: 'id', type: 'Int', isId: true }),
+          createMockField({ name: 'tenantSlug', type: 'String' }),
+          createMockField({
+            name: 'tenant',
+            type: 'Tenant',
+            kind: 'object',
+            relationName: 'TenantProjects',
+            relationFromFields: ['tenantSlug'],
+            relationToFields: ['slug'],
+            relationOnDelete: 'Cascade',
+          }),
+          createMockField({
+            name: 'deleted_at',
+            type: 'DateTime',
+            isRequired: false,
+          }),
+        ],
+      }),
+    ];
+
+    const dmmf = createMockDMMF(models);
+    const schema = parseDMMF(dmmf);
+    const graph = buildCascadeGraph(schema);
+
+    expect(graph['Tenant']).toHaveLength(1);
+    const child = graph['Tenant']?.[0];
+    expect(child?.model).toBe('Project');
+    expect(child?.foreignKey).toEqual(['tenantSlug']);
+    // parentKey should be 'slug' (the referenced unique field), NOT 'id' (the PK)
+    expect(child?.parentKey).toEqual(['slug']);
+    expect(child?.isSoftDeletable).toBe(true);
+  });
+
+  it('falls back to parent PK when relation references are empty', () => {
+    // Simulate a relation field where DMMF provides empty relationToFields
+    // (this happens on the "list" side of a relation, but we filter those out;
+    // this tests the fallback path if references is empty on a non-list relation)
+    const models = [
+      createMockModel({
+        name: 'Owner',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({
+            name: 'items',
+            type: 'Item',
+            kind: 'object',
+            isList: true,
+            relationName: 'OwnerItems',
+          }),
+        ],
+      }),
+      createMockModel({
+        name: 'Item',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'ownerId', type: 'String' }),
+          createMockField({
+            name: 'owner',
+            type: 'Owner',
+            kind: 'object',
+            relationName: 'OwnerItems',
+            relationFromFields: ['ownerId'],
+            relationToFields: [],
+            relationOnDelete: 'Cascade',
+          }),
+        ],
+      }),
+    ];
+
+    const dmmf = createMockDMMF(models);
+    const schema = parseDMMF(dmmf);
+    const graph = buildCascadeGraph(schema);
+
+    expect(graph['Owner']).toHaveLength(1);
+    const child = graph['Owner']?.[0];
+    expect(child?.foreignKey).toEqual(['ownerId']);
+    // Should fall back to parent's primary key
+    expect(child?.parentKey).toEqual(['id']);
+  });
+
   it('ignores non-cascade relations', () => {
     const models = [
       createMockModel({

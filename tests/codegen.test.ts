@@ -1770,6 +1770,78 @@ describe('emitRuntime - audit', () => {
   });
 });
 
+describe('emitRuntime - non-audited softDelete transaction wrapping', () => {
+  it('simple (fast) path wraps softDelete in prisma.$transaction', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Post is a simple model (leaf, no unique strings with mangle) — fast path
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    const postCode = postDelegate![0];
+
+    // The fast-path softDelete should still be wrapped in a $transaction for atomicity
+    expect(postCode).toContain('prisma.$transaction');
+    // But should NOT use softDeleteWithCascade/softDeleteWithCascadeInTx
+    expect(postCode).not.toContain('softDeleteWithCascadeInTx');
+    expect(postCode).not.toContain('softDeleteWithCascade(');
+  });
+
+  it('complex path wraps softDelete in prisma.$transaction using softDeleteWithCascadeInTx', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // User is a complex model (has cascade children) — complex path
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    const userCode = userDelegate![0];
+
+    // Complex path softDelete should be wrapped in $transaction
+    expect(userCode).toContain('prisma.$transaction');
+    // And should call softDeleteWithCascadeInTx inside that transaction
+    expect(userCode).toContain('softDeleteWithCascadeInTx');
+  });
+});
+
+describe('emitRuntime - $onlyDeleted uses postProcessReadOnlyDeleted', () => {
+  it('$onlyDeleted client uses postProcessReadOnlyDeleted instead of postProcessRead', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Extract the createOnlyDeletedClient function
+    const onlyDeletedFunc = /function createOnlyDeletedClient[\s\S]*?^}/m.exec(output);
+    expect(onlyDeletedFunc).not.toBeNull();
+    const funcBody = onlyDeletedFunc![0];
+
+    // Should use postProcessReadOnlyDeleted for all find operations
+    expect(funcBody).toContain('postProcessReadOnlyDeleted');
+    // Should NOT use postProcessRead (the regular one that nullifies deleted to-one relations)
+    expect(funcBody).not.toContain('postProcessRead(');
+  });
+
+  it('transaction $onlyDeleted uses postProcessReadOnlyDeleted instead of postProcessRead', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // Find the $onlyDeleted section within the tx wrapper
+    const onlyDeletedSection = /\$onlyDeleted: \{[\s\S]*?\},\n\n/.exec(txContent);
+    expect(onlyDeletedSection).not.toBeNull();
+    const section = onlyDeletedSection![0];
+
+    // Should use postProcessReadOnlyDeleted, not postProcessRead
+    expect(section).toContain('postProcessReadOnlyDeleted');
+    expect(section).not.toContain('postProcessRead(');
+  });
+});
+
 describe('emitIndex - audit', () => {
   it('exports WrapOptions and AuditContext when auditable models exist', () => {
     const schema = createAuditSchema();

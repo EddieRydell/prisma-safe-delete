@@ -231,33 +231,36 @@ Models are automatically detected as soft-deletable if they have a DateTime fiel
 ## Known Limitations
 
 - **Fluent API**: `safePrisma.user.findUnique(...).posts()` bypasses filtering. Use `include` instead.
-- **Raw queries**: `$queryRaw` bypasses the wrapper entirely (by design).
+- **Raw queries**: `$queryRaw` and `$executeRaw` bypass the wrapper entirely (by design).
 - **Upsert**: Soft-deleted records are not found by `upsert`'s `where` clause. With `none` strategy, the `create` branch will fail on unique constraint violation.
 - **`$extends`**: `safePrisma.$extends(...)` returns a raw PrismaClient. Use `safePrisma.$prisma.$extends(...)` instead.
-- **To-one includes**: Prisma doesn't support `where` on to-one relation includes, so soft-deleted to-one relations (e.g., `profile`, `author`) will still appear in results. See [Limitations and Caveats](#limitations-and-caveats) below.
+- **To-one includes (partial)**: Prisma doesn't support `where` on to-one relation includes. For most read operations, the wrapper post-processes results to nullify soft-deleted to-one relations. However, `$includingDeleted` and `$prisma` escape hatches do not apply this post-processing. See [Limitations and Caveats](#limitations-and-caveats) below.
 - **Nested writes**: `connect`, `connectOrCreate`, and nested `create`/`delete` within `data` bypass soft-delete logic.
-- **Sequential transactions**: `$transaction([...])` with a promise array bypasses soft-delete filtering. Use the interactive form `$transaction(async (tx) => { ... })` instead.
+- **Sequential transactions**: `$transaction([...])` with a promise array skips return-value post-processing (e.g., to-one nullification). The `where` filters are still injected at call time. Use the interactive form `$transaction(async (tx) => { ... })` for full wrapping.
 - **No database-level enforcement**: The wrapper operates at the application layer only. Developers can bypass soft-delete via `$prisma`, `__dangerousHardDelete`, raw SQL, or by using PrismaClient directly. For strict enforcement, add database triggers or row-level security policies.
 - **Audit event atomicity**: Audit events are written within the same database transaction as the operation they log. If the transaction fails, the audit event is also rolled back. For compliance-critical deployments where audit events must survive operation failures, consider adding an external audit sink (e.g., write-ahead log, event stream, or async replication).
 
 ## Limitations and Caveats
 
-### To-one relation includes expose soft-deleted records
+### To-one relation includes
 
-Prisma does not support `where` on to-one relation includes ([prisma/prisma#16049](https://github.com/prisma/prisma/issues/16049)). This means soft-deleted to-one relations are returned as if they are active:
+Prisma does not support `where` on to-one relation includes ([prisma/prisma#16049](https://github.com/prisma/prisma/issues/16049)). The wrapper works around this by **post-processing** query results: after Prisma returns data, soft-deleted to-one relations are automatically nullified.
 
 ```typescript
 const user = await safePrisma.user.findFirst({
   include: {
-    posts: true,    // ✓ Soft-deleted posts are filtered out
-    profile: true,  // ✗ Soft-deleted profile is still returned
+    posts: true,    // ✓ Soft-deleted posts filtered via WHERE clause
+    profile: true,  // ✓ Soft-deleted profile nullified via post-processing
   }
 });
+// user.profile is null if the profile was soft-deleted
 ```
 
-**Impact**: If soft-deleted records contain sensitive data (PII, credentials), that data will be visible through to-one includes. List relations (`posts`, `comments`) are always filtered correctly.
-
-**Workaround**: Check the `deleted_at` field on returned to-one relations in your application code, or avoid including to-one relations to soft-deletable models when the data is sensitive.
+**Edge cases where post-processing does not apply:**
+- `$includingDeleted` — intentionally returns all records including deleted to-one relations
+- `$onlyDeleted` — preserves deleted to-one relations (since the caller explicitly wants deleted data)
+- `$prisma` — raw Prisma client, no wrapping at all
+- If you use `select` on a to-one relation without including `deleted_at`, the post-processor cannot determine deletion status and will leave the relation as-is
 
 ### Concurrent operations and isolation levels
 
@@ -265,6 +268,7 @@ Cascade and restore operations use transactions at the default isolation level (
 
 - **Restore conflicts**: The conflict check (findFirst) and the actual restore (update) are not atomic — another transaction can insert a conflicting record between these steps.
 - **Cascade inconsistency**: New child records created between the parent's findMany and the cascade updates may be missed.
+- **Restore timestamp matching**: `restoreCascade` identifies cascade-deleted children by matching the exact `deleted_at` timestamp. If two unrelated cascade deletes occur within the same millisecond, restoring one could incorrectly restore children belonging to the other.
 
 If your application performs concurrent soft-deletes or restores on overlapping records, use SERIALIZABLE isolation:
 
