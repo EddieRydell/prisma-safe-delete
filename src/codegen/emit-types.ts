@@ -203,6 +203,21 @@ function emitAuditedMutationTypes(lines: string[], name: string, actorIdParam: s
   lines.push(`  upsert: <T extends Prisma.${name}UpsertArgs>(args: T & ${actorIdParam}) => Promise<Prisma.${name}GetPayload<T>>;`);
 }
 
+/** Emits the $writeAuditEvent method type signature (shared by SafePrismaClient and SafeTransactionClient). */
+function emitWriteAuditEventType(lines: string[]): void {
+  lines.push('  /** Write a manual audit event (for actions not tied to a Prisma mutation on an @audit model) */');
+  lines.push('  $writeAuditEvent: (params: {');
+  lines.push('    entityType: string;');
+  lines.push('    entityId: string;');
+  lines.push('    action: string;');
+  lines.push('    actorId?: string | null;');
+  lines.push('    eventData: unknown;');
+  lines.push('    parentEventId?: string;');
+  lines.push('    auditContext?: AuditContext;');
+  lines.push('  }) => Promise<string>;');
+  lines.push('');
+}
+
 function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   const lines: string[] = [];
 
@@ -235,6 +250,9 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('  /** Query including soft-deleted records with filter propagation */');
   lines.push('  $includingDeleted: IncludingDeletedClient;');
   lines.push('');
+  if (hasAuditableModelsForWrap) {
+    emitWriteAuditEventType(lines);
+  }
   lines.push('  // Raw query methods');
   lines.push("  $queryRaw: PrismaClient['$queryRaw'];");
   lines.push("  $executeRaw: PrismaClient['$executeRaw'];");
@@ -277,6 +295,10 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('');
   lines.push('  /** Query only soft-deleted records */');
   lines.push('  $onlyDeleted: OnlyDeletedClient;');
+  lines.push('');
+  if (hasAuditableModelsForWrap) {
+    emitWriteAuditEventType(lines);
+  }
   lines.push('}');
   lines.push('');
 

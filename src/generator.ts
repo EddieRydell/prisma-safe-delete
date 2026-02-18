@@ -577,6 +577,10 @@ export function validateAuditSetup(schema: ParsedSchema): void {
       errors.push(
         `  Column ${col.name}: must be required (not nullable)`,
       );
+    } else if (col.name === 'created_at' && !field.hasDefaultValue) {
+      errors.push(
+        `  Column created_at: must have @default(now()) so audit timestamps are server-side`,
+      );
     }
   }
 
