@@ -137,6 +137,7 @@ All read operations (`findMany`, `findFirst`, `findUnique`, `count`, `aggregate`
 | `model.includingDeleted` | Per-model override (does not propagate) |
 | `$prisma` | Raw Prisma client (no filtering) |
 | `$transaction` | Interactive transaction with full soft-delete API |
+| `$writeAuditEvent` | Write a custom audit event (requires `@audit-table`) |
 
 For full API documentation with examples, see [docs/api-reference.md](docs/api-reference.md).
 
@@ -183,7 +184,7 @@ await safePrisma.project.create({
 });
 ```
 
-Audit events capture before/after snapshots for updates, the full record for creates and deletes, and are written atomically in the same transaction as the mutation. For full details, see [docs/api-reference.md](docs/api-reference.md#audit-logging).
+Audit events capture before/after snapshots for updates, the full record for creates and deletes, and are written atomically in the same transaction as the mutation. All audited mutation methods also accept an optional per-call `auditContext` that merges with the global one. For full details, see [docs/api-reference.md](docs/api-reference.md#audit-logging).
 
 ## Unique Constraint Handling
 

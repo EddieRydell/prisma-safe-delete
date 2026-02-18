@@ -1843,10 +1843,10 @@ describe('emitRuntime - audit', () => {
     });
 
     // All _audited* helpers should accept callCtx as last parameter
-    expect(output).toMatch(/_auditedCreate\([\s\S]*?callCtx\?: Record<string, unknown>/);
-    expect(output).toMatch(/_auditedUpdate\([\s\S]*?callCtx\?: Record<string, unknown>/);
-    expect(output).toMatch(/_auditedDelete\([\s\S]*?callCtx\?: Record<string, unknown>/);
-    expect(output).toMatch(/_auditedHardDelete\([\s\S]*?callCtx\?: Record<string, unknown>/);
+    expect(output).toMatch(/_auditedCreate\([\s\S]*?callCtx\?: AuditContext/);
+    expect(output).toMatch(/_auditedUpdate\([\s\S]*?callCtx\?: AuditContext/);
+    expect(output).toMatch(/_auditedDelete\([\s\S]*?callCtx\?: AuditContext/);
+    expect(output).toMatch(/_auditedHardDelete\([\s\S]*?callCtx\?: AuditContext/);
   });
 
   it('audited method call sites pass callCtx to helpers', () => {
@@ -2062,7 +2062,7 @@ describe('validateAuditSetup', () => {
     const schema = parseDMMF(createMockDMMF(models));
 
     expect(() => { validateAuditSetup(schema); }).toThrow(
-      '@default(now()) for tamper-resistant server-side timestamps',
+      '@default(now()) so audit timestamps are server-side',
     );
   });
 
@@ -2100,5 +2100,95 @@ describe('validateAuditSetup', () => {
   it('accepts audit table with @default(now()) on created_at', () => {
     const schema = createAuditSchema();
     expect(() => { validateAuditSetup(schema); }).not.toThrow();
+  });
+});
+
+describe('emitTypes - $writeAuditEvent', () => {
+  it('emits $writeAuditEvent on SafeTransactionClient when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    const txMatch = /interface SafeTransactionClient \{[\s\S]*?\n\}/.exec(output);
+    expect(txMatch).not.toBeNull();
+    const txBlock = txMatch![0];
+    expect(txBlock).toContain('$writeAuditEvent');
+    expect(txBlock).toContain('entityType: string');
+    expect(txBlock).toContain('entityId: string');
+    expect(txBlock).toContain('action: string');
+    expect(txBlock).toContain('actorId?: string | null');
+    expect(txBlock).toContain('eventData: Prisma.InputJsonValue');
+    expect(txBlock).toContain('parentEventId?: string');
+    expect(txBlock).toContain('auditContext?: AuditContext');
+    expect(txBlock).toContain('Promise<string>');
+  });
+
+  it('emits $writeAuditEvent on SafePrismaClient when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    const clientMatch = /interface SafePrismaClient \{[\s\S]*?\n\}/.exec(output);
+    expect(clientMatch).not.toBeNull();
+    const clientBlock = clientMatch![0];
+    expect(clientBlock).toContain('$writeAuditEvent');
+    expect(clientBlock).toContain('Promise<string>');
+  });
+
+  it('does not emit $writeAuditEvent when no auditable models', () => {
+    const schema = createTestSchema();
+    const output = emitTypes(schema, TEST_CLIENT_PATH);
+
+    expect(output).not.toContain('$writeAuditEvent');
+  });
+});
+
+describe('emitRuntime - $writeAuditEvent', () => {
+  it('emits $writeAuditEvent in wrapTransactionClient when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txCode = txWrapper![0];
+    expect(txCode).toContain('$writeAuditEvent');
+    // Should call writeAuditEvent(tx, ...) directly (no prisma.$transaction wrapper)
+    expect(txCode).toMatch(/\$writeAuditEvent.*writeAuditEvent\(tx,/s);
+    // Should call _mergeAuditContext for global context merging
+    expect(txCode).toContain('_mergeAuditContext(wrapOptions, params.auditContext)');
+  });
+
+  it('emits $writeAuditEvent in wrapPrismaClient when audit is enabled', () => {
+    const schema = createAuditSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const auditTable = resolveAuditTableConfig(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+      auditTable,
+    });
+
+    const wrapFunc = /function wrapPrismaClient[\s\S]*?^}/m.exec(output);
+    expect(wrapFunc).not.toBeNull();
+    const wrapCode = wrapFunc![0];
+    expect(wrapCode).toContain('$writeAuditEvent');
+    // Should wrap in prisma.$transaction for top-level calls
+    expect(wrapCode).toMatch(/\$writeAuditEvent[\s\S]*?prisma\.\$transaction/);
+    expect(wrapCode).toContain('_mergeAuditContext(wrapOptions, params.auditContext)');
+  });
+
+  it('does not emit $writeAuditEvent when no audit table', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, {
+      uniqueStrategy: 'mangle',
+      cascadeGraph,
+    });
+
+    expect(output).not.toContain('$writeAuditEvent');
   });
 });

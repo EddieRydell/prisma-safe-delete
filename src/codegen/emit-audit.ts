@@ -208,11 +208,11 @@ function emitAuditOperationHelpers(): string {
  */
 async function _mergeAuditContext(
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<Record<string, unknown> | undefined> {
   const globalCtx = await wrapOptions?.auditContext?.();
   if (!globalCtx && !callCtx) return undefined;
-  return { ...globalCtx, ...callCtx };
+  return { ...globalCtx, ...callCtx } as Record<string, unknown>;
 }
 
 /**
@@ -225,7 +225,7 @@ async function _auditedCreate(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const record = await delegate.create(args);
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
@@ -243,7 +243,7 @@ async function _auditedCreateMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<{ count: number }> {
   const records = await delegate.createManyAndReturn(args);
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
@@ -263,7 +263,7 @@ async function _auditedCreateManyAndReturn(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any[]> {
   const records = await delegate.createManyAndReturn(args);
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
@@ -283,7 +283,7 @@ async function _auditedUpdate(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const before = await delegate.findUniqueOrThrow({ where: args.where });
   const after = await delegate.update(args);
@@ -302,7 +302,7 @@ async function _auditedUpdateMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const beforeRecords = await delegate.findMany({ where: args.where });
   const result = await delegate.updateMany(args);
@@ -336,7 +336,7 @@ async function _auditedUpdateManyAndReturn(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any[]> {
   const beforeRecords = await delegate.findMany({ where: args.where });
   const results = await delegate.updateManyAndReturn(args);
@@ -374,7 +374,7 @@ async function _auditedUpsert(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const existing = await delegate.findUnique({ where: args.where });
   const result = await delegate.upsert(args);
@@ -398,7 +398,7 @@ async function _auditedDelete(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const snapshot = await delegate.findUniqueOrThrow({ where: args.where });
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
@@ -416,7 +416,7 @@ async function _auditedDeleteMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const records = await delegate.findMany({ where: args?.where });
   const ctx = await _mergeAuditContext(wrapOptions, callCtx);
@@ -438,7 +438,7 @@ async function _auditedHardDelete(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   if (isAuditable(modelName, 'delete')) {
     const snapshot = await delegate.findUniqueOrThrow({ where: args.where });
@@ -459,7 +459,7 @@ async function _auditedHardDeleteMany(
   modelName: string,
   actorId: string | null,
   wrapOptions: any,
-  callCtx?: Record<string, unknown>,
+  callCtx?: AuditContext,
 ): Promise<any> {
   const records = await delegate.findMany({ where: args?.where });
   if (isAuditable(modelName, 'delete') && records.length > 0) {

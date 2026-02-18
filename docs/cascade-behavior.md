@@ -75,7 +75,20 @@ await safePrisma.$transaction(async (tx) => {
 
 ## Audit Logging and Cascades
 
-If a soft-deletable model is also auditable (`/// @audit`), the `softDelete` operation itself is audited, but cascade-deleted children do **not** generate individual audit events. The `cascaded` return value provides the cascade counts; persist it if you need a full audit trail of cascade operations.
+If a soft-deletable model is also auditable (`/// @audit`), cascade operations generate audit events for both the parent and its children. Each child's audit event includes a `parent_event_id` linking back to the parent's audit event, forming a traceable chain.
+
+```typescript
+const { record, cascaded } = await safePrisma.user.softDelete({
+  where: { id: 'user-1' },
+  actorId: currentUserId,
+});
+// Creates audit events for:
+// 1. The user (parent event)
+// 2. Each cascade-deleted post (with parent_event_id → user's event)
+// 3. Each cascade-deleted comment (with parent_event_id → post's event)
+```
+
+If a cascade passes through a non-auditable intermediate model (e.g., a model without `@audit`), a warning is emitted and the `parent_event_id` chain breaks at that point.
 
 For audit-only models (no `deleted_at`), `delete` and `deleteMany` are audited per-record when the model's audit actions include `delete`.
 
