@@ -1,3 +1,9 @@
+## [4.1.0](https://github.com/EddieRydell/prisma-safe-delete/compare/v4.0.0...v4.1.0) (2026-02-18)
+
+### Features
+
+* add public $writeAuditEvent to SafePrismaClient and SafeTransactionClient ([#61](https://github.com/EddieRydell/prisma-safe-delete/issues/61)) ([adb846c](https://github.com/EddieRydell/prisma-safe-delete/commit/adb846c74bd499ff45eaa417663384a2fcd6afa3))
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
