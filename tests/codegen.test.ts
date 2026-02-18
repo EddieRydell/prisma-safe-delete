@@ -973,19 +973,17 @@ describe('emitRuntime - bug fix regression tests', () => {
     expect(mangleFn![0]).not.toContain('already mangled');
   });
 
-  it('#42: restoreCascadeChildren does not bail out on non-soft-deletable children', () => {
+  it('#42: restoreCascadeChildren skips non-soft-deletable children', () => {
     const schema = createTestSchema();
     const cascadeGraph = buildCascadeGraph(schema);
     const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
 
-    // The old code had: if (!child.isSoftDeletable || !child.deletedAtField) continue;
-    // This skipped non-soft-deletable intermediary nodes entirely, preventing
-    // traversal to their soft-deletable grandchildren.
+    // Non-soft-deletable children are hard-deleted during cascade (and DB ON DELETE CASCADE
+    // handles their descendants). They cannot be restored, so restoreCascadeChildren should
+    // skip them entirely to avoid wasteful DB queries.
     const restoreCascadeFn = /async function restoreCascadeChildren[\s\S]*?^}/m.exec(output);
     expect(restoreCascadeFn).not.toBeNull();
-    expect(restoreCascadeFn![0]).not.toContain('if (!child.isSoftDeletable || !child.deletedAtField) continue');
-    // It should still gate restore operations behind the check
-    expect(restoreCascadeFn![0]).toContain('if (child.isSoftDeletable && child.deletedAtField)');
+    expect(restoreCascadeFn![0]).toContain('if (!child.isSoftDeletable || !child.deletedAtField) continue');
   });
 
   it('#44: _count: true expands to select with filters instead of pass-through', () => {
@@ -1767,6 +1765,78 @@ describe('emitRuntime - audit', () => {
     });
 
     expect(output).toContain('AuditContext');
+  });
+});
+
+describe('emitRuntime - non-audited softDelete transaction wrapping', () => {
+  it('simple (fast) path wraps softDelete in prisma.$transaction', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Post is a simple model (leaf, no unique strings with mangle) — fast path
+    const postDelegate = /function createPostDelegate[\s\S]*?^}/m.exec(output);
+    expect(postDelegate).not.toBeNull();
+    const postCode = postDelegate![0];
+
+    // The fast-path softDelete should still be wrapped in a $transaction for atomicity
+    expect(postCode).toContain('prisma.$transaction');
+    // But should NOT use softDeleteWithCascade/softDeleteWithCascadeInTx
+    expect(postCode).not.toContain('softDeleteWithCascadeInTx');
+    expect(postCode).not.toContain('softDeleteWithCascade(');
+  });
+
+  it('complex path wraps softDelete in prisma.$transaction using softDeleteWithCascadeInTx', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // User is a complex model (has cascade children) — complex path
+    const userDelegate = /function createUserDelegate[\s\S]*?^}/m.exec(output);
+    expect(userDelegate).not.toBeNull();
+    const userCode = userDelegate![0];
+
+    // Complex path softDelete should be wrapped in $transaction
+    expect(userCode).toContain('prisma.$transaction');
+    // And should call softDeleteWithCascadeInTx inside that transaction
+    expect(userCode).toContain('softDeleteWithCascadeInTx');
+  });
+});
+
+describe('emitRuntime - $onlyDeleted uses postProcessReadOnlyDeleted', () => {
+  it('$onlyDeleted client uses postProcessReadOnlyDeleted instead of postProcessRead', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    // Extract the createOnlyDeletedClient function
+    const onlyDeletedFunc = /function createOnlyDeletedClient[\s\S]*?^}/m.exec(output);
+    expect(onlyDeletedFunc).not.toBeNull();
+    const funcBody = onlyDeletedFunc![0];
+
+    // Should use postProcessReadOnlyDeleted for all find operations
+    expect(funcBody).toContain('postProcessReadOnlyDeleted');
+    // Should NOT use postProcessRead (the regular one that nullifies deleted to-one relations)
+    expect(funcBody).not.toContain('postProcessRead(');
+  });
+
+  it('transaction $onlyDeleted uses postProcessReadOnlyDeleted instead of postProcessRead', () => {
+    const schema = createTestSchema();
+    const cascadeGraph = buildCascadeGraph(schema);
+    const output = emitRuntime(schema, TEST_CLIENT_PATH, { uniqueStrategy: 'mangle', cascadeGraph });
+
+    const txWrapper = /function wrapTransactionClient[\s\S]*?^}/m.exec(output);
+    expect(txWrapper).not.toBeNull();
+    const txContent = txWrapper![0];
+
+    // Find the $onlyDeleted section within the tx wrapper
+    const onlyDeletedSection = /\$onlyDeleted: \{[\s\S]*?\},\n\n/.exec(txContent);
+    expect(onlyDeletedSection).not.toBeNull();
+    const section = onlyDeletedSection![0];
+
+    // Should use postProcessReadOnlyDeleted, not postProcessRead
+    expect(section).toContain('postProcessReadOnlyDeleted');
+    expect(section).not.toContain('postProcessRead(');
   });
 });
 

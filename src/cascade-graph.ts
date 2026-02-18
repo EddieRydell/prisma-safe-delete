@@ -1,4 +1,4 @@
-import type { ParsedModel, ParsedSchema } from './dmmf-parser.js';
+import type { ParsedSchema, SoftDeletableModel } from './dmmf-parser.js';
 
 /**
  * Represents a child model in a cascade relationship
@@ -8,7 +8,7 @@ export interface CascadeChild {
   model: string;
   /** The foreign key field(s) on the child model */
   foreignKey: string[];
-  /** The primary key field(s) on the parent model that the FK references */
+  /** The field(s) on the parent model that the FK references (usually the primary key, but can be any unique field) */
   parentKey: string[];
   /** Whether the child model supports soft deletion */
   isSoftDeletable: boolean;
@@ -64,8 +64,13 @@ export function buildCascadeGraph(schema: ParsedSchema): CascadeGraph {
         continue;
       }
 
-      // Get the parent's primary key (what the FK references)
-      const parentKey = normalizeKey(parentModel.primaryKey);
+      // Get the parent key that the FK references.
+      // Use the relation's `references` (DMMF relationToFields) when available,
+      // falling back to the parent's primary key for the common case.
+      const parentKey =
+        relation.references.length > 0
+          ? relation.references
+          : normalizeKey(parentModel.primaryKey);
       const foreignKey = relation.foreignKey;
 
       // Skip if we don't have FK information
@@ -164,9 +169,9 @@ export function getSoftDeletableDescendants(
   graph: CascadeGraph,
   schema: ParsedSchema,
   modelName: string,
-): ParsedModel[] {
+): SoftDeletableModel[] {
   const order = getCascadeOrder(graph, modelName);
-  const descendants: ParsedModel[] = [];
+  const descendants: SoftDeletableModel[] = [];
 
   for (const name of order) {
     // Skip the starting model itself

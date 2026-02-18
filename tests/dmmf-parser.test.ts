@@ -613,19 +613,19 @@ describe('uniqueConstraints - compoundKeyName', () => {
   });
 });
 
-describe('@audit annotations', () => {
-  // Helper to create a model with documentation (/// comments in Prisma schema)
-  function modelWithDoc(name: string, doc: string, extraFields: ReturnType<typeof createMockField>[] = []) {
-    return createMockModel({
-      name,
-      fields: [
-        createMockField({ name: 'id', type: 'String', isId: true }),
-        ...extraFields,
-      ],
-      documentation: doc,
-    } as Parameters<typeof createMockModel>[0]);
-  }
+// Helper to create a model with documentation (/// comments in Prisma schema)
+function modelWithDoc(name: string, doc: string, extraFields: ReturnType<typeof createMockField>[] = []) {
+  return createMockModel({
+    name,
+    fields: [
+      createMockField({ name: 'id', type: 'String', isId: true }),
+      ...extraFields,
+    ],
+    documentation: doc,
+  } as Parameters<typeof createMockModel>[0]);
+}
 
+describe('@audit annotations', () => {
   it('@audit sets isAuditable: true with all actions', () => {
     const dmmf = createMockDMMF([modelWithDoc('User', '@audit')]);
     const result = parseDMMF(dmmf);
@@ -776,5 +776,78 @@ describe('@audit annotations', () => {
 
     expect(model.isAuditable).toBe(false);
     expect(model.auditActions).toEqual([]);
+  });
+});
+
+describe('kind discriminant', () => {
+  it('plain model has kind "plain"', () => {
+    const dmmf = createMockDMMF([
+      createMockModel({
+        name: 'Setting',
+        fields: [createMockField({ name: 'id', type: 'String', isId: true })],
+      }),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.kind).toBe('plain');
+    expect(model.isSoftDeletable).toBe(false);
+    expect(model.isAuditable).toBe(false);
+    expect(model.isAuditTable).toBe(false);
+  });
+
+  it('soft-deletable model has kind "soft-deletable"', () => {
+    const dmmf = createMockDMMF([
+      createMockModel({
+        name: 'User',
+        fields: [
+          createMockField({ name: 'id', type: 'String', isId: true }),
+          createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+        ],
+      }),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.kind).toBe('soft-deletable');
+    expect(model.isSoftDeletable).toBe(true);
+    expect(model.deletedAtField).toBe('deleted_at');
+  });
+
+  it('soft-deletable + auditable model has kind "soft-deletable"', () => {
+    const dmmf = createMockDMMF([
+      modelWithDoc('User', '@audit', [
+        createMockField({ name: 'deleted_at', type: 'DateTime', isRequired: false }),
+      ]),
+    ]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.kind).toBe('soft-deletable');
+    expect(model.isSoftDeletable).toBe(true);
+    expect(model.isAuditable).toBe(true);
+    expect(model.deletedAtField).toBe('deleted_at');
+  });
+
+  it('audit-only model has kind "audit-only"', () => {
+    const dmmf = createMockDMMF([modelWithDoc('User', '@audit')]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.kind).toBe('audit-only');
+    expect(model.isSoftDeletable).toBe(false);
+    expect(model.isAuditable).toBe(true);
+    expect(model.deletedAtField).toBeNull();
+  });
+
+  it('audit-table model has kind "audit-table"', () => {
+    const dmmf = createMockDMMF([modelWithDoc('AuditEvent', '@audit-table')]);
+    const result = parseDMMF(dmmf);
+    const model = result.models[0] as ParsedModel;
+
+    expect(model.kind).toBe('audit-table');
+    expect(model.isAuditTable).toBe(true);
+    expect(model.isSoftDeletable).toBe(false);
+    expect(model.isAuditable).toBe(false);
   });
 });

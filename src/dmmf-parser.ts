@@ -48,17 +48,11 @@ export type AuditAction = 'create' | 'update' | 'delete';
 const VALID_AUDIT_ACTIONS: readonly AuditAction[] = ['create', 'update', 'delete'];
 
 /**
- * Represents a fully parsed Prisma model
+ * Shared base for all parsed model variants.
  */
-export interface ParsedModel {
+interface ParsedModelBase {
   name: string;
   primaryKey: string | string[];
-  isSoftDeletable: boolean;
-  deletedAtField: string | null;
-  deletedByField: string | null;
-  isAuditable: boolean;
-  auditActions: AuditAction[];
-  isAuditTable: boolean;
   fields: ParsedField[];
   relations: ParsedRelation[];
   /** String fields with @unique or part of @@unique that need mangling on soft delete */
@@ -70,13 +64,72 @@ export interface ParsedModel {
 }
 
 /**
+ * A model with a deleted_at field enabling soft-delete behavior.
+ * May also be auditable.
+ */
+export interface SoftDeletableModel extends ParsedModelBase {
+  kind: 'soft-deletable';
+  isSoftDeletable: true;
+  isAuditTable: false;
+  deletedAtField: string;
+  deletedByField: string | null;
+  isAuditable: boolean;
+  auditActions: AuditAction[];
+}
+
+/**
+ * A non-soft-deletable model that is auditable (has @audit annotation).
+ */
+export interface AuditOnlyModel extends ParsedModelBase {
+  kind: 'audit-only';
+  isSoftDeletable: false;
+  isAuditTable: false;
+  deletedAtField: null;
+  deletedByField: null;
+  isAuditable: true;
+  auditActions: AuditAction[];
+}
+
+/**
+ * The model designated as the audit event table (@audit-table).
+ */
+export interface AuditTableModel extends ParsedModelBase {
+  kind: 'audit-table';
+  isSoftDeletable: false;
+  isAuditTable: true;
+  deletedAtField: null;
+  deletedByField: null;
+  isAuditable: false;
+  auditActions: readonly [];
+}
+
+/**
+ * A plain model with no soft-delete, audit, or audit-table behavior.
+ */
+export interface PlainModel extends ParsedModelBase {
+  kind: 'plain';
+  isSoftDeletable: false;
+  isAuditTable: false;
+  deletedAtField: null;
+  deletedByField: null;
+  isAuditable: false;
+  auditActions: readonly [];
+}
+
+/**
+ * Discriminated union of all parsed model variants.
+ * Use `model.isSoftDeletable` or `model.kind` to narrow.
+ */
+export type ParsedModel = SoftDeletableModel | AuditOnlyModel | AuditTableModel | PlainModel;
+
+/**
  * Result of parsing the entire DMMF
  */
 export interface ParsedSchema {
   models: ParsedModel[];
   modelMap: Map<string, ParsedModel>;
   /** The model marked with @audit-table, if any */
-  auditTable: ParsedModel | null;
+  auditTable: AuditTableModel | null;
 }
 
 const DELETED_AT_FIELD_NAMES: readonly string[] = ['deleted_at', 'deletedAt'];
@@ -164,7 +217,10 @@ function extractPrimaryKey(model: DMMFModel): string | string[] {
     }
   }
 
-  return 'id';
+  throw new Error(
+    `prisma-safe-delete: Model "${model.name}" has no identifiable primary key (@id, @@id, or @@unique). ` +
+    `Every model must have a primary key for soft-delete operations.`,
+  );
 }
 
 /**
@@ -246,8 +302,8 @@ function extractUniqueStringFields(model: DMMFModel): string[] {
     }
   }
 
-  // Return sorted for deterministic output
-  return [...uniqueStringFields].sort();
+  // Return sorted for deterministic output (ASCII order, not locale-dependent)
+  return [...uniqueStringFields].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**
@@ -271,8 +327,8 @@ function extractAllUniqueFields(model: DMMFModel): string[] {
     }
   }
 
-  // Return sorted for deterministic output
-  return [...uniqueFields].sort();
+  // Return sorted for deterministic output (ASCII order, not locale-dependent)
+  return [...uniqueFields].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**
@@ -416,24 +472,66 @@ function parseModel(model: DMMFModel, options?: ParseDMMFOptions): ParsedModel {
   const doc = (model as unknown as { documentation?: string }).documentation;
   const audit = parseAuditAnnotations(doc);
 
-  // @audit-table models are never themselves auditable or soft-deletable
-  const isSoftDeletable = audit.isAuditTable ? false : Boolean(deletedAtField);
-  const isAuditable = audit.isAuditTable ? false : audit.isAuditable;
-
-  return {
+  // Shared base properties
+  const base: ParsedModelBase = {
     name: model.name,
     primaryKey: extractPrimaryKey(model),
-    isSoftDeletable,
-    deletedAtField: isSoftDeletable ? deletedAtField : null,
-    deletedByField: isSoftDeletable ? deletedByField : null,
-    isAuditable,
-    auditActions: isAuditable ? audit.auditActions : [],
-    isAuditTable: audit.isAuditTable,
     fields,
     relations,
     uniqueStringFields: extractUniqueStringFields(model),
     allUniqueFields: extractAllUniqueFields(model),
     uniqueConstraints: extractUniqueConstraints(model, deletedAtField),
+  };
+
+  // Determine variant via if/else chain: audit-table → soft-deletable → audit-only → plain
+  if (audit.isAuditTable) {
+    return {
+      ...base,
+      kind: 'audit-table',
+      isSoftDeletable: false,
+      isAuditTable: true,
+      deletedAtField: null,
+      deletedByField: null,
+      isAuditable: false,
+      auditActions: [],
+    };
+  }
+
+  if (deletedAtField !== null) {
+    return {
+      ...base,
+      kind: 'soft-deletable',
+      isSoftDeletable: true,
+      isAuditTable: false,
+      deletedAtField,
+      deletedByField,
+      isAuditable: audit.isAuditable,
+      auditActions: audit.isAuditable ? audit.auditActions : [],
+    };
+  }
+
+  if (audit.isAuditable) {
+    return {
+      ...base,
+      kind: 'audit-only',
+      isSoftDeletable: false,
+      isAuditTable: false,
+      deletedAtField: null,
+      deletedByField: null,
+      isAuditable: true,
+      auditActions: audit.auditActions,
+    };
+  }
+
+  return {
+    ...base,
+    kind: 'plain',
+    isSoftDeletable: false,
+    isAuditTable: false,
+    deletedAtField: null,
+    deletedByField: null,
+    isAuditable: false,
+    auditActions: [],
   };
 }
 
@@ -457,7 +555,7 @@ export function parseDMMF(dmmf: DMMF.Document, options?: ParseDMMFOptions): Pars
   }
 
   // Find the audit table model (at most one should be marked @audit-table)
-  const auditTables = models.filter((m) => m.isAuditTable);
+  const auditTables = models.filter((m): m is AuditTableModel => m.isAuditTable);
   const auditTable = auditTables.length === 1 ? (auditTables[0] ?? null) : null;
 
   return { models, modelMap, auditTable };
@@ -466,20 +564,26 @@ export function parseDMMF(dmmf: DMMF.Document, options?: ParseDMMFOptions): Pars
 /**
  * Gets all soft-deletable models from a parsed schema
  */
-export function getSoftDeletableModels(schema: ParsedSchema): ParsedModel[] {
-  return schema.models.filter((model) => model.isSoftDeletable);
+export function getSoftDeletableModels(schema: ParsedSchema): SoftDeletableModel[] {
+  return schema.models.filter((model): model is SoftDeletableModel => model.isSoftDeletable);
 }
 
 /**
  * Gets all non-soft-deletable models from a parsed schema
  */
-export function getHardDeleteOnlyModels(schema: ParsedSchema): ParsedModel[] {
-  return schema.models.filter((model) => !model.isSoftDeletable);
+export function getHardDeleteOnlyModels(
+  schema: ParsedSchema,
+): (AuditOnlyModel | AuditTableModel | PlainModel)[] {
+  return schema.models.filter(
+    (model): model is AuditOnlyModel | AuditTableModel | PlainModel => !model.isSoftDeletable,
+  );
 }
 
 /**
  * Gets all auditable models from a parsed schema
  */
-export function getAuditableModels(schema: ParsedSchema): ParsedModel[] {
-  return schema.models.filter((model) => model.isAuditable);
+export function getAuditableModels(schema: ParsedSchema): (SoftDeletableModel | AuditOnlyModel)[] {
+  return schema.models.filter(
+    (model): model is SoftDeletableModel | AuditOnlyModel => model.isAuditable,
+  );
 }

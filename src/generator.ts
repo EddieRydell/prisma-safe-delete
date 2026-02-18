@@ -4,8 +4,8 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
   parseDMMF,
-  type ParsedModel,
   type ParsedSchema,
+  type SoftDeletableModel,
   type UniqueConstraintInfo,
 } from './dmmf-parser.js';
 import { buildCascadeGraph } from './cascade-graph.js';
@@ -57,7 +57,7 @@ export function collectModelsWithUniqueFields(schema: ParsedSchema): UniqueField
   const result: UniqueFieldInfo[] = [];
 
   for (const model of schema.models) {
-    if (!model.isSoftDeletable || model.deletedAtField === null) {
+    if (!model.isSoftDeletable) {
       continue;
     }
 
@@ -203,13 +203,12 @@ export interface UniqueConstraintValidation {
  * - Standalone unique constraints that should include deleted_at
  */
 function checkSentinelHasIssues(schema: ParsedSchema): boolean {
-  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  const softDeletableModels = schema.models.filter((m): m is SoftDeletableModel => m.isSoftDeletable);
   if (softDeletableModels.length === 0) return false;
 
-  const hasMisconfiguredFields = softDeletableModels.some(m => {
-    const status = checkSentinelFieldConfig(m);
-    return status !== null && !status.isCorrectlyConfigured;
-  });
+  const hasMisconfiguredFields = softDeletableModels.some(m =>
+    checkSentinelFieldConfig(m)?.isCorrectlyConfigured === false,
+  );
 
   const hasStandaloneUniques = softDeletableModels.some(m =>
     m.uniqueConstraints.some(c => !c.includesDeletedAt)
@@ -269,13 +268,13 @@ export function buildMangleWarningLines(
   schema: ParsedSchema,
   useColors = true,
 ): string[] {
-  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  const softDeletableModels = schema.models.filter((m): m is SoftDeletableModel => m.isSoftDeletable);
   if (softDeletableModels.length === 0) return [];
 
   const unmangleableFields: UnmangleableFieldInfo[] = [];
 
   for (const model of softDeletableModels) {
-    const deletedAtField = model.deletedAtField ?? 'deleted_at';
+    const deletedAtField = model.deletedAtField;
     const mangleableSet = new Set(model.uniqueStringFields);
 
     for (const fieldName of model.allUniqueFields) {
@@ -353,9 +352,7 @@ interface SentinelFieldStatus {
  * Checks whether a soft-deletable model's deleted_at field is correctly configured
  * for the sentinel strategy (non-nullable DateTime with @default).
  */
-function checkSentinelFieldConfig(model: ParsedModel): SentinelFieldStatus | null {
-  if (!model.isSoftDeletable || model.deletedAtField === null) return null;
-
+function checkSentinelFieldConfig(model: SoftDeletableModel): SentinelFieldStatus | null {
   const field = model.fields.find(f => f.name === model.deletedAtField);
   if (field === undefined) return null;
 
@@ -376,7 +373,7 @@ export function buildSentinelWarningLines(
   schema: ParsedSchema,
   useColors = true,
 ): string[] {
-  const softDeletableModels = schema.models.filter(m => m.isSoftDeletable && m.deletedAtField !== null);
+  const softDeletableModels = schema.models.filter((m): m is SoftDeletableModel => m.isSoftDeletable);
   if (softDeletableModels.length === 0) return [];
 
   const y = useColors ? YELLOW : '';
@@ -636,6 +633,10 @@ generatorHandler({
 
     // Read custom config options
     const rawStrategy = options.generator.config['uniqueStrategy'] as string | undefined;
+    if (rawStrategy !== undefined && rawStrategy !== 'mangle' && rawStrategy !== 'none' && rawStrategy !== 'sentinel') {
+      // eslint-disable-next-line no-console
+      console.warn(`prisma-safe-delete: Unknown uniqueStrategy value "${rawStrategy}". Expected "mangle", "none", or "sentinel". Defaulting to "mangle".`);
+    }
     const uniqueStrategy: UniqueStrategy =
       rawStrategy === 'none' ? 'none'
       : rawStrategy === 'sentinel' ? 'sentinel'

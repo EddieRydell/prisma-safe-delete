@@ -926,8 +926,8 @@ describe('E2E: Real database tests', () => {
       expect(await safePrisma.team.count()).toBe(0);
       expect(await safePrisma.project.count()).toBe(0);
 
-      // Non-soft-deletable Asset still exists (not affected by soft delete cascade)
-      expect(await prisma.asset.count()).toBe(1);
+      // Non-soft-deletable Asset is hard-deleted during cascade
+      expect(await prisma.asset.count()).toBe(0);
     });
   });
 
@@ -2400,7 +2400,7 @@ describe('E2E: Real database tests', () => {
         // Try to restore - should fail because email would conflict
         await expect(
           safePrisma.customer.restore({ where: { id: 'c-deleted' } })
-        ).rejects.toThrow(/unique field "email".*already exists/);
+        ).rejects.toThrow(/unique constraint on \(email\).*already satisfied/);
       });
 
       it('restoreMany throws on conflict and rolls back', async () => {
@@ -2432,7 +2432,7 @@ describe('E2E: Real database tests', () => {
         // Try to restore both - should fail on second one
         await expect(
           safePrisma.customer.restoreMany({ where: { name: 'ToRestore' } })
-        ).rejects.toThrow(/unique field.*already exists/);
+        ).rejects.toThrow(/unique constraint on \(email\).*already satisfied/);
 
         // Verify first one was rolled back (still deleted)
         const c1 = await prisma.customer.findUnique({ where: { id: 'c1' } });
@@ -2669,8 +2669,8 @@ describe('E2E: Real database tests', () => {
       });
     });
 
-    describe('Cascade restore through non-soft-deletable intermediary', () => {
-      it('restoreCascade traverses through non-soft-deletable model to restore grandchildren', async () => {
+    describe('Cascade through non-soft-deletable intermediary', () => {
+      it('hard-deletes non-soft-deletable children and their descendants during cascade', async () => {
         // Organization(soft) -> Asset(non-soft) -> AssetComment(soft)
         await prisma.organization.create({
           data: {
@@ -2688,34 +2688,31 @@ describe('E2E: Real database tests', () => {
           },
         });
 
-        // Soft delete organization — AssetComment should cascade-delete, Asset stays as-is
+        // Soft delete organization — Asset (non-soft-deletable) is hard-deleted,
+        // and its AssetComment children are first soft-deleted then DB-cascade-deleted with Asset
         await safePrisma.organization.softDelete({ where: { id: 'org1' } });
 
         // Verify organization is soft-deleted
         const org = await prisma.organization.findUnique({ where: { id: 'org1' } });
         expect(org.deleted_at).not.toBeNull();
 
-        // Verify AssetComment is soft-deleted (cascaded through non-soft-deletable Asset)
-        const comment = await prisma.assetComment.findUnique({ where: { id: 'ac1' } });
-        expect(comment.deleted_at).not.toBeNull();
-
-        // Asset still exists (not soft-deletable, no deleted_at)
+        // Asset is hard-deleted (non-soft-deletable children are hard-deleted)
         const asset = await prisma.asset.findUnique({ where: { id: 'asset1' } });
-        expect(asset).not.toBeNull();
+        expect(asset).toBeNull();
 
-        // Restore organization with cascade
+        // AssetComment is also gone (DB cascade from Asset deletion)
+        const comment = await prisma.assetComment.findUnique({ where: { id: 'ac1' } });
+        expect(comment).toBeNull();
+
+        // Restore organization — no children to restore since they were hard-deleted
         const { cascaded } = await safePrisma.organization.restoreCascade({ where: { id: 'org1' } });
 
         // Verify organization is restored
         const restoredOrg = await prisma.organization.findUnique({ where: { id: 'org1' } });
         expect(restoredOrg.deleted_at).toBeNull();
 
-        // Verify AssetComment is restored (traversed through non-soft-deletable Asset)
-        const restoredComment = await prisma.assetComment.findUnique({ where: { id: 'ac1' } });
-        expect(restoredComment.deleted_at).toBeNull();
-
-        // Verify cascade info includes assetComment
-        expect(cascaded.AssetComment).toBe(1);
+        // No cascaded restores (everything was hard-deleted)
+        expect(cascaded.AssetComment).toBeUndefined();
       });
     });
 
@@ -2748,7 +2745,7 @@ describe('E2E: Real database tests', () => {
         // Try to restore customer with cascade - should fail due to order conflict
         await expect(
           safePrisma.customer.restoreCascade({ where: { id: 'cust1' } })
-        ).rejects.toThrow(/unique field.*already exists/);
+        ).rejects.toThrow(/unique constraint on \(orderNumber\).*already satisfied/);
 
         // Verify customer was rolled back (still deleted)
         const customer = await prisma.customer.findUnique({ where: { id: 'cust1' } });
@@ -5219,6 +5216,340 @@ describe('E2E: Real database tests', () => {
 
       // The author relation should be nullified because the user is soft-deleted
       expect(result.record.author).toBeNull();
+    });
+  });
+
+  describe('Audit logging - additional coverage', () => {
+    let auditSafePrisma2: any;
+    beforeAll(() => {
+      auditSafePrisma2 = wrapPrismaClient(prisma, {
+        auditContext: () => ({ source: 'e2e-test' }),
+      });
+    });
+
+    it('auditContext cannot override built-in audit fields', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-override', name: 'Override Org' },
+      });
+
+      const project = await auditSafePrisma2.project.create({
+        data: { id: 'proj-override', name: 'Audit Override Test', organizationId: org.id },
+        actorId: 'real-actor',
+        auditContext: {
+          entity_type: 'INJECTED',
+          action: 'INJECTED',
+          entity_id: 'INJECTED',
+          actor_id: 'INJECTED',
+          event_data: 'INJECTED',
+        },
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_id: project.id },
+      });
+      expect(events).toHaveLength(1);
+      // Built-in fields should NOT be overridden by auditContext
+      expect(events[0].entity_type).toBe('Project');
+      expect(events[0].action).toBe('create');
+      expect(events[0].actor_id).toBe('real-actor');
+      expect(events[0].entity_id).toBe(project.id);
+      // event_data should be the created record, not 'INJECTED'
+      expect(typeof events[0].event_data).toBe('object');
+      expect(events[0].event_data).not.toBe('INJECTED');
+    });
+
+    it('restoreCascade writes audit events for both parent and children', async () => {
+      const org = await prisma.organization.create({
+        data: {
+          id: 'org-rc-audit',
+          name: 'RC Audit Org',
+          projects: {
+            create: { id: 'proj-rc-audit', name: 'RC Audit Project' },
+          },
+        },
+      });
+
+      // Soft delete the org (cascades to project)
+      await auditSafePrisma2.organization.softDelete({
+        where: { id: org.id },
+        actorId: 'cascade-actor',
+      });
+
+      // Clear audit events from the soft delete so we only see restore events
+      await prisma.auditEvent.deleteMany();
+
+      // Restore cascade the org
+      await auditSafePrisma2.organization.restoreCascade({
+        where: { id: org.id },
+        actorId: 'restore-actor',
+      });
+
+      // Check for restore audit events
+      const orgEvents = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Organization', entity_id: org.id, action: 'restore' },
+      });
+      expect(orgEvents).toHaveLength(1);
+      expect(orgEvents[0].actor_id).toBe('restore-actor');
+
+      const projEvents = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-rc-audit', action: 'restore' },
+      });
+      expect(projEvents).toHaveLength(1);
+      expect(projEvents[0].actor_id).toBe('restore-actor');
+    });
+
+    it('audited simple-path softDelete captures pre-mutation snapshot in event_data', async () => {
+      // Project is an audited model on the simple path (no cascade children, no unique string fields)
+      const org = await prisma.organization.create({
+        data: { id: 'org-snap', name: 'Snapshot Org' },
+      });
+
+      await auditSafePrisma2.project.create({
+        data: { id: 'proj-snap', name: 'Snapshot Project', organizationId: org.id },
+      });
+
+      // Clear audit events from create
+      await prisma.auditEvent.deleteMany();
+
+      // Soft delete the project
+      await auditSafePrisma2.project.softDelete({
+        where: { id: 'proj-snap' },
+        actorId: 'snap-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-snap', action: 'soft_delete' },
+      });
+      expect(events).toHaveLength(1);
+
+      // The event_data should contain a before/after snapshot
+      // The "before" snapshot should have deleted_at as null (pre-mutation state)
+      const eventData = events[0].event_data as { before?: Record<string, unknown>; after?: Record<string, unknown> };
+      if (eventData.before !== undefined) {
+        expect(eventData.before.deleted_at).toBeNull();
+      } else {
+        // If the structure is just the record (pre-mutation snapshot), it should not have deleted_at set
+        const record = events[0].event_data as Record<string, unknown>;
+        expect(record.deleted_at).toBeNull();
+      }
+    });
+
+    it('audited createMany writes audit events for each record', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-cm', name: 'CreateMany Org' },
+      });
+
+      await auditSafePrisma2.project.createMany({
+        data: [
+          { id: 'proj-cm1', name: 'P1', organizationId: org.id },
+          { id: 'proj-cm2', name: 'P2', organizationId: org.id },
+        ],
+        actorId: 'cm-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', action: 'create', actor_id: 'cm-actor' },
+        orderBy: { entity_id: 'asc' },
+      });
+      expect(events).toHaveLength(2);
+      expect(events[0].entity_id).toBe('proj-cm1');
+      expect(events[1].entity_id).toBe('proj-cm2');
+    });
+
+    it('audited updateMany writes audit events with before/after for each record', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-um', name: 'UpdateMany Org' },
+      });
+      await prisma.project.createMany({
+        data: [
+          { id: 'proj-um1', name: 'Original1', organizationId: org.id },
+          { id: 'proj-um2', name: 'Original2', organizationId: org.id },
+        ],
+      });
+
+      // Clear any create events
+      await prisma.auditEvent.deleteMany();
+
+      await auditSafePrisma2.project.updateMany({
+        where: { organizationId: org.id },
+        data: { name: 'Updated' },
+        actorId: 'um-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', action: 'update', actor_id: 'um-actor' },
+        orderBy: { entity_id: 'asc' },
+      });
+      expect(events).toHaveLength(2);
+
+      // Verify before/after structure
+      for (const event of events) {
+        const data = event.event_data as { before: { name: string }; after: { name: string } };
+        expect(data.before.name).toMatch(/^Original/);
+        expect(data.after.name).toBe('Updated');
+      }
+    });
+
+    it('audited upsert writes create audit event for the create path', async () => {
+      const org = await prisma.organization.create({
+        data: { id: 'org-ups', name: 'Upsert Org' },
+      });
+
+      // Clear any events
+      await prisma.auditEvent.deleteMany();
+
+      // Upsert with a non-existent ID should trigger create path
+      await auditSafePrisma2.project.upsert({
+        where: { id: 'proj-ups-new' },
+        create: { id: 'proj-ups-new', name: 'New Upsert', organizationId: org.id },
+        update: { name: 'Updated Upsert' },
+        actorId: 'ups-actor',
+      });
+
+      const events = await prisma.auditEvent.findMany({
+        where: { entity_type: 'Project', entity_id: 'proj-ups-new', action: 'create' },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].actor_id).toBe('ups-actor');
+    });
+  });
+
+  describe('$onlyDeleted preserves deleted to-one relations', () => {
+    it('$onlyDeleted preserves deleted to-one relation (User.profile)', async () => {
+      const user = await prisma.user.create({
+        data: {
+          id: 'u-od-profile',
+          email: 'onlydelprof@test.com',
+          name: 'OnlyDel Profile User',
+          profile: {
+            create: { id: 'prof-od', bio: 'Hello world' },
+          },
+        },
+      });
+
+      // Soft delete both user and profile
+      await prisma.profile.update({
+        where: { id: 'prof-od' },
+        data: { deleted_at: new Date() },
+      });
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { deleted_at: new Date() },
+      });
+
+      // $onlyDeleted should show deleted user WITH deleted profile
+      const result = await safePrisma.$onlyDeleted.user.findFirst({
+        where: { id: user.id },
+        include: { profile: true },
+      });
+
+      expect(result).not.toBeNull();
+      expect(result.deleted_at).not.toBeNull();
+      // Profile should NOT be null in $onlyDeleted mode (deleted to-one should be preserved)
+      expect(result.profile).not.toBeNull();
+      expect(result.profile.bio).toBe('Hello world');
+
+      // Compare: regular safePrisma should not find this user at all
+      const regularResult = await safePrisma.user.findFirst({
+        where: { id: user.id },
+      });
+      expect(regularResult).toBeNull();
+    });
+  });
+
+  describe('Compound unique restore conflict', () => {
+    it('restore throws when compound unique fields conflict with active record', async () => {
+      // Create and soft-delete a workspace
+      await prisma.workspace.create({
+        data: { id: 'ws-conflict-1', orgSlug: 'org1', slug: 'workspace1', name: 'Original' },
+      });
+      await safePrisma.workspace.softDelete({ where: { id: 'ws-conflict-1' } });
+
+      // Create a NEW workspace with the same orgSlug + slug
+      await prisma.workspace.create({
+        data: { id: 'ws-conflict-2', orgSlug: 'org1', slug: 'workspace1', name: 'Replacement' },
+      });
+
+      // Attempt to restore the first workspace — should throw due to compound unique conflict
+      await expect(
+        safePrisma.workspace.restore({ where: { id: 'ws-conflict-1' } })
+      ).rejects.toThrow(/unique constraint/);
+    });
+
+    it('restore succeeds when no compound unique conflict exists', async () => {
+      // Create and soft-delete a workspace
+      await prisma.workspace.create({
+        data: { id: 'ws-ok', orgSlug: 'org2', slug: 'workspace2', name: 'Safe Workspace' },
+      });
+      await safePrisma.workspace.softDelete({ where: { id: 'ws-ok' } });
+
+      // No conflict — restore should succeed
+      const restored = await safePrisma.workspace.restore({ where: { id: 'ws-ok' } });
+
+      expect(restored).not.toBeNull();
+      expect(restored.orgSlug).toBe('org2');
+      expect(restored.slug).toBe('workspace2');
+      expect(restored.deleted_at).toBeNull();
+    });
+  });
+
+  describe('restoreMany e2e coverage', () => {
+    it('restoreMany restores multiple records by ID list', async () => {
+      const ids = ['rm-u1', 'rm-u2', 'rm-u3'];
+      const deletedAt = new Date();
+      await prisma.user.createMany({
+        data: ids.map((id, i) => ({
+          id,
+          email: `rm${String(i)}@test.com`,
+          deleted_at: deletedAt,
+        })),
+      });
+
+      // Verify none are visible via safe client
+      const before = await safePrisma.user.findMany({ where: { id: { in: ids } } });
+      expect(before).toHaveLength(0);
+
+      // Restore all
+      const result = await safePrisma.user.restoreMany({
+        where: { id: { in: ids } },
+      });
+      expect(result.count).toBe(3);
+
+      // Verify all are now visible
+      const after = await safePrisma.user.findMany({
+        where: { id: { in: ids } },
+        orderBy: { id: 'asc' },
+      });
+      expect(after).toHaveLength(3);
+      for (const user of after) {
+        expect(user.deleted_at).toBeNull();
+      }
+    });
+
+    it('restoreMany only restores deleted records (skips already-active)', async () => {
+      const deletedAt = new Date();
+      await prisma.user.createMany({
+        data: [
+          { id: 'rm-active', email: 'rmactive@test.com' }, // Already active
+          { id: 'rm-del1', email: 'rmdel1@test.com', deleted_at: deletedAt },
+          { id: 'rm-del2', email: 'rmdel2@test.com', deleted_at: deletedAt },
+        ],
+      });
+
+      // restoreMany targeting all three
+      const result = await safePrisma.user.restoreMany({
+        where: { id: { in: ['rm-active', 'rm-del1', 'rm-del2'] } },
+      });
+
+      // Only the 2 deleted records should be restored (active one is skipped since
+      // restoreMany only targets records with non-null deleted_at)
+      expect(result.count).toBe(2);
+
+      // All 3 should now be visible
+      const users = await safePrisma.user.findMany({
+        where: { id: { in: ['rm-active', 'rm-del1', 'rm-del2'] } },
+      });
+      expect(users).toHaveLength(3);
     });
   });
 });
