@@ -613,19 +613,19 @@ describe('uniqueConstraints - compoundKeyName', () => {
   });
 });
 
-describe('@audit annotations', () => {
-  // Helper to create a model with documentation (/// comments in Prisma schema)
-  function modelWithDoc(name: string, doc: string, extraFields: ReturnType<typeof createMockField>[] = []) {
-    return createMockModel({
-      name,
-      fields: [
-        createMockField({ name: 'id', type: 'String', isId: true }),
-        ...extraFields,
-      ],
-      documentation: doc,
-    } as Parameters<typeof createMockModel>[0]);
-  }
+// Helper to create a model with documentation (/// comments in Prisma schema)
+function modelWithDoc(name: string, doc: string, extraFields: ReturnType<typeof createMockField>[] = []) {
+  return createMockModel({
+    name,
+    fields: [
+      createMockField({ name: 'id', type: 'String', isId: true }),
+      ...extraFields,
+    ],
+    documentation: doc,
+  } as Parameters<typeof createMockModel>[0]);
+}
 
+describe('@audit annotations', () => {
   it('@audit sets isAuditable: true with all actions', () => {
     const dmmf = createMockDMMF([modelWithDoc('User', '@audit')]);
     const result = parseDMMF(dmmf);
@@ -780,18 +780,6 @@ describe('@audit annotations', () => {
 });
 
 describe('kind discriminant', () => {
-  // Helper to create a model with documentation (/// comments in Prisma schema)
-  function modelWithDoc(name: string, doc: string, extraFields: ReturnType<typeof createMockField>[] = []) {
-    return createMockModel({
-      name,
-      fields: [
-        createMockField({ name: 'id', type: 'String', isId: true }),
-        ...extraFields,
-      ],
-      documentation: doc,
-    } as Parameters<typeof createMockModel>[0]);
-  }
-
   it('plain model has kind "plain"', () => {
     const dmmf = createMockDMMF([
       createMockModel({
