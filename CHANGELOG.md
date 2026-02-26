@@ -1,3 +1,13 @@
+## [5.0.0](https://github.com/EddieRydell/prisma-safe-delete/compare/v4.1.0...v5.0.0) (2026-02-26)
+
+### ⚠ BREAKING CHANGES
+
+* remove $extends from SafePrismaClient to prevent silent loss o… (#66)
+
+### Features
+
+* remove $extends from SafePrismaClient to prevent silent loss o… ([#66](https://github.com/EddieRydell/prisma-safe-delete/issues/66)) ([cfd99c5](https://github.com/EddieRydell/prisma-safe-delete/commit/cfd99c558de4d6c1d04a8e0dd7f01d9a4d2a3958))
+
 ## [4.1.0](https://github.com/EddieRydell/prisma-safe-delete/compare/v4.0.0...v4.1.0) (2026-02-18)
 
 ### Features

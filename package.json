@@ -1,6 +1,6 @@
 {
   "name": "prisma-safe-delete",
-  "version": "4.1.0",
+  "version": "5.0.0",
   "description": "A Prisma generator that creates a type-safe wrapper for soft deletion with automatic cascade support",
   "type": "module",
   "main": "dist/generator.js",
