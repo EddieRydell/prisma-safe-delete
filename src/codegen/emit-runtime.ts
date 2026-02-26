@@ -3672,7 +3672,6 @@ function emitWrapperFunction(schema: ParsedSchema, hasAudit: boolean): string {
   lines.push('      // Sequential transaction (array of promises)');
   lines.push('      return (prisma.$transaction as any)(arg, options);');
   lines.push("    }) as SafePrismaClient['$transaction'],");
-  lines.push('    $extends: (prisma.$extends as any).bind(prisma) as PrismaClient[\'$extends\'],');
   lines.push('    $queryRaw: (prisma.$queryRaw as any).bind(prisma) as PrismaClient[\'$queryRaw\'],');
   lines.push('    $executeRaw: (prisma.$executeRaw as any).bind(prisma) as PrismaClient[\'$executeRaw\'],');
   lines.push('    $queryRawUnsafe: (prisma.$queryRawUnsafe as any).bind(prisma) as PrismaClient[\'$queryRawUnsafe\'],');

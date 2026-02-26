@@ -209,6 +209,7 @@ describe('emitTypes', () => {
     expect(output).toContain('$prisma: PrismaClient');
     expect(output).toContain('$includingDeleted: IncludingDeletedClient');
     expect(output).toContain('$onlyDeleted: OnlyDeletedClient');
+    expect(output).not.toContain('$extends');
   });
 
   it('generates IncludingDeletedClient interface', () => {
@@ -371,6 +372,7 @@ describe('emitRuntime', () => {
     const output = emitRuntime(schema, TEST_CLIENT_PATH);
 
     expect(output).toContain('export function wrapPrismaClient');
+    expect(output).not.toContain('$extends');
   });
 
   it('simple model (leaf, no unique strings) emits updateMany-based softDeleteMany', () => {

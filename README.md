@@ -234,12 +234,38 @@ Models are automatically detected as soft-deletable if they have a DateTime fiel
 - **Fluent API**: `safePrisma.user.findUnique(...).posts()` bypasses filtering. Use `include` instead.
 - **Raw queries**: `$queryRaw` and `$executeRaw` bypass the wrapper entirely (by design).
 - **Upsert**: Soft-deleted records are not found by `upsert`'s `where` clause. With `none` strategy, the `create` branch will fail on unique constraint violation.
-- **`$extends`**: `safePrisma.$extends(...)` returns a raw PrismaClient. Use `safePrisma.$prisma.$extends(...)` instead.
+- **`$extends` not available**: `$extends` is intentionally omitted from `SafePrismaClient` because Prisma's `$extends()` returns a new unwrapped client, silently losing soft-delete behavior. See [Using Prisma Extensions](#using-prisma-extensions) below.
 - **To-one includes (partial)**: Prisma doesn't support `where` on to-one relation includes. For most read operations, the wrapper post-processes results to nullify soft-deleted to-one relations. However, `$includingDeleted` and `$prisma` escape hatches do not apply this post-processing. See [Limitations and Caveats](#limitations-and-caveats) below.
 - **Nested writes**: `connect`, `connectOrCreate`, and nested `create`/`delete` within `data` bypass soft-delete logic.
 - **Sequential transactions**: `$transaction([...])` with a promise array skips return-value post-processing (e.g., to-one nullification). The `where` filters are still injected at call time. Use the interactive form `$transaction(async (tx) => { ... })` for full wrapping.
 - **No database-level enforcement**: The wrapper operates at the application layer only. Developers can bypass soft-delete via `$prisma`, `__dangerousHardDelete`, raw SQL, or by using PrismaClient directly. For strict enforcement, add database triggers or row-level security policies.
 - **Audit event atomicity**: Audit events are written within the same database transaction as the operation they log. If the transaction fails, the audit event is also rolled back. For compliance-critical deployments where audit events must survive operation failures, consider adding an external audit sink (e.g., write-ahead log, event stream, or async replication).
+
+## Using Prisma Extensions
+
+`$extends` is not available on `SafePrismaClient`. Prisma's `$extends()` returns a **new** client instance (it doesn't mutate the original), so calling it on the safe wrapper would return a raw client with no soft-delete behavior — a silent footgun.
+
+**Extend before wrapping** (recommended): apply extensions to the raw client, then wrap the result:
+
+```typescript
+import { PrismaClient } from '@prisma/client';
+import { wrapPrismaClient } from './generated/safe-delete';
+
+const extended = new PrismaClient().$extends({
+  /* your extension */
+});
+
+const safePrisma = wrapPrismaClient(extended as unknown as PrismaClient);
+```
+
+The `as unknown as PrismaClient` cast is necessary because Prisma's extended client type is nominally incompatible with `PrismaClient`. The cast signals that you take responsibility for structural compatibility.
+
+**One-off raw access**: if you need `$extends` for a specific operation, use the `$prisma` escape hatch:
+
+```typescript
+const rawExtended = safePrisma.$prisma.$extends({ /* ... */ });
+// rawExtended is a raw Prisma client — no soft-delete wrapping
+```
 
 ## Limitations and Caveats
 
