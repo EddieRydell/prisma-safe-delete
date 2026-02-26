@@ -281,7 +281,6 @@ function emitSafePrismaClientType(schema: ParsedSchema): string[] {
   lines.push('    <R>(fn: (tx: SafeTransactionClient) => Promise<R>, options?: { maxWait?: number; timeout?: number; isolationLevel?: Prisma.TransactionIsolationLevel }): Promise<R>;');
   lines.push('    <P extends Prisma.PrismaPromise<unknown>[]>(arg: [...P], options?: { isolationLevel?: Prisma.TransactionIsolationLevel }): Promise<{ -readonly [K in keyof P]: Awaited<P[K]> }>;');
   lines.push('  };');
-  lines.push("  $extends: PrismaClient['$extends'];");
   lines.push("  $queryRaw: PrismaClient['$queryRaw'];");
   lines.push("  $executeRaw: PrismaClient['$executeRaw'];");
   lines.push("  $queryRawUnsafe: PrismaClient['$queryRawUnsafe'];");
