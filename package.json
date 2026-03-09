@@ -60,7 +60,7 @@
     "prisma": ">=7.0.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.0.0",
+    "@eslint/js": "^10.0.1",
     "@prisma/adapter-pg": "^7.0.0",
     "@prisma/client": "^7.3.0",
     "@prisma/generator-helper": "^7.0.0",
